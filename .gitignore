@@ -1,0 +1,12 @@
+build/
+sdkconfig
+sdkconfig.old
+logs/
+*.pcap
+*.pcapng
+managed_components/
+dependencies.lock
+.cache/
+.vscode/
+
+__pycache__/

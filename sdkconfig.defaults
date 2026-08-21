@@ -1,0 +1,74 @@
+# ===== Target =====
+CONFIG_IDF_TARGET="esp32c5"
+
+# ===== CPU: 240 MHz (max performance, 减少注入抖动) =====
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# ===== Console: UART0 (via CH343P bridge on H2 port) =====
+# 原生 USB-Serial/JTAG (H1/COM3) 在 Windows 下 CDC 端点会卡死 (写超时),
+# 且 app 早期崩溃时无人服务 CDC -> 看不到任何输出/无法恢复.
+# 改用 UART0: 经 H2 口的 CH343P 桥接, 可靠且不依赖 app USB 驱动, 崩溃时 panic 也能打印.
+CONFIG_ESP_CONSOLE_NONE=n
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT_GPIO=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_ESP_LINE_ENDER_CR_LF=y
+
+# ===== PSRAM: 8MB Quad, 80 MHz =====
+# 嗅探/pcap 缓冲可以放 PSRAM, 减轻 internal SRAM 压力
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+
+# ===== mbedtls hardware crypto (可选, 留作后续 PMKID 解析) =====
+CONFIG_MBEDTLS_HARDWARE_AES=y
+CONFIG_MBEDTLS_HARDWARE_SHA=y
+
+# ===== Wi-Fi (核心) =====
+# esp_wifi_80211_tx() 在 ESP_WIFI_ENABLED 开关后即可用, 无独立 Kconfig
+CONFIG_ESP_WIFI_ENABLED=y
+CONFIG_ESP_WIFI_NVS_ENABLED=y
+# 仅用 STA + 802.11_tx, 关 softap 节省 flash/RAM
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
+# PSRAM 场景官方推荐 Static (避免 dynamic 抖动)
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER=y
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=n
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=12
+
+# ===== 关闭未用协议栈 (节省 flash/RAM, 避免 2.4G 共存调度) =====
+CONFIG_BT=n
+CONFIG_IEEE802154_ENABLED=n
+
+# ===== esp_console + linenoise (交互 REPL) =====
+# console 组件默认提供 linenoise 编辑 + argtable3 参数解析
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# ===== Task Watchdog: 关闭 (REPL 长时间空闲会误触发) =====
+CONFIG_ESP_TASK_WDT_EN=n
+CONFIG_ESP_TASK_WDT=n
+
+# ===== Power Management: 禁用 (沿用 bench: PM+ldgen 有竞态, 且我们要稳定时序) =====
+# CONFIG_PM_ENABLE=n
+
+# ===== Optimizations: -O2 =====
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# ===== Main task stack: 仅跑 rgb + wifi init (cli 已移到独立任务) =====
+# 架构: app_main 只做 rgb_led_init + wifi_attack_init, 随后 xTaskCreate("cli")
+# 起 20KB 独立任务跑 esp_console REPL. 故 main task 不再承担 console/argtable
+# 的栈开销, 16KB 足够 phy_init/wifi_init (实测 wifi init ok 在 8KB 内通过,
+# 16KB 留充裕余量).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# ===== nano printf: 显著降低 vfprintf 栈开销 =====
+# 完整 newlib vfprintf 单次调用可吃 1-2KB 栈; esp_console/argtable/我们的
+# META,PKT 行大量用 printf, 启用 nano 格式化既省栈又省 flash.
+# (此前漏配 -> 日志显示 "config nano formatting: disabled", 栈溢出帮凶之一)
+CONFIG_LIBC_NEWLIB_NANO_FORMAT=y
+
+# ===== Partition: single app (简单, 无 OTA 需求) =====
+CONFIG_PARTITION_TABLE_SINGLE_APP=y
