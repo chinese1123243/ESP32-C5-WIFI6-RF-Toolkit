@@ -85,6 +85,21 @@ class State:
         self.fw_state = "IDLE"
         self.fw_channel = 0
         self.lock = threading.Lock()
+        # TUI 扩展: export/dump 捕获
+        self.capture_mode = None   # "json" / "csv" / "dump_aps" / ...
+        self.capture_buf = []
+        self.capture_save_path = None
+        # HTTP 状态
+        self.http_running = False
+        self.http_ssid = ""
+        self.http_ip = ""
+        self.http_sta = 0
+        # DB 计数缓存 (status 中解析)
+        self.db_aps = 0
+        self.db_clients = 0
+        self.db_eapols = 0
+        # 计数阈值
+        self._dump_last_header = False
 
 st = State()
 
@@ -222,7 +237,32 @@ def serial_reader():
                                     st.total_inject = int(parts[i+1])
                             except ValueError:
                                 pass
+                        elif parts[i] == "aps":
+                            try: st.db_aps = int(parts[i+1])
+                            except ValueError: pass
+                        elif parts[i] == "clients":
+                            try: st.db_clients = int(parts[i+1])
+                            except ValueError: pass
+                        elif parts[i] == "eapols":
+                            try: st.db_eapols = int(parts[i+1])
+                            except ValueError: pass
+                    # HTTP 状态解析
+                    if len(parts) >= 2 and parts[0] == "HTTP":
+                        act2 = parts[1] if len(parts) > 1 else ""
+                        if act2 == "START":
+                            st.http_running = True
+                            for i in range(2, len(parts)-1, 2):
+                                if parts[i] == "ssid": st.http_ssid = parts[i+1]
+                                elif parts[i] == "ip": st.http_ip = parts[i+1]
+                        elif act2 == "STOP":
+                            st.http_running = False
+                            st.http_ssid = ""
+                            st.http_ip = ""
                     print(f"  {meta_col}[meta] {line_s[5:]}{C.RST}", flush=True)
+                    # HTTP 启动提示
+                    if line_s.startswith("META,HTTP,START"):
+                        print(f"  {C.G}{C.BOLD}    -> 连接 Wi-Fi: {st.http_ssid} / 密码: rftool1234{C.RST}")
+                        print(f"  {C.G}{C.BOLD}    -> 浏览器访问 http://{st.http_ip}/{C.RST}")
                     maybe_print_status()
                 elif "========================================" in line_s:
                     print(f"  {C.M}{line_s}{C.RST}", flush=True)
@@ -245,10 +285,39 @@ def serial_reader():
                     print(f"  {line_s}  {C.DIM}# 伪造 beacon 洪水 (仅限授权使用){C.RST}", flush=True)
                 elif line_s.strip().startswith("probeflood ") and "Probe" in line_s:
                     print(f"  {line_s}  {C.DIM}# probe request 洪水{C.RST}", flush=True)
+                elif line_s.strip().startswith("http ") and "HTTP" in line_s:
+                    print(f"  {line_s}  {C.DIM}# HTTP REST API 远程控制面板{C.RST}", flush=True)
+                elif line_s.strip().startswith("export ") and "Export" in line_s:
+                    print(f"  {line_s}  {C.DIM}# 导出数据 (TUI 自动保存本地文件){C.RST}", flush=True)
+                elif line_s.strip().startswith("dump ") and "Dump" in line_s:
+                    print(f"  {line_s}  {C.DIM}# 显示数据库表格 (TUI 彩色格式化){C.RST}", flush=True)
                 elif line_s.strip().startswith("Usage:"):
                     print(f"  {C.DIM}{line_s}{C.RST}", flush=True)
                 elif line_s.strip().startswith("Type '<cmd>"):
                     print(f"  {C.DIM}{line_s}  # 输入 '<cmd> --help' 查看详细参数{C.RST}", flush=True)
+                # ===== export/dump 捕获 =====
+                # export json 开始: 以 { 开头 (非前面几种格式之一)
+                elif st.capture_mode == "json" and (line_s.startswith("{") or st.capture_buf):
+                    with st.lock:
+                        st.capture_buf.append(line_s)
+                    # 简易结束检测: 一行含 ]}
+                    if line_s.rstrip().endswith("]}") or line_s.rstrip() == "}":
+                        _finalize_capture()
+                elif st.capture_mode == "csv" and ("," in line_s or st.capture_buf):
+                    with st.lock:
+                        st.capture_buf.append(line_s)
+                    # csv 无明确结束符; 我们在用户 input 循环里检测到下一个命令前手动结束.
+                    # 这里如果收到 rftool> 提示符就结束 (已经在开头 strip 处理了, 所以不会触发)
+                # dump 表格捕获: AP,xx / CLIENT,xx / EAPOL,xx
+                elif line_s.startswith("AP,") or line_s.startswith("CLIENT,") or line_s.startswith("EAPOL,") or                      (st.capture_mode and st.capture_mode.startswith("dump_") and line_s.startswith("type,")):
+                    if line_s.startswith("type,") and not st.capture_buf:
+                        # 打印表头
+                        _print_dump_header(line_s)
+                        st._dump_last_header = True
+                    else:
+                        _print_dump_row(line_s)
+                    with st.lock:
+                        st.capture_buf.append(line_s)
                 elif line_s.strip():
                     # 其他输出 (启动日志等)
                     print(f"  {C.DIM}{line_s}{C.RST}", flush=True)
@@ -275,6 +344,109 @@ def serial_reader():
         except Exception as e:
             if st.running:
                 print(f"  {C.R}[!] reader error: {e}{C.RST}", flush=True)
+
+# ==================== Export/Dump 辅助函数 ====================
+def _finalize_capture():
+    """结束 capture, 保存文件"""
+    with st.lock:
+        mode = st.capture_mode
+        data = list(st.capture_buf)
+        save = st.capture_save_path
+        st.capture_buf = []
+        st.capture_mode = None
+        st.capture_save_path = None
+    if not data:
+        return
+    # 生成本地文件名
+    if save is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ext = "json" if mode == "json" else ("csv" if mode == "csv" else "txt")
+        save = f"rftool_{mode}_{ts}.{ext}"
+    try:
+        with open(save, "w", encoding="utf-8") as f:
+            f.write(chr(10).join(data) + chr(10))
+        nbytes = os.path.getsize(save)
+        print(f"  {C.G}{C.BOLD}[export] 已保存 -> {save} ({nbytes} bytes, {len(data)} 行){C.RST}", flush=True)
+    except Exception as e:
+        print(f"  {C.R}[export] 保存失败: {e}{C.RST}", flush=True)
+
+def _print_dump_header(line_s):
+    """dump 表格表头 (type,bssid_or_mac,ssid,channel,rssi,...)"""
+    cols = [s.strip() for s in line_s.split(",")]
+    col_map = {c: i for i, c in enumerate(cols)}
+    with st.lock:
+        st._dump_cols = cols
+        st._dump_colmap = col_map
+    # 选择显示列
+    show = ["type", "bssid_or_mac", "ssid", "channel", "rssi", "encryption", "vendor", "pmf", "pkt_count"]
+    show_cols = [c for c in show if c in col_map]
+    widths = []
+    header = "  "
+    for cname in show_cols:
+        w = max(8, len(cname) + 2)
+        widths.append(w)
+        header += f"{cname.upper():<{w}}"
+    print(f"  {C.BOLD}{'─'*(sum(widths)+6)}{C.RST}", flush=True)
+    print(f"{C.BOLD}{header}{C.RST}", flush=True)
+    print(f"  {C.BOLD}{'─'*(sum(widths)+6)}{C.RST}", flush=True)
+    with st.lock:
+        st._dump_showcols = show_cols
+        st._dump_widths = widths
+
+def _print_dump_row(line_s):
+    """打印 dump 表格一行"""
+    # 按逗号分隔 (注意 ssid 可能有引号)
+    parts = []
+    i = 0
+    s = line_s
+    while i < len(s):
+        if s[i] == '"':
+            j = s.find('"', i+1)
+            if j < 0:
+                parts.append(s[i+1:])
+                break
+            parts.append(s[i+1:j])
+            i = j + 2
+            if i < len(s) and s[i-1] == ',':
+                pass
+        else:
+            j = s.find(',', i)
+            if j < 0:
+                parts.append(s[i:])
+                break
+            parts.append(s[i:j])
+            i = j + 1
+    try:
+        with st.lock:
+            show_cols = st._dump_showcols
+            widths    = st._dump_widths
+            col_map   = st._dump_colmap
+    except AttributeError:
+        # 无表头, 直接打印
+        print(f"  {C.DIM}{line_s}{C.RST}", flush=True)
+        return
+    out = "  "
+    for idx, cname in enumerate(show_cols):
+        w = widths[idx]
+        try: val = parts[col_map[cname]] if col_map[cname] < len(parts) else "-"
+        except (KeyError, IndexError): val = "-"
+        # 颜色
+        col = C.W
+        if cname == "rssi":
+            try:
+                rv = int(val)
+                col = C.G if rv > -60 else (C.Y if rv > -75 else C.R)
+            except: pass
+        elif cname == "encryption":
+            if   val == "OPEN": col = C.G
+            elif val == "WEP":  col = C.R
+            elif val.startswith("WPA"): col = C.Y
+        elif cname == "type":
+            if   val == "AP":     col = C.CY
+            elif val == "CLIENT": col = C.M
+            elif val == "EAPOL":  col = C.R + C.BOLD
+        out += f"{col}{val:<{w}}{C.RST}"
+    print(out, flush=True)
 
 # ==================== 状态变化提示 ====================
 _last_state = None
@@ -311,7 +483,7 @@ def save_readline():
             pass
 
 # ==================== 命令补全 ====================
-COMMANDS = ["help", "status", "sniff", "stop", "deauth", "beaconflood", "probeflood", "exit", "quit"]
+COMMANDS = ["help", "status", "sniff", "stop", "deauth", "beaconflood", "probeflood", "export", "dump", "http", "exit", "quit"]
 
 def completer(text, state):
     matches = [c for c in COMMANDS if c.startswith(text)]
@@ -324,7 +496,11 @@ def cleanup():
     st.running = False
     time.sleep(0.2)
     print(f"\n\n  {C.BOLD}========== 统计 =========={C.RST}")
-    print(f"  总帧数: {C.G}{st.total_pkts}{C.RST}")
+    print(f"  总帧数:      {C.G}{st.total_pkts}{C.RST}")
+    print(f"  注入帧数:    {C.R}{st.total_inject}{C.RST}")
+    print(f"  DB-APs:      {C.CY}{st.db_aps}{C.RST}")
+    print(f"  DB-Clients:  {C.CY}{st.db_clients}{C.RST}")
+    print(f"  DB-EAPOLs:   {C.CY}{st.db_eapols}{C.RST}")
     for (typ, sub), n in sorted(st.stats.items(), key=lambda x: -x[1]):
         print(f"    {typ:<8} {sub:<14} {n}")
     if st.pcap_file:

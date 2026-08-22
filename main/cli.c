@@ -17,6 +17,8 @@
 #include "wifi_attack.h"
 #include "radio_common.h"
 #include "rgb_led.h"
+#include "wifi_db.h"
+#include "http_server.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,25 +78,62 @@ typedef struct {
 static struct {
     arg_int_t *channel;
     arg_int_t *count;
+    arg_int_t *dwell;
     arg_end_t *end;
 } sniff_args;
 
 static void sniff_arg_reset(void)
 {
-    if (sniff_args.channel) arg_freetable((void **)&sniff_args.channel, 3);
-    sniff_args.channel = arg_int1(NULL, NULL, "<1-14>", "channel 1..14");
+    if (sniff_args.channel) arg_freetable((void **)&sniff_args.channel, 4);
+    sniff_args.channel = arg_int1(NULL, NULL, "<1-14|auto>", "channel 1..14 or 'auto' for rotate");
     sniff_args.count   = arg_int0("n", "count", "<n>", "stop after N packets (0=forever)");
-    sniff_args.end     = arg_end(2);
+    sniff_args.dwell   = arg_int0("d", "dwell", "<ms>", "auto mode: ms per channel (default 1000)");
+    sniff_args.end     = arg_end(3);
 }
 
 static int cmd_sniff(int argc, char **argv)
 {
+    /* 检测 auto 子命令: argv[1] == "auto" */
+    if (argc >= 2 && strcmp(argv[1], "auto") == 0) {
+        /* "auto" 不是合法 int，手动解析 [--dwell N] [-n N] */
+        uint32_t dwell = 1000;
+        uint32_t cnt = 0;
+        int i = 2;
+        while (i < argc) {
+            const char *a = argv[i];
+            if ((strcmp(a, "--dwell") == 0 || strcmp(a, "-d") == 0) && i + 1 < argc) {
+                dwell = (uint32_t)atoi(argv[i+1]);
+                if (dwell < 50) dwell = 50;
+                if (dwell > 60000) dwell = 60000;
+                i += 2;
+            } else if ((strcmp(a, "--count") == 0 || strcmp(a, "-n") == 0) && i + 1 < argc) {
+                cnt = (uint32_t)atoi(argv[i+1]);
+                i += 2;
+            } else {
+                printf("META,WIFI,ERR,msg,bad_option,%s\n", a);
+                fflush(stdout);
+                return 1;
+            }
+        }
+        esp_err_t e = wifi_attack_sniff_auto_start(dwell);
+        if (e != ESP_OK) {
+            printf("META,WIFI,ERR,code,%d,msg,sniff_auto_start_failed\n", e);
+            fflush(stdout);
+            return 1;
+        }
+        (void)cnt;
+        return 0;
+    }
     int nerrors = arg_parse(argc, argv, (void **)&sniff_args);
     if (nerrors) {
         arg_print_errors(stderr, sniff_args.end, argv[0]);
         return 1;
     }
-    uint8_t ch = (uint8_t)sniff_args.channel->ival[0];
+    int ch_raw = sniff_args.channel->ival[0];
+    if (ch_raw < 1 || ch_raw > 14) {
+        printf("META,WIFI,ERR,msg,bad_channel (1-14 or 'auto')\n"); fflush(stdout); return 1;
+    }
+    uint8_t ch = (uint8_t)ch_raw;
     uint32_t cnt = sniff_args.count->count ? (uint32_t)sniff_args.count->ival[0] : 0;
     esp_err_t e = wifi_attack_sniff_start(ch, cnt);
     if (e != ESP_OK) {
@@ -176,7 +215,7 @@ static void beacon_arg_reset(void)
     if (beacon_args.prefix) arg_freetable((void **)&beacon_args.prefix, 4);
     beacon_args.prefix   = arg_str1("p", "prefix", "<str>",   "SSID prefix");
     beacon_args.count    = arg_int0("n", "count", "<n>",     "count (0=forever)");
-    beacon_args.interval = arg_int0("i", "interval", "<ms>", "interval ms (default 100)");
+    beacon_args.interval = arg_int0("i", "interval", "<ms>", "interval ms (default 0=fastest)");
     beacon_args.end      = arg_end(4);
 }
 
@@ -185,7 +224,7 @@ static int cmd_beaconflood(int argc, char **argv)
     int nerrors = arg_parse(argc, argv, (void **)&beacon_args);
     if (nerrors) { arg_print_errors(stderr, beacon_args.end, argv[0]); return 1; }
     uint32_t cnt  = beacon_args.count->count ? (uint32_t)beacon_args.count->ival[0] : 0;
-    uint32_t intv = beacon_args.interval->count ? (uint32_t)beacon_args.interval->ival[0] : 100;
+    uint32_t intv = beacon_args.interval->count ? (uint32_t)beacon_args.interval->ival[0] : 0;
     esp_err_t e = wifi_attack_beacon_flood_start(beacon_args.prefix->sval[0], cnt, intv);
     if (e != ESP_OK) {
         printf("META,WIFI,ERR,code,%d,msg,beacon_start_failed\n", e); fflush(stdout); return 1;
@@ -204,7 +243,7 @@ static void probe_arg_reset(void)
 {
     if (probe_args.count) arg_freetable((void **)&probe_args.count, 3);
     probe_args.count    = arg_int0("n", "count", "<n>",     "count (0=forever)");
-    probe_args.interval = arg_int0("i", "interval", "<ms>", "interval ms (default 100)");
+    probe_args.interval = arg_int0("i", "interval", "<ms>", "interval ms (default 0=fastest)");
     probe_args.end      = arg_end(2);
 }
 
@@ -213,10 +252,109 @@ static int cmd_probeflood(int argc, char **argv)
     int nerrors = arg_parse(argc, argv, (void **)&probe_args);
     if (nerrors) { arg_print_errors(stderr, probe_args.end, argv[0]); return 1; }
     uint32_t cnt  = probe_args.count->count ? (uint32_t)probe_args.count->ival[0] : 0;
-    uint32_t intv = probe_args.interval->count ? (uint32_t)probe_args.interval->ival[0] : 100;
+    uint32_t intv = probe_args.interval->count ? (uint32_t)probe_args.interval->ival[0] : 0;
     esp_err_t e = wifi_attack_probe_flood_start(cnt, intv);
     if (e != ESP_OK) {
         printf("META,WIFI,ERR,code,%d,msg,probe_start_failed\n", e); fflush(stdout); return 1;
+    }
+    return 0;
+}
+
+
+/* ---------- http ---------- */
+static struct {
+    arg_str_t *subcmd;
+    arg_str_t *ssid;
+    arg_str_t *pass;
+    arg_end_t *end;
+} http_args;
+
+static void http_arg_reset(void)
+{
+    if (http_args.subcmd) arg_freetable((void **)&http_args.subcmd, 4);
+    http_args.subcmd = arg_str1(NULL, NULL, "<start|stop|status>", "subcommand");
+    http_args.ssid   = arg_str0(NULL, "ssid", "<str>", "AP SSID (start only)");
+    http_args.pass   = arg_str0(NULL, "pass", "<str>", "AP password (start only, min 8)");
+    http_args.end    = arg_end(4);
+}
+
+static int cmd_http(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&http_args);
+    if (nerrors) { arg_print_errors(stderr, http_args.end, argv[0]); return 1; }
+    const char *sub = http_args.subcmd->sval[0];
+    if (strcmp(sub, "start") == 0) {
+        const char *ssid = (http_args.ssid->count) ? http_args.ssid->sval[0] : NULL;
+        const char *pw   = (http_args.pass->count) ? http_args.pass->sval[0] : NULL;
+        esp_err_t e = http_server_start(ssid, pw);
+        if (e != ESP_OK) { printf("META,WIFI,ERR,code,%d,msg,http_start_failed\n", e); fflush(stdout); return 1; }
+
+        return 0;
+    } else if (strcmp(sub, "stop") == 0) {
+        esp_err_t e = http_server_stop();
+        if (e != ESP_OK) { printf("META,WIFI,ERR,code,%d,msg,http_stop_failed\n", e); fflush(stdout); return 1; }
+
+        return 0;
+    } else if (strcmp(sub, "status") == 0) {
+        http_server_status();
+        return 0;
+    }
+    printf("META,WIFI,ERR,msg,bad_subcmd (start|stop|status)\n"); fflush(stdout);
+
+    return 1;
+}
+
+/* ---------- export ---------- */
+static struct {
+    arg_str_t *format;
+    arg_end_t *end;
+} export_args;
+
+static void export_arg_reset(void)
+{
+    if (export_args.format) arg_freetable((void **)&export_args.format, 2);
+    export_args.format = arg_str1(NULL, NULL, "<csv|json>", "export format");
+    export_args.end    = arg_end(2);
+}
+
+static int cmd_export(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&export_args);
+    if (nerrors) { arg_print_errors(stderr, export_args.end, argv[0]); return 1; }
+    const char *fmt = export_args.format->sval[0];
+    if (strcmp(fmt, "csv") == 0) {
+        wifi_db_export_csv();
+    } else if (strcmp(fmt, "json") == 0) {
+        wifi_db_export_json();
+    } else {
+        printf("META,WIFI,ERR,msg,bad_format (csv or json)\n"); fflush(stdout); return 1;
+    }
+    return 0;
+}
+
+/* ---------- dump ---------- */
+static struct {
+    arg_str_t *what;
+    arg_end_t *end;
+} dump_args;
+
+static void dump_arg_reset(void)
+{
+    if (dump_args.what) arg_freetable((void **)&dump_args.what, 2);
+    dump_args.what = arg_str1(NULL, NULL, "<aps|clients|eapols|all>", "what to dump");
+    dump_args.end  = arg_end(2);
+}
+
+static int cmd_dump(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&dump_args);
+    if (nerrors) { arg_print_errors(stderr, dump_args.end, argv[0]); return 1; }
+    const char *w = dump_args.what->sval[0];
+    if (strcmp(w, "aps") == 0 || strcmp(w, "all") == 0) wifi_db_dump_aps();
+    if (strcmp(w, "clients") == 0 || strcmp(w, "all") == 0) wifi_db_dump_clients();
+    if (strcmp(w, "eapols") == 0 || strcmp(w, "all") == 0) wifi_db_dump_eapols();
+    if (strcmp(w, "aps") && strcmp(w, "clients") && strcmp(w, "eapols") && strcmp(w, "all")) {
+        printf("META,WIFI,ERR,msg,bad_target (aps|clients|eapols|all)\n"); fflush(stdout); return 1;
     }
     return 0;
 }
@@ -240,7 +378,7 @@ static int cmd_help(int argc, char **argv)
         "  help         Show this help\n"
         "  status       Show current state and counters\n"
         "  sniff        Start Wi-Fi promiscuous sniff (output PKT/HEX lines)\n"
-        "                  Usage: sniff <1-14> [--count=<n>]\n"
+        "                  Usage: sniff <1-14|auto> [opts]\n"
         "  stop         Stop current sniff/inject\n"
         "  deauth       Deauth frame inject (authorized use only)\n"
         "                  Usage: deauth -b <bssid> [-s <station>] [opts]\n"
@@ -248,6 +386,12 @@ static int cmd_help(int argc, char **argv)
         "                  Usage: beaconflood -p <prefix> [opts]\n"
         "  probeflood   Probe request flood\n"
         "                  Usage: probeflood [opts]\n"
+        "  export       Export tracked tables (CSV or JSON)\n"
+        "                  Usage: export <csv|json>\n"
+        "  dump         Dump tracked tables to console\n"
+        "                  Usage: dump <aps|clients|eapols|all>\n"
+        "  http         HTTP REST API remote control\n"
+        "                  Usage: http <start|stop|status> [opts]\n"
         "\n"
         "  Type '<cmd> --help' for detailed options.\n"
         , stdout);
@@ -260,11 +404,14 @@ static int cmd_help(int argc, char **argv)
 static const cli_cmd_t g_cmds[] = {
     { "help",        "Show command list",    NULL,                   cmd_help,        NULL },
     { "status",      "Show state/counters",  NULL,                   cmd_status,      NULL },
-    { "sniff",       "Start promisc sniff",  "<1-14> [--count=<n>]", cmd_sniff,       sniff_arg_reset },
+    { "sniff",       "Start promisc sniff",  "<1-14|auto> [opts]", cmd_sniff,       sniff_arg_reset },
     { "stop",        "Stop sniff/inject",    NULL,                   cmd_stop,        NULL },
     { "deauth",      "Deauth inject",        "-b <bssid> [opts]",    cmd_deauth,      deauth_arg_reset },
     { "beaconflood", "Beacon flood",         "-p <prefix> [opts]",   cmd_beaconflood, beacon_arg_reset },
     { "probeflood",  "Probe req flood",      "[opts]",               cmd_probeflood,  probe_arg_reset },
+    { "http",        "HTTP REST API",        "<start|stop|status>",  cmd_http,        http_arg_reset },
+    { "export",      "Export data",          "<csv|json>",           cmd_export,      export_arg_reset },
+    { "dump",        "Dump tables",          "<aps|clients|eapols|all>", cmd_dump,   dump_arg_reset },
 };
 #define NUM_CMDS  (sizeof(g_cmds) / sizeof(g_cmds[0]))
 
@@ -315,6 +462,9 @@ static int exec_line(char *line)
             else if (c->func == cmd_deauth)      { at = (void **)&deauth_args;      n = 6; }
             else if (c->func == cmd_beaconflood) { at = (void **)&beacon_args;      n = 4; }
             else if (c->func == cmd_probeflood)  { at = (void **)&probe_args;       n = 3; }
+            else if (c->func == cmd_export)      { at = (void **)&export_args;      n = 2; }
+            else if (c->func == cmd_dump)         { at = (void **)&dump_args;        n = 2; }
+            
             if (at && n > 0) arg_print_glossary(stdout, at, "  %-30s %s\n");
         }
         fflush(stdout);
@@ -345,6 +495,9 @@ esp_err_t cli_start(void)
     deauth_arg_reset();
     beacon_arg_reset();
     probe_arg_reset();
+    export_arg_reset();
+    dump_arg_reset();
+    http_arg_reset();
 
     static char line[MAX_CMDLINE];
 

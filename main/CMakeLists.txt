@@ -18,4 +18,5 @@ idf_component_register(
         esp_timer
         esp_driver_rmt
         esp_rom
+        esp_http_server
 )
