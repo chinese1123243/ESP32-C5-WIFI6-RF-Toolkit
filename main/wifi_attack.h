@@ -51,8 +51,18 @@ esp_err_t wifi_attack_probe_flood_start(uint32_t count, uint32_t interval_ms);
 /* 停止当前注入任务 (若有). 安全可重复调用. */
 esp_err_t wifi_attack_inject_stop(void);
 
+/* 启动信道自动轮询嗅探. dwell_ms: 每信道停留毫秒. */
+esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms);
+
 /* 打印 META 状态行 (state / channel / counters). */
 void wifi_attack_status(void);
+
+/* 供外部模块 (HTTP) 读取的原子 getter. */
+int      wifi_atk_state_val(void);
+uint8_t  wifi_atk_channel(void);
+bool     wifi_atk_auto_ch(void);
+uint32_t wifi_atk_sniff_total(void);
+uint32_t wifi_atk_inject_total(void);
 
 #ifdef __cplusplus
 }

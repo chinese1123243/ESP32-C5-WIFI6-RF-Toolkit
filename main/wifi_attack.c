@@ -16,6 +16,7 @@
 #include "wifi_attack.h"
 #include "radio_common.h"
 #include "rgb_led.h"
+#include "wifi_db.h"
 
 #include <stdatomic.h>
 #include <string.h>
@@ -46,6 +47,23 @@ static SemaphoreHandle_t s_inject_mtx  = NULL;    /* 同时仅一个注入任务
 static SemaphoreHandle_t s_stop_sem    = NULL;    /* 唤醒嗅探 stopper 任务 */
 static TaskHandle_t      s_inject_task = NULL;
 static _Atomic bool      s_inject_stop  = false;
+
+/* ===================== 信道轮询任务 ===================== */
+static _Atomic bool s_channel_rotate = false;
+static _Atomic uint32_t s_dwell_ms = 1000;
+
+static void channel_rotate_task(void *pv)
+{
+    uint8_t ch = 1;
+    while (atomic_load(&s_channel_rotate)) {
+        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+        atomic_store(&s_sniff_channel, ch);
+        ch++;
+        if (ch > 13) ch = 1;
+        vTaskDelay(pdMS_TO_TICKS(atomic_load(&s_dwell_ms)));
+    }
+    vTaskDelete(NULL);
+}
 
 /* ===================== 注入任务参数 ===================== */
 typedef enum {
@@ -131,6 +149,27 @@ static void wifi_sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type)
         extract_ssid(f, frame_len, ssid, sizeof(ssid));
         if (ssid[0] == '\0') { strncpy(ssid, "<hidden>", sizeof(ssid) - 1); ssid[sizeof(ssid)-1]='\0'; }
     }
+    /* Track AP in database (beacon/probe_resp) */
+    if (ftype == FC_TYPE_MGMT && (fsub == 0x8 || fsub == 0x5)) {
+        wifi_db_update_ap(f, frame_len, atomic_load(&s_sniff_channel), rssi);
+    }
+    /* Track clients from data frames */
+    if (ftype == FC_TYPE_DATA) {
+        wifi_db_update_client(f, frame_len, rssi);
+        if (wifi_db_check_eapol(f, frame_len, rssi)) {
+            char esrc[18], edst[18];
+            mac_to_str(f + 10, esrc);
+            mac_to_str(f + 4, edst);
+            printf("META,WIFI,EAPOL,DETECTED,src,%s,dst,%s\n", esrc, edst);
+            fflush(stdout);
+            rgb_led_pulse(60, 0, 60, 0);
+        }
+    }
+    /* Passive deauth detection */
+    if (ftype == FC_TYPE_MGMT && fsub == 0xc) {
+        printf("META,WIFI,DEAUTH,DETECTED,src,%s,dst,%s,rssi,%d\n", sa, da, rssi);
+        fflush(stdout);
+    }
 
     printf("PKT,WIFI,%s,%s,%d,%d,%s,%s,%s,%s\n",
            frame_type_str(ftype), frame_subtype_str(ftype, fsub),
@@ -180,7 +219,7 @@ static void inject_task(void *pv)
                 len = mk_deauth_frame(frame, a->bssid, a->sta, true, a->reason);
                 uint8_t f2[26];
                 int l2 = mk_deauth_frame(f2, a->bssid, a->sta, false, a->reason);
-                esp_wifi_80211_tx(WIFI_IF_STA, f2, l2, false);
+                esp_wifi_80211_tx(WIFI_IF_STA, f2, l2, true);
             }
         } else if (a->mode == INJECT_BEACON) {
             uint8_t src[6];
@@ -197,7 +236,7 @@ static void inject_task(void *pv)
         }
 
         if (len > 0) {
-            esp_err_t e = esp_wifi_80211_tx(WIFI_IF_STA, frame, len, false);
+            esp_err_t e = esp_wifi_80211_tx(WIFI_IF_STA, frame, len, true);
             sent++;
             atomic_store(&s_inject_total, sent);
             if (e != ESP_OK) {
@@ -254,6 +293,7 @@ esp_err_t wifi_attack_init(void)
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start");
     esp_wifi_set_ps(WIFI_PS_NONE);   /* 关省电, 减少 tx 抖动 */
 
+    wifi_db_init();
     ESP_LOGI(TAG, "Wi-Fi init ok (STA, PS_NONE)");
     rgb_led_set_status(RGB_IDLE);
     return ESP_OK;
@@ -274,6 +314,7 @@ esp_err_t wifi_attack_sniff_start(uint8_t channel, uint32_t count)
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
 
+    wifi_db_clear();
     atomic_store(&s_sniff_channel, channel);
     /* count=0 -> 永续: 用 UINT32_MAX 占位 (回调里 !=UINT32_MAX 才递减, 故永不动) */
     atomic_store(&s_sniff_remaining, count ? count : UINT32_MAX);
@@ -287,17 +328,7 @@ esp_err_t wifi_attack_sniff_start(uint8_t channel, uint32_t count)
     return ESP_OK;
 }
 
-esp_err_t wifi_attack_sniff_stop(void)
-{
-    if (atomic_load(&s_state) != WIFI_ATK_SNIFF) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    /* 标记停止, 由 stopper task 执行真正 set_promiscuous(false).
-     * 先原子改 state 阻断回调, 再唤醒 stopper. */
-    atomic_store(&s_state, WIFI_ATK_IDLE);
-    xSemaphoreGive(s_stop_sem);
-    return ESP_OK;
-}
+
 
 static esp_err_t inject_start_common(inject_args_t *a)
 {
@@ -378,15 +409,82 @@ esp_err_t wifi_attack_inject_stop(void)
     return ESP_OK;
 }
 
+esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms)
+{
+    if (atomic_load(&s_state) != WIFI_ATK_IDLE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (dwell_ms < 100) dwell_ms = 100;
+
+    wifi_promiscuous_filter_t filt = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA,
+    };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(wifi_sniff_cb);
+    esp_wifi_set_promiscuous(true);
+
+    wifi_db_clear();
+    atomic_store(&s_dwell_ms, dwell_ms);
+    atomic_store(&s_channel_rotate, true);
+    atomic_store(&s_sniff_remaining, UINT32_MAX);
+    atomic_store(&s_sniff_total, 0);
+    atomic_store(&s_state, WIFI_ATK_SNIFF);
+    rgb_led_set_status(RGB_SNIFF);
+
+    BaseType_t r = xTaskCreate(channel_rotate_task, "chrot", 2048, NULL, 5, NULL);
+    if (r != pdPASS) {
+        atomic_store(&s_state, WIFI_ATK_IDLE);
+        atomic_store(&s_channel_rotate, false);
+        esp_wifi_set_promiscuous(false);
+        rgb_led_set_status(RGB_IDLE);
+        return ESP_FAIL;
+    }
+
+    printf("META,WIFI,SNIFF,AUTO,START,dwell_ms,%u\n", (unsigned)dwell_ms);
+    fflush(stdout);
+    return ESP_OK;
+}
+
+static void sniff_stop_common(void)
+{
+    if (atomic_load(&s_channel_rotate)) {
+        atomic_store(&s_channel_rotate, false);
+    }
+}
+
+esp_err_t wifi_attack_sniff_stop(void)
+{
+    if (atomic_load(&s_state) != WIFI_ATK_SNIFF) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    sniff_stop_common();
+    atomic_store(&s_state, WIFI_ATK_IDLE);
+    xSemaphoreGive(s_stop_sem);
+    return ESP_OK;
+}
+
 void wifi_attack_status(void)
 {
     wifi_atk_state_t st = atomic_load(&s_state);
     const char *stname = (st == WIFI_ATK_SNIFF)  ? "SNIFF"  :
                          (st == WIFI_ATK_INJECT) ? "INJECT" : "IDLE";
-    printf("META,WIFI,STATUS,state,%s,channel,%u,sniff_total,%u,inject_total,%u\n",
+    bool auto_ch = atomic_load(&s_channel_rotate);
+    printf("META,WIFI,STATUS,state,%s,channel,%u,auto_ch,%u,sniff_total,%u,inject_total,%u,aps,%u,clients,%u,eapols,%u\n",
            stname,
            (unsigned)atomic_load(&s_sniff_channel),
+           auto_ch ? 1u : 0u,
            (unsigned)atomic_load(&s_sniff_total),
-           (unsigned)atomic_load(&s_inject_total));
+           (unsigned)atomic_load(&s_inject_total),
+           (unsigned)wifi_db_ap_count(),
+           (unsigned)wifi_db_client_count(),
+           (unsigned)wifi_db_eapol_count());
     fflush(stdout);
 }
+
+
+/* ===================== 外部 getter (HTTP 用) ===================== */
+int wifi_atk_state_val(void)       { return (int)atomic_load(&s_state); }
+uint8_t wifi_atk_channel(void)     { return (uint8_t)atomic_load(&s_sniff_channel); }
+bool wifi_atk_auto_ch(void)        { return atomic_load(&s_channel_rotate); }
+uint32_t wifi_atk_sniff_total(void){ return (uint32_t)atomic_load(&s_sniff_total); }
+uint32_t wifi_atk_inject_total(void){ return (uint32_t)atomic_load(&s_inject_total); }
