@@ -322,13 +322,17 @@ static int cmd_export(int argc, char **argv)
     int nerrors = arg_parse(argc, argv, (void **)&export_args);
     if (nerrors) { arg_print_errors(stderr, export_args.end, argv[0]); return 1; }
     const char *fmt = export_args.format->sval[0];
+    rgb_status_t prev = rgb_led_get_status();
+    rgb_led_set_status(RGB_EXPORT);
     if (strcmp(fmt, "csv") == 0) {
         wifi_db_export_csv();
     } else if (strcmp(fmt, "json") == 0) {
         wifi_db_export_json();
     } else {
+        rgb_led_set_status(prev);
         printf("META,WIFI,ERR,msg,bad_format (csv or json)\n"); fflush(stdout); return 1;
     }
+    rgb_led_set_status(prev);
     return 0;
 }
 
@@ -350,12 +354,16 @@ static int cmd_dump(int argc, char **argv)
     int nerrors = arg_parse(argc, argv, (void **)&dump_args);
     if (nerrors) { arg_print_errors(stderr, dump_args.end, argv[0]); return 1; }
     const char *w = dump_args.what->sval[0];
+    rgb_status_t prev = rgb_led_get_status();
+    rgb_led_set_status(RGB_DUMP);
     if (strcmp(w, "aps") == 0 || strcmp(w, "all") == 0) wifi_db_dump_aps();
     if (strcmp(w, "clients") == 0 || strcmp(w, "all") == 0) wifi_db_dump_clients();
     if (strcmp(w, "eapols") == 0 || strcmp(w, "all") == 0) wifi_db_dump_eapols();
     if (strcmp(w, "aps") && strcmp(w, "clients") && strcmp(w, "eapols") && strcmp(w, "all")) {
+        rgb_led_set_status(prev);
         printf("META,WIFI,ERR,msg,bad_target (aps|clients|eapols|all)\n"); fflush(stdout); return 1;
     }
+    rgb_led_set_status(prev);
     return 0;
 }
 
@@ -472,7 +480,9 @@ static int exec_line(char *line)
     }
 
     if (c->arg_reset) c->arg_reset();
-    return c->func(argc, argv);
+    int ret = c->func(argc, argv);
+    rgb_led_event(ret == 0 ? RGB_EV_CMD_SUCCESS : RGB_EV_CMD_ERROR, 0);
+    return ret;
 }
 
 /* ===================== REPL 主循环 ===================== */
