@@ -50,15 +50,36 @@ ftool-AP**（默认无密码），浏览器访问 http://192.168.71.1 即可远�
 
 ## RGB LED 状态指示
 
-板载 WS2812 (GPIO27) 实时反映固件状态：
+板载 WS2812 (GPIO27) 实时反映固件状态。v2 扩展版提供 **13 种主状态**（持久显示）+ **6 种瞬态事件**（短闪后恢复主状态），无需看屏幕即可判断设备当前行为。
 
-| 颜色 | 状态 | 含义 |
+### 主状态（持久）
+
+| 颜色 | 状态枚举 | 含义 |
 |---|---|---|
-| 紫色 | BOOT | 启动中，Wi-Fi 初始化 |
-| 蓝色 | IDLE | 空闲待命 |
-| 亮绿 | SNIFF | 嗅探中，每帧闪一下 |
-| 亮红 | INJECT | 注入中，每 5 帧闪一下 |
-| 最亮红 | ERROR | 出错 |
+| 黑 | OFF | 关灯 / 启动早期 |
+| 暗紫 | BOOT | 初始化中（NVS/Wi-Fi/DB 未就绪） |
+| 暗蓝 | IDLE | REPL 待命，无后台任务 |
+| 深绿 | SNIFF_SINGLE | 单信道 promiscuous 嗅探（固定信道） |
+| 黄绿 | SNIFF_AUTO | 自动信道轮询（channel_rotate 运行中） |
+| 亮红 | INJECT_DEAUTH | Deauth / Disassoc 帧注入 |
+| 洋红 | INJECT_BEACON | Beacon Flood（伪造 AP） |
+| 橙红 | INJECT_PROBE | Probe Flood（伪造探测请求） |
+| 青蓝 | HTTP_READY | HTTP REST API 已启动（SoftAP 待机） |
+| 金黄 | EXPORT | 正在导出 CSV/JSON |
+| 浅紫 | DUMP | 正在 dump 表到串口 |
+| 橙 | WARN | 参数错误 / 边界告警（非致命） |
+| 亮红 | ERROR | 致命错误（初始化失败） |
+
+### 瞬态事件（短闪后恢复主状态）
+
+| 闪色 | 事件 | 触发条件 | 时长 |
+|---|---|---|---|
+| 白 | EV_EAPOL_CAPTURED | 抓到 EAPOL M1/M2 握手包 | 150ms |
+| 蓝 | EV_CHAN_SWITCH | 自动轮询跳变到下一信道 | 40ms |
+| 主色加深 | EV_TX_OK | 注入包 TX 成功（50ms 节流） | 15ms |
+| 绿 | EV_CMD_SUCCESS | CLI 命令执行成功 | 100ms |
+| 红 | EV_CMD_ERROR | CLI 命令参数/执行错误 | 100ms |
+| 青 | EV_STA_JOIN | 有 STA 连入 HTTP SoftAP | 80ms |
 
 ## 目录结构
 
