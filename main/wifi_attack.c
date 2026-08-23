@@ -104,15 +104,22 @@ static void sniff_stopper_task(void *pv)
 /* 从 mgmt 帧体里提取 SSID IE. 返回写入 dst 的字节数 (不含 nul), 失败 0. */
 static int extract_ssid(const uint8_t *frame, int len, char *dst, int dst_cap)
 {
-    int off = 24;  /* 跨过 FC(2)+dur(2)+addr1/2/3(18)+seq(2) */
+    int off = 24;
     while (off + 2 <= len) {
         uint8_t id   = frame[off];
         uint8_t slen = frame[off + 1];
         if (off + 2 + slen > len) break;
         if (id == 0) {
+            if (slen == 0) { dst[0] = '\0'; return 0; }
             int n = slen < dst_cap - 1 ? slen : dst_cap - 1;
             memcpy(dst, frame + off + 2, n);
             dst[n] = '\0';
+            for (int i = 0; i < n; i++) {
+                if ((unsigned char)dst[i] < 0x20 || (unsigned char)dst[i] > 0x7e) {
+                    dst[0] = '\0';
+                    return 0;
+                }
+            }
             return n;
         }
         off += 2 + slen;
@@ -148,7 +155,7 @@ static void wifi_sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type)
     char ssid[34] = "-";
     if ((ftype == FC_TYPE_MGMT) && (fsub == 0x8 || fsub == 0x5)) {
         extract_ssid(f, frame_len, ssid, sizeof(ssid));
-        if (ssid[0] == '\0') { strncpy(ssid, "<hidden>", sizeof(ssid) - 1); ssid[sizeof(ssid)-1]='\0'; }
+        if (ssid[0] == '\0') { memcpy(ssid, "<hidden>", 9); }
     }
     /* Track AP in database (beacon/probe_resp) */
     if (ftype == FC_TYPE_MGMT && (fsub == 0x8 || fsub == 0x5)) {
