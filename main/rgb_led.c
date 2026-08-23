@@ -1,5 +1,5 @@
 /*
- * rgb_led.c — WS2812 RMT 驱动实现
+ * rgb_led.c — WS2812 RMT 驱动实现 (v2: 扩展状态 + 瞬态事件)
  *
  * 适配 ESP-IDF v5.5.3 (无 led_strip 组件, 用 RMT + 自定义 encoder).
  * encoder 逻辑移植自 examples/peripherals/rmt/led_strip/led_strip_encoder.c.
@@ -21,8 +21,11 @@ static const char *TAG = "RGB";
 
 static rmt_channel_handle_t s_chan = NULL;
 static rmt_encoder_handle_t s_enc  = NULL;
-static rgb_status_t         s_last = RGB_OFF;
+static rgb_status_t         s_cur_status = RGB_OFF;   /* 单一事实源: 当前主状态 */
 static bool                 s_inited = false;
+
+/* ---------- 瞬态事件节流: 每种事件记录上次触发时间(ms) ---------- */
+static uint32_t s_ev_last_tick[RGB_EV_MAX] = {0};
 
 /* ---------- WS2812 RMT encoder (移植自官方 example) ---------- */
 
@@ -83,8 +86,6 @@ static esp_err_t rmt_led_reset(rmt_encoder_t *encoder)
 
 static esp_err_t rmt_new_led_encoder(uint32_t resolution, rmt_encoder_handle_t *ret_encoder)
 {
-    /* 注意: ESP_GOTO_ON_* 宏内部固定写入名为 `ret` 的变量, 故输出参数须改名
-     * (官方 led_strip_encoder.c 亦如此), 并声明本地 esp_err_t ret. */
     esp_err_t ret = ESP_OK;
     rmt_led_encoder_t *led = rmt_alloc_encoder_mem(sizeof(*led));
     ESP_GOTO_ON_FALSE(led, ESP_ERR_NO_MEM, err, TAG, "no mem");
@@ -120,7 +121,6 @@ err:
 static esp_err_t rgb_tx(uint8_t r, uint8_t g, uint8_t b)
 {
     if (!s_inited) return ESP_ERR_INVALID_STATE;
-    /* WS2812 字节序: G7..G0 R7..R0 B7..B0 (msb first) */
     uint8_t grb[GRB_BYTES] = { g, r, b };
     rmt_transmit_config_t tx = { .loop_count = 0 };
     ESP_RETURN_ON_ERROR(rmt_transmit(s_chan, s_enc, grb, sizeof(grb), &tx),
@@ -143,25 +143,52 @@ esp_err_t rgb_led_init(void)
     ESP_RETURN_ON_ERROR(rmt_new_led_encoder(RMT_RES_HZ, &s_enc), TAG, "new encoder");
     ESP_RETURN_ON_ERROR(rmt_enable(s_chan), TAG, "enable");
     s_inited = true;
-    s_last = RGB_BOOT;
+    s_cur_status = RGB_BOOT;
     rgb_tx(20, 0, 20);  /* 启动: 紫 */
     ESP_LOGI(TAG, "WS2812 init ok, GPIO=%d", RFTOOL_RGB_GPIO);
     return ESP_OK;
 }
 
-/* 状态 -> 颜色映射 (亮度调暗, 护眼/省电) */
+/* v2: 主状态 -> 颜色映射 (亮度调暗, 护眼/省电) */
 static void status_to_rgb(rgb_status_t s, uint8_t *r, uint8_t *g, uint8_t *b)
 {
     switch (s) {
-    case RGB_OFF:    *r = 0;   *g = 0;   *b = 0;   break;
-    case RGB_BOOT:   *r = 8;   *g = 0;   *b = 8;   break;  /* 暗紫 */
-    case RGB_IDLE:   *r = 0;   *g = 0;   *b = 12;  break;  /* 暗蓝 */
-    case RGB_SNIFF:  *r = 0;   *g = 24;  *b = 0;   break;  /* 绿 */
-    case RGB_INJECT: *r = 32;  *g = 0;   *b = 0;   break;  /* 红 */
-    case RGB_ERROR:  *r = 48;  *g = 0;   *b = 0;   break;  /* 亮红 */
-    default:         *r = 0;   *g = 0;   *b = 0;   break;
+    /* --- 基础 --- */
+    case RGB_OFF:           *r = 0;   *g = 0;   *b = 0;   break;
+    case RGB_BOOT:          *r = 8;   *g = 0;   *b = 8;   break;  /* 暗紫 */
+    case RGB_IDLE:          *r = 0;   *g = 0;   *b = 12;  break;  /* 暗蓝 */
+    case RGB_ERROR:         *r = 48;  *g = 0;   *b = 0;   break;  /* 亮红 */
+
+    /* --- 嗅探 --- */
+    case RGB_SNIFF_SINGLE:  *r = 0;   *g = 24;  *b = 0;   break;  /* 深绿 */
+    case RGB_SNIFF_AUTO:    *r = 16;  *g = 24;  *b = 0;   break;  /* 黄绿 */
+
+    /* --- 注入 --- */
+    case RGB_INJECT_DEAUTH: *r = 32;  *g = 0;   *b = 0;   break;  /* 亮红 */
+    case RGB_INJECT_BEACON: *r = 32;  *g = 0;   *b = 24;  break;  /* 洋红 */
+    case RGB_INJECT_PROBE:  *r = 32;  *g = 12;  *b = 0;   break;  /* 橙红 */
+
+    /* --- 系统状态 --- */
+    case RGB_HTTP_READY:    *r = 0;   *g = 16;  *b = 24;  break;  /* 青蓝 */
+    case RGB_EXPORT:        *r = 24;  *g = 20;  *b = 0;   break;  /* 金黄 */
+    case RGB_DUMP:          *r = 12;  *g = 0;   *b = 20;  break;  /* 浅紫 */
+    case RGB_WARN:          *r = 24;  *g = 12;  *b = 0;   break;  /* 橙 */
+
+    default:                *r = 0;   *g = 0;   *b = 0;   break;
     }
 }
+
+/* v2: 瞬态事件 -> (颜色, 持续ms) 映射 */
+typedef struct { uint8_t r, g, b; uint32_t ms; } ev_flash_t;
+
+static const ev_flash_t s_ev_flash[RGB_EV_MAX] = {
+    [RGB_EV_EAPOL_CAPTURED] = { 60, 60, 60, 150 },  /* 白, 150ms */
+    [RGB_EV_CHAN_SWITCH]     = { 0,  0,  48, 40 },   /* 蓝, 40ms  */
+    [RGB_EV_TX_OK]           = { 0,  0,  0,  0 },     /* 特殊: 加深主色 15ms */
+    [RGB_EV_CMD_SUCCESS]     = { 0,  40, 0,  100 },  /* 绿, 100ms */
+    [RGB_EV_CMD_ERROR]       = { 48, 0,  0,  100 },  /* 红, 100ms */
+    [RGB_EV_STA_JOIN]        = { 0,  32, 32, 80 },   /* 青, 80ms  */
+};
 
 esp_err_t rgb_led_set(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -170,10 +197,46 @@ esp_err_t rgb_led_set(uint8_t r, uint8_t g, uint8_t b)
 
 esp_err_t rgb_led_set_status(rgb_status_t s)
 {
-    s_last = s;
+    s_cur_status = s;
     uint8_t r, g, b;
     status_to_rgb(s, &r, &g, &b);
     return rgb_tx(r, g, b);
+}
+
+rgb_status_t rgb_led_get_status(void)
+{
+    return s_cur_status;
+}
+
+void rgb_led_event(rgb_event_t ev, uint32_t skip_if_same_interval_ms)
+{
+    if (!s_inited || ev >= RGB_EV_MAX) return;
+
+    /* 节流: 同类事件在窗口内跳过 */
+    if (skip_if_same_interval_ms > 0) {
+        uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        if (now - s_ev_last_tick[ev] < skip_if_same_interval_ms) return;
+        s_ev_last_tick[ev] = now;
+    }
+
+    const ev_flash_t *f = &s_ev_flash[ev];
+
+    if (ev == RGB_EV_TX_OK) {
+        /* 特殊: 加深当前主状态颜色, 短闪 15ms */
+        uint8_t r, g, b;
+        status_to_rgb(s_cur_status, &r, &g, &b);
+        rgb_tx(r > 0 ? r + 16 : 0, g > 0 ? g + 16 : 0, b > 0 ? b + 16 : 0);
+        vTaskDelay(pdMS_TO_TICKS(15));
+        status_to_rgb(s_cur_status, &r, &g, &b);
+        rgb_tx(r, g, b);
+    } else {
+        /* 通用: 闪事件色, 延时, 恢复主状态色 */
+        rgb_tx(f->r, f->g, f->b);
+        if (f->ms) vTaskDelay(pdMS_TO_TICKS(f->ms));
+        uint8_t r, g, b;
+        status_to_rgb(s_cur_status, &r, &g, &b);
+        rgb_tx(r, g, b);
+    }
 }
 
 void rgb_led_pulse(uint8_t r, uint8_t g, uint8_t b, uint32_t ms)
@@ -181,7 +244,8 @@ void rgb_led_pulse(uint8_t r, uint8_t g, uint8_t b, uint32_t ms)
     if (!s_inited) return;
     rgb_tx(r, g, b);
     if (ms) vTaskDelay(pdMS_TO_TICKS(ms));
+    /* v2: 恢复到主状态色 (单一事实源) */
     uint8_t r0, g0, b0;
-    status_to_rgb(s_last, &r0, &g0, &b0);
+    status_to_rgb(s_cur_status, &r0, &g0, &b0);
     rgb_tx(r0, g0, b0);
 }

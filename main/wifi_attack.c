@@ -58,6 +58,7 @@ static void channel_rotate_task(void *pv)
     while (atomic_load(&s_channel_rotate)) {
         esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
         atomic_store(&s_sniff_channel, ch);
+        rgb_led_event(RGB_EV_CHAN_SWITCH, 300);
         ch++;
         if (ch > 13) ch = 1;
         vTaskDelay(pdMS_TO_TICKS(atomic_load(&s_dwell_ms)));
@@ -162,7 +163,7 @@ static void wifi_sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type)
             mac_to_str(f + 4, edst);
             printf("META,WIFI,EAPOL,DETECTED,src,%s,dst,%s\n", esrc, edst);
             fflush(stdout);
-            rgb_led_pulse(60, 0, 60, 0);
+            rgb_led_pulse(80, 80, 80, 0);
         }
     }
     /* Passive deauth detection */
@@ -177,10 +178,6 @@ static void wifi_sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type)
     fflush(stdout);
 
     print_hex_line(f, frame_len);
-
-    if (ftype == FC_TYPE_MGMT) {
-        rgb_led_pulse(0, 40, 0, 0);   /* 暗绿闪, ms=0 不延时 */
-    }
 
     uint32_t total = atomic_fetch_add(&s_sniff_total, 1) + 1;
 
@@ -239,6 +236,7 @@ static void inject_task(void *pv)
             esp_err_t e = esp_wifi_80211_tx(WIFI_IF_STA, frame, len, true);
             sent++;
             atomic_store(&s_inject_total, sent);
+            rgb_led_event(RGB_EV_TX_OK, 50);
             if (e != ESP_OK) {
                 printf("META,WIFI,INJECT,ERR,code,%d\n", e);
                 fflush(stdout);
@@ -320,7 +318,7 @@ esp_err_t wifi_attack_sniff_start(uint8_t channel, uint32_t count)
     atomic_store(&s_sniff_remaining, count ? count : UINT32_MAX);
     atomic_store(&s_sniff_total, 0);
     atomic_store(&s_state, WIFI_ATK_SNIFF);
-    rgb_led_set_status(RGB_SNIFF);
+    rgb_led_set_status(RGB_SNIFF_SINGLE);
 
     printf("META,WIFI,SNIFF,START,channel,%u,count,%lu\n",
            channel, (unsigned long)(count ? count : 0xFFFFFFFFUL));
@@ -343,7 +341,11 @@ static esp_err_t inject_start_common(inject_args_t *a)
     atomic_store(&s_inject_stop, false);
     atomic_store(&s_inject_total, 0);
     atomic_store(&s_state, WIFI_ATK_INJECT);
-    rgb_led_set_status(RGB_INJECT);
+    switch (a->mode) {
+        case INJECT_DEAUTH: rgb_led_set_status(RGB_INJECT_DEAUTH); break;
+        case INJECT_BEACON: rgb_led_set_status(RGB_INJECT_BEACON); break;
+        case INJECT_PROBE:  rgb_led_set_status(RGB_INJECT_PROBE);  break;
+    }
 
     BaseType_t r = xTaskCreate(inject_task, "inject", 4096, a, 5, &s_inject_task);
     if (r != pdPASS) {
@@ -429,7 +431,7 @@ esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms)
     atomic_store(&s_sniff_remaining, UINT32_MAX);
     atomic_store(&s_sniff_total, 0);
     atomic_store(&s_state, WIFI_ATK_SNIFF);
-    rgb_led_set_status(RGB_SNIFF);
+    rgb_led_set_status(RGB_SNIFF_AUTO);
 
     BaseType_t r = xTaskCreate(channel_rotate_task, "chrot", 2048, NULL, 5, NULL);
     if (r != pdPASS) {

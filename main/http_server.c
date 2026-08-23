@@ -48,6 +48,7 @@ static void ap_event_handler(void *arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
         wifi_event_ap_staconnected_t *e = (wifi_event_ap_staconnected_t *)event_data;
         s_sta_num++;
+        rgb_led_event(RGB_EV_STA_JOIN, 0);
         ESP_LOGI(TAG, "station join: AID=%d, MAC=%02x:%02x:%02x:%02x:%02x:%02x, total=%d",
                  e->aid, e->mac[0],e->mac[1],e->mac[2],e->mac[3],e->mac[4],e->mac[5], s_sta_num);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED) {
@@ -612,7 +613,10 @@ esp_err_t http_server_start(const char *ssid, const char *pass)
     register_all_uri(s_server);
 
     s_running = true;
-    rgb_led_pulse(0, 100, 100, 0);
+    if (rgb_led_get_status() == RGB_IDLE)
+        rgb_led_set_status(RGB_HTTP_READY);
+    else
+        rgb_led_pulse(0, 60, 80, 0);
 
     esp_netif_ip_info_t ip;
     esp_netif_get_ip_info(s_ap_netif, &ip);
@@ -634,6 +638,8 @@ esp_err_t http_server_stop(void)
     s_running = false;
     s_sta_num = 0;
     s_ssid[0] = '\0';
+    if (rgb_led_get_status() == RGB_HTTP_READY)
+        rgb_led_set_status(RGB_IDLE);
     printf("META,HTTP,STOP,ok,1\n");
     fflush(stdout);
     return ESP_OK;
