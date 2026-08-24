@@ -23,6 +23,7 @@ typedef enum {
     WIFI_ATK_IDLE = 0,
     WIFI_ATK_SNIFF,
     WIFI_ATK_INJECT,
+    WIFI_ATK_DOWNGRADE,   /* WPA3->WPA2 downgrade AP + EAPOL 4-way capture */
 } wifi_atk_state_t;
 
 /* 初始化 Wi-Fi: NVS / netif / event_loop / STA 模式 / start / PS_NONE.
@@ -53,6 +54,22 @@ esp_err_t wifi_attack_inject_stop(void);
 
 /* 启动信道自动轮询嗅探. dwell_ms: 每信道停留毫秒. */
 esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms);
+
+/* ====== WPA3 -> WPA2 Downgrade AP ======
+ * 启动一个 WPA2-PSK PMF-Disabled 同名 SoftAP, 诱导 WPA3-Transition 客户端
+ * 降级走 WPA2 4-way handshake. 同时开 promiscuous 抓 EAPOL 存 wifi_db.
+ * ssid: 伪造同名 AP 的 SSID (与目标网络同名)
+ * pass: 伪造 AP 的 WPA2 密码 (随便, 客户端连不上反而重试暴露握手)
+ * 返回 ESP_ERR_INVALID_STATE 若当前非 IDLE (会自动调 stop_all). */
+esp_err_t wifi_attack_downgrade_start(const char *ssid, const char *pass);
+
+/* 停止 downgrade AP (回到 IDLE). */
+esp_err_t wifi_attack_downgrade_stop(void);
+
+/* ====== 全局互斥控制 ======
+ * 停止所有正在运行的功能 (sniff + inject + downgrade), 等 inject task 退出.
+ * 任何 _start 函数内部都会先调用此函数实现"启动一个就停其他". */
+esp_err_t wifi_attack_stop_all(void);
 
 /* 打印 META 状态行 (state / channel / counters). */
 void wifi_attack_status(void);
