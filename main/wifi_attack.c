@@ -33,8 +33,27 @@
 #include "esp_wifi.h"
 #include "esp_timer.h"
 #include "esp_random.h"
+#include "esp_rom_uart.h"
+#include <stdarg.h>
 
 static const char *TAG = "WIFI";
+
+/* Direct UART write bypassing stdio lock. Used by inject_task (low prio)
+ * to avoid priority-inheritance deadlock with cli_task (high prio) printf. */
+static void raw_out(const char *fmt, ...)
+{
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        if (n > (int)sizeof(buf)) n = sizeof(buf);
+        for (int i = 0; i < n; i++) {
+            esp_rom_uart_tx_one_char(buf[i]);
+        }
+    }
+}
 
 /* ===================== 模块状态 ===================== */
 static _Atomic wifi_atk_state_t s_state = WIFI_ATK_IDLE;
@@ -245,8 +264,7 @@ static void inject_task(void *pv)
             atomic_store(&s_inject_total, sent);
             rgb_led_event(RGB_EV_TX_OK, 50);
             if (e != ESP_OK) {
-                printf("META,WIFI,INJECT,ERR,code,%d\n", e);
-                fflush(stdout);
+                raw_out("META,WIFI,INJECT,ERR,code,%d\n", e);
             }
             /* breath task handles flashing */
         }
@@ -257,9 +275,8 @@ static void inject_task(void *pv)
 
     atomic_store(&s_state, WIFI_ATK_IDLE);
     rgb_led_set_status(RGB_IDLE);
-    printf("META,WIFI,INJECT,DONE,mode,%d,sent,%u\n",
-           (int)a->mode, (unsigned)sent);
-    fflush(stdout);
+    raw_out("META,WIFI,INJECT,DONE,mode,%d,sent,%u\n",
+            (int)a->mode, (unsigned)sent);
 
     free(a);
     s_inject_task = NULL;
@@ -459,11 +476,24 @@ static void sniff_stop_common(void)
     if (atomic_load(&s_channel_rotate)) {
         atomic_store(&s_channel_rotate, false);
     }
+    /* Directly disable promiscuous - safe from any task context.
+     * The callback checks s_state != SNIFF and returns early,
+     * so there's no race even if a packet is being processed. */
+    esp_wifi_set_promiscuous(false);
 }
 
 esp_err_t wifi_attack_sniff_stop(void)
 {
-    if (atomic_load(&s_state) != WIFI_ATK_SNIFF) {
+    /* If definitely not sniffing, bail fast. But also handle the race where
+     * state shows IDLE but promiscuous is still on (e.g. callback just set
+     * IDLE but hasn't disabled promisc yet). */
+    wifi_atk_state_t st = atomic_load(&s_state);
+    if (st != WIFI_ATK_SNIFF) {
+        /* Defensive: force-close promiscuous regardless of state */
+        if (atomic_load(&s_channel_rotate)) {
+            atomic_store(&s_channel_rotate, false);
+        }
+        esp_wifi_set_promiscuous(false);
         return ESP_ERR_INVALID_STATE;
     }
     sniff_stop_common();

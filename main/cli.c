@@ -148,8 +148,13 @@ static int cmd_sniff(int argc, char **argv)
 static int cmd_stop(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    if (wifi_attack_inject_stop() == ESP_OK) return 0;
-    if (wifi_attack_sniff_stop()    == ESP_OK) return 0;
+    /* Force-stop everything. Run both stops; either may return INVALID_STATE
+     * if that subsystem isn't running, but we still must try the other. */
+    esp_err_t e1 = wifi_attack_inject_stop();
+    esp_err_t e2 = wifi_attack_sniff_stop();
+    if (e1 == ESP_OK || e2 == ESP_OK) {
+        return 0;
+    }
     printf("META,WIFI,ERR,msg,nothing_running\n");
     fflush(stdout);
     return 1;
