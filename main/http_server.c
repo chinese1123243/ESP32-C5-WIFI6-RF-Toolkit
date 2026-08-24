@@ -199,6 +199,12 @@ static esp_err_t h_root_get(httpd_req_t *r)
         "<button onclick='doProbe()'>Probe</button> "
         "<button onclick='doStop()'>STOP</button>"
         "</div>"
+        "<div class='sec'><b>WPA3 Downgrade</b> (auth only)<br>"
+        "<label>SSID<input id='dssid' placeholder='target SSID' style='width:120px'></label>"
+        "<label>pass<input id='dpass' placeholder='rftool1234' value='rftool1234' style='width:90px'></label>"
+        "<button onclick='doDowngrade()'>Start</button> "
+        "<button onclick='doStop()'>STOP</button>"
+        "</div>"
         "<div class='sec'><b>Database</b> <button onclick='loadAll()'>Refresh</button>"
         "<div id='aps'></div><div id='cls'></div></div>"
         "<div class='sec'><b>Export</b> "
@@ -239,6 +245,7 @@ static esp_err_t h_root_get(httpd_req_t *r)
         "function doDeauth(){api('/api/deauth/start',{bssid:val('bssid'),station:val('sta'),count:num('dcnt',20),interval_ms:num('dint',0),reason:7}).then(refresh)}"
         "function doBeacon(){api('/api/beaconflood/start',{prefix:val('prefix'),count:num('bcnt',100),interval_ms:0}).then(refresh)}"
         "function doProbe(){api('/api/probeflood/start',{count:num('pcnt',200),interval_ms:0}).then(refresh)}"
+        "function doDowngrade(){api('/api/downgrade/start',{ssid:val('dssid'),pass:val('dpass')}).then(refresh)}"
         "setInterval(refresh,3000);refresh();loadAll();"
         "</script></body></html>");
     httpd_resp_sendstr_chunk(r, NULL);
@@ -252,7 +259,9 @@ static esp_err_t h_status_get(httpd_req_t *r)
     int cl_cnt = wifi_db_client_count();
     int ep_cnt = wifi_db_eapol_count();
     int st_raw = wifi_atk_state_val();
-    const char *stname = (st_raw == 1) ? "SNIFF" : (st_raw == 2 ? "INJECT" : "IDLE");
+    const char *stname = (st_raw == 1) ? "SNIFF" :
+                         (st_raw == 2 ? "INJECT" :
+                         (st_raw == 3 ? "DOWNGRADE" : "IDLE"));
     unsigned ch   = (unsigned)wifi_atk_channel();
     unsigned auto_ch = wifi_atk_auto_ch() ? 1u : 0u;
     unsigned sniff_t = (unsigned)wifi_atk_sniff_total();
@@ -301,9 +310,25 @@ static esp_err_t h_sniff_auto_post(httpd_req_t *r)
 static esp_err_t h_stop_post(httpd_req_t *r)
 {
     (void)r;
-    esp_err_t e1 = wifi_attack_inject_stop();
-    esp_err_t e2 = wifi_attack_sniff_stop();
-    if (e1 != ESP_OK && e2 != ESP_OK) { send_err(r, "nothing_running"); } else { send_ok(r, NULL); }
+    /* stop_all: 同时停 sniff + inject + downgrade, 等 inject task 退出 */
+    esp_err_t e = wifi_attack_stop_all();
+    if (e != ESP_OK) { send_err(r, "nothing_running"); } else { send_ok(r, NULL); }
+    return ESP_OK;
+}
+
+/* POST /api/downgrade/start */
+static esp_err_t h_downgrade_start_post(httpd_req_t *r)
+{
+    char *body = read_body(r);
+    if (!body) { send_err(r, "oom"); return ESP_OK; }
+    char ssid[64] = {0};
+    char pass[64] = {0};
+    bool ok = json_get_str(body, "ssid", ssid, sizeof(ssid));
+    json_get_str(body, "pass", pass, sizeof(pass));
+    free(body);
+    if (!ok || !ssid[0]) { send_err(r, "missing_ssid"); return ESP_OK; }
+    esp_err_t e = wifi_attack_downgrade_start(ssid, pass[0] ? pass : "rftool1234");
+    if (e != ESP_OK) { send_err(r, "downgrade_start_failed"); } else { send_ok(r, NULL); }
     return ESP_OK;
 }
 
@@ -531,6 +556,7 @@ static const httpd_uri_t s_uri_status =     { .uri = "/api/status",        .meth
 static const httpd_uri_t s_uri_sniff =      { .uri = "/api/sniff/start",   .method = HTTP_POST, .handler = h_sniff_start_post };
 static const httpd_uri_t s_uri_sniff_auto = { .uri = "/api/sniff/auto",    .method = HTTP_POST, .handler = h_sniff_auto_post };
 static const httpd_uri_t s_uri_stop =       { .uri = "/api/stop",          .method = HTTP_POST, .handler = h_stop_post };
+static const httpd_uri_t s_uri_downgrade = { .uri = "/api/downgrade/start",.method = HTTP_POST, .handler = h_downgrade_start_post };
 static const httpd_uri_t s_uri_deauth =     { .uri = "/api/deauth/start",  .method = HTTP_POST, .handler = h_deauth_start_post };
 static const httpd_uri_t s_uri_beacon =     { .uri = "/api/beaconflood/start",.method= HTTP_POST, .handler = h_beacon_start_post };
 static const httpd_uri_t s_uri_probe =      { .uri = "/api/probeflood/start", .method= HTTP_POST, .handler = h_probe_start_post };
@@ -547,6 +573,7 @@ static void register_all_uri(httpd_handle_t srv)
     httpd_register_uri_handler(srv, &s_uri_sniff);
     httpd_register_uri_handler(srv, &s_uri_sniff_auto);
     httpd_register_uri_handler(srv, &s_uri_stop);
+    httpd_register_uri_handler(srv, &s_uri_downgrade);
     httpd_register_uri_handler(srv, &s_uri_deauth);
     httpd_register_uri_handler(srv, &s_uri_beacon);
     httpd_register_uri_handler(srv, &s_uri_probe);
@@ -644,6 +671,8 @@ esp_err_t http_server_start(const char *ssid, const char *pass)
     hcfg.lru_purge_enable = true;
     hcfg.stack_size = 6144;
     hcfg.max_uri_handlers = 16;
+    hcfg.task_priority = 23;   /* 关键: 必须高于 inject_task(5) 和 chrot(5),
+                               * 与 wifi_task(23) 同级, 确保 /api/stop 能抢占注入任务 */
 
     ESP_RETURN_ON_ERROR(httpd_start(&s_server, &hcfg), TAG, "httpd_start fail");
     register_all_uri(s_server);

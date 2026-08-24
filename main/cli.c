@@ -148,11 +148,9 @@ static int cmd_sniff(int argc, char **argv)
 static int cmd_stop(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    /* Force-stop everything. Run both stops; either may return INVALID_STATE
-     * if that subsystem isn't running, but we still must try the other. */
-    esp_err_t e1 = wifi_attack_inject_stop();
-    esp_err_t e2 = wifi_attack_sniff_stop();
-    if (e1 == ESP_OK || e2 == ESP_OK) {
+    /* stop_all: 同时停 sniff + inject + downgrade, 互斥状态机统一入口 */
+    esp_err_t e = wifi_attack_stop_all();
+    if (e == ESP_OK) {
         return 0;
     }
     printf("META,WIFI,ERR,msg,nothing_running\n");
@@ -309,6 +307,34 @@ static int cmd_http(int argc, char **argv)
     return 1;
 }
 
+/* ---------- downgrade ---------- */
+static struct {
+    arg_str_t *ssid;
+    arg_str_t *pass;
+    arg_end_t *end;
+} downgrade_args;
+
+static void downgrade_arg_reset(void)
+{
+    if (downgrade_args.ssid) arg_freetable((void **)&downgrade_args.ssid, 3);
+    downgrade_args.ssid = arg_str1(NULL, NULL, "<ssid>", "target network SSID to clone");
+    downgrade_args.pass = arg_str0(NULL, "pass", "<str>", "fake AP password (default rftool1234)");
+    downgrade_args.end  = arg_end(3);
+}
+
+static int cmd_downgrade(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&downgrade_args);
+    if (nerrors) { arg_print_errors(stderr, downgrade_args.end, argv[0]); return 1; }
+    const char *ssid = downgrade_args.ssid->sval[0];
+    const char *pass = (downgrade_args.pass->count) ? downgrade_args.pass->sval[0] : "rftool1234";
+    esp_err_t e = wifi_attack_downgrade_start(ssid, pass);
+    if (e != ESP_OK) {
+        printf("META,WIFI,ERR,code,%d,msg,downgrade_start_failed\n", e); fflush(stdout); return 1;
+    }
+    return 0;
+}
+
 /* ---------- export ---------- */
 static struct {
     arg_str_t *format;
@@ -405,6 +431,8 @@ static int cmd_help(int argc, char **argv)
         "                  Usage: dump <aps|clients|eapols|all>\n"
         "  http         HTTP REST API remote control\n"
         "                  Usage: http <start|stop|status> [opts]\n"
+        "  downgrade    WPA3->WPA2 downgrade AP + EAPOL capture (authorized use only)\n"
+        "                  Usage: downgrade <ssid> [--pass <str>]\n"
         "\n"
         "  Type '<cmd> --help' for detailed options.\n"
         , stdout);
@@ -423,6 +451,7 @@ static const cli_cmd_t g_cmds[] = {
     { "beaconflood", "Beacon flood",         "-p <prefix> [opts]",   cmd_beaconflood, beacon_arg_reset },
     { "probeflood",  "Probe req flood",      "[opts]",               cmd_probeflood,  probe_arg_reset },
     { "http",        "HTTP REST API",        "<start|stop|status>",  cmd_http,        http_arg_reset },
+    { "downgrade",   "WPA3->WPA2 downgrade AP + EAPOL capture", "<ssid> [opts]", cmd_downgrade, downgrade_arg_reset },
     { "export",      "Export data",          "<csv|json>",           cmd_export,      export_arg_reset },
     { "dump",        "Dump tables",          "<aps|clients|eapols|all>", cmd_dump,   dump_arg_reset },
 };
@@ -477,6 +506,7 @@ static int exec_line(char *line)
             else if (c->func == cmd_probeflood)  { at = (void **)&probe_args;       n = 3; }
             else if (c->func == cmd_export)      { at = (void **)&export_args;      n = 2; }
             else if (c->func == cmd_dump)         { at = (void **)&dump_args;        n = 2; }
+            else if (c->func == cmd_downgrade)    { at = (void **)&downgrade_args;   n = 3; }
             
             if (at && n > 0) arg_print_glossary(stdout, at, "  %-30s %s\n");
         }
@@ -513,6 +543,7 @@ esp_err_t cli_start(void)
     export_arg_reset();
     dump_arg_reset();
     http_arg_reset();
+    downgrade_arg_reset();
 
     static char line[MAX_CMDLINE];
 
