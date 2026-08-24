@@ -53,7 +53,7 @@ static void init_task(void *arg)
     }
 
     /* 3. 创建 CLI 任务 (32KB 独立栈: 极简 REPL 无需 esp_console 的 80KB+) */
-    BaseType_t r = xTaskCreate(cli_task, "cli", 32768, NULL, 5, NULL);
+    BaseType_t r = xTaskCreate(cli_task, "cli", 32768, NULL, 24, NULL);
     if (r != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate(cli) FAILED");
         rgb_led_set_status(RGB_ERROR);
