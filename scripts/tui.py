@@ -9,6 +9,8 @@ rftool TUI — 交互式终端控制工具
   - 自动 pcap 写入 (DLT=105 IEEE802_11)
   - 底部状态栏: 状态/信道/帧数统计
   - Ctrl+C 退出时打印统计
+  - Ctrl+S 立即发送 stop (即使输入被顶掉也能停)
+  - safe_print: 串口输出不覆盖用户正在输入的行
 
 用法:
   python tui.py <COMx> [-o capture.pcap]
@@ -29,6 +31,13 @@ try:
     import readline
 except ImportError:
     readline = None  # Windows 可能无 readline, 用 input() 降级
+
+# Windows 键盘输入 (无缓冲, 支持 Ctrl+S 紧急停止)
+try:
+    import msvcrt
+    HAVE_MSVCRT = True
+except ImportError:
+    HAVE_MSVCRT = False
 
 # ==================== 颜色 ====================
 class C:
@@ -103,6 +112,210 @@ class State:
 
 st = State()
 
+# ==================== 安全打印 & 自定义输入 (解决输入被顶掉) ====================
+# 全局输入缓冲 + 打印锁
+_input_buf = ""          # 用户当前输入的内容
+_input_prompt = ""       # 当前提示符 (含颜色)
+_print_lock = threading.Lock()
+_stop_pending = False    # Ctrl+S 触发的紧急停止标志
+
+def _erase_current_line():
+    """擦除当前光标所在行 (CR + 清行 + CR)"""
+    # \r 回到行首, \033[2K 清除整行, 再 \r 回到行首
+    sys.stdout.write("\r\033[2K\r")
+    sys.stdout.flush()
+
+def _redraw_input():
+    """重新绘制当前输入行 (提示符 + 输入内容)"""
+    if _input_prompt or _input_buf:
+        sys.stdout.write(f"{_input_prompt}{_input_buf}")
+        sys.stdout.flush()
+
+def safe_print(*args, sep=" ", end="\n", flush=True):
+    """线程安全的打印: 先擦除输入行, 打印内容, 再重绘输入行
+    这样 serial_reader 线程的输出不会覆盖用户正在输入的内容
+    """
+    global _print_lock
+    with _print_lock:
+        # 1. 擦除当前输入行
+        _erase_current_line()
+        # 2. 打印实际内容
+        text = sep.join(str(a) for a in args) + end
+        sys.stdout.write(text)
+        if flush:
+            sys.stdout.flush()
+        # 3. 重绘用户输入行 (如果有)
+        _redraw_input()
+
+def _send_stop_immediately():
+    """立即向串口发送 stop 命令 (由 Ctrl+S 触发)"""
+    if st.ser and st.running:
+        try:
+            st.ser.write(b"stop\n")
+            st.ser.flush()
+            safe_print(f"  {C.Y}{C.BOLD}[Ctrl+S] 已发送 stop{C.RST}")
+        except Exception:
+            pass
+
+def custom_input(prompt):
+    """自定义输入循环 (Windows 使用 msvcrt, 其他系统 fallback 到 input())
+    特性:
+      - 实时键盘响应, 不被串口输出阻塞
+      - Ctrl+S 立即发送 stop (无需回车)
+      - 支持退格, 回车提交, Ctrl+C 中断
+      - ↑↓ 调用 readline 历史 (如果可用)
+    """
+    global _input_buf, _input_prompt, _stop_pending
+
+    _input_prompt = prompt
+    _input_buf = ""
+
+    # Fallback: 非 Windows 或 msvcrt 不可用
+    if not HAVE_MSVCRT:
+        try:
+            line = input(prompt)
+            _input_prompt = ""
+            _input_buf = ""
+            return line
+        finally:
+            _input_prompt = ""
+            _input_buf = ""
+
+    # Windows msvcrt 自定义循环
+    # 先画提示符
+    with _print_lock:
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+
+    history_idx = -1  # readline 历史索引, -1 = 当前输入
+
+    while True:
+        try:
+            if not msvcrt.kbhit():
+                # 检查是否有 Ctrl+S 待处理 (由其他线程设置)
+                if _stop_pending:
+                    _stop_pending = False
+                    _send_stop_immediately()
+                time.sleep(0.01)
+                continue
+
+            ch = msvcrt.getwch()
+
+            # --- 特殊键处理 ---
+            if ch == "\x13":  # Ctrl+S -> 紧急 stop
+                _send_stop_immediately()
+                continue
+
+            if ch == "\x03":  # Ctrl+C -> 抛出中断
+                raise KeyboardInterrupt
+
+            if ch == "\r":  # 回车 -> 提交
+                line = _input_buf
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                # 加入 readline 历史
+                if readline and line.strip():
+                    readline.add_history(line)
+                _input_buf = ""
+                _input_prompt = ""
+                return line
+
+            if ch == "\x08" or ch == "\x7f":  # 退格 (Backspace / DEL)
+                if _input_buf:
+                    _input_buf = _input_buf[:-1]
+                    with _print_lock:
+                        sys.stdout.write("\b \b")
+                        sys.stdout.flush()
+                continue
+
+            if ch == "\t":  # Tab -> 简单补全
+                prefix = _input_buf
+                # 从 COMMANDS 中找匹配
+                matches = [c for c in COMMANDS if c.startswith(prefix)]
+                if len(matches) == 1:
+                    # 唯一匹配: 自动补全
+                    new_text = matches[0]
+                    with _print_lock:
+                        # 擦除当前输入
+                        erase = "\b" * len(_input_buf) + " " * len(_input_buf) + "\b" * len(_input_buf)
+                        sys.stdout.write(erase)
+                        _input_buf = new_text
+                        sys.stdout.write(_input_buf)
+                        sys.stdout.flush()
+                elif len(matches) > 1:
+                    # 多个匹配: 打印列表
+                    safe_print(f"  {C.DIM}补全: {' '.join(matches)}{C.RST}")
+                continue
+
+            # --- 方向键: msvcrt 方向键是 2 字节序列, 首字节 0xE0 或 0x00 ---
+            if ch in ("\xe0", "\x00"):
+                ch2 = msvcrt.getwch()
+                if ch2 == "H":  # ↑ 上一条历史
+                    if readline:
+                        try:
+                            nh = readline.get_current_history_length()
+                            if nh == 0:
+                                continue
+                            if history_idx == -1:
+                                # 第一次按 ↑, 保存当前输入到临时变量
+                                globals()["_history_saved"] = _input_buf
+                                history_idx = nh - 1
+                            elif history_idx > 0:
+                                history_idx -= 1
+                            line = readline.get_history_item(history_idx + 1) or ""
+                            with _print_lock:
+                                erase = "\b" * len(_input_buf) + " " * len(_input_buf) + "\b" * len(_input_buf)
+                                sys.stdout.write(erase)
+                                _input_buf = line
+                                sys.stdout.write(_input_buf)
+                                sys.stdout.flush()
+                        except Exception:
+                            pass
+                    continue
+                elif ch2 == "P":  # ↓ 下一条历史
+                    if readline:
+                        try:
+                            nh = readline.get_current_history_length()
+                            if history_idx == -1:
+                                continue
+                            if history_idx < nh - 1:
+                                history_idx += 1
+                                line = readline.get_history_item(history_idx + 1) or ""
+                            else:
+                                # 回到用户之前输入的内容
+                                line = globals().get("_history_saved", "")
+                                history_idx = -1
+                            with _print_lock:
+                                erase = "\b" * len(_input_buf) + " " * len(_input_buf) + "\b" * len(_input_buf)
+                                sys.stdout.write(erase)
+                                _input_buf = line
+                                sys.stdout.write(_input_buf)
+                                sys.stdout.flush()
+                        except Exception:
+                            pass
+                    continue
+                elif ch2 in ("K", "M"):  # ← → 暂时不支持光标移动, 忽略
+                    continue
+                else:
+                    continue  # 其他特殊键忽略
+
+            # --- 可打印字符 ---
+            if ord(ch) >= 32:
+                _input_buf += ch
+                with _print_lock:
+                    sys.stdout.write(ch)
+                    sys.stdout.flush()
+
+        except KeyboardInterrupt:
+            _input_buf = ""
+            _input_prompt = ""
+            raise
+        except Exception:
+            # 任何异常都清空状态
+            _input_buf = ""
+            _input_prompt = ""
+            raise
+
 # ==================== 串口读取线程 ====================
 def parse_pkt_line(line):
     parts = line.strip().split(",")
@@ -168,7 +381,7 @@ def serial_reader():
                             st.total_pkts += 1
                             st.stats[(pkt["type"], pkt["subtype"])] += 1
                             st.pending_pkt = pkt
-                        print(format_pkt(pkt), flush=True)
+                        safe_print(format_pkt(pkt))
                         if st.total_pkts % 10 == 0:
                             maybe_print_status()
                 elif line_s.startswith("HEX,"):
@@ -258,43 +471,43 @@ def serial_reader():
                             st.http_running = False
                             st.http_ssid = ""
                             st.http_ip = ""
-                    print(f"  {meta_col}[meta] {line_s[5:]}{C.RST}", flush=True)
+                    safe_print(f"  {meta_col}[meta] {line_s[5:]}{C.RST}")
                     # HTTP 启动提示
                     if line_s.startswith("META,HTTP,START"):
-                        print(f"  {C.G}{C.BOLD}    -> 连接 Wi-Fi: {st.http_ssid} / 密码: rftool1234{C.RST}")
-                        print(f"  {C.G}{C.BOLD}    -> 浏览器访问 http://{st.http_ip}/{C.RST}")
+                        safe_print(f"  {C.G}{C.BOLD}    -> 连接 Wi-Fi: {st.http_ssid} / 密码: rftool1234{C.RST}")
+                        safe_print(f"  {C.G}{C.BOLD}    -> 浏览器访问 http://{st.http_ip}/{C.RST}")
                     maybe_print_status()
                 elif "========================================" in line_s:
-                    print(f"  {C.M}{line_s}{C.RST}", flush=True)
+                    safe_print(f"  {C.M}{line_s}{C.RST}")
                 elif "ESP32-C5" in line_s or "Authorized" in line_s or "ILLEGAL" in line_s:
-                    print(f"  {C.M}{line_s}{C.RST}", flush=True)
+                    safe_print(f"  {C.M}{line_s}{C.RST}")
                 elif line_s.strip() == "Commands:":
                     # help 命令输出: 中英双语
-                    print(f"  {C.BOLD}命令列表 / Commands:{C.RST}", flush=True)
+                    safe_print(f"  {C.BOLD}命令列表 / Commands:{C.RST}")
                 elif line_s.strip().startswith("help ") and "Show this help" in line_s:
-                    print(f"  {line_s}  {C.DIM}# 显示帮助{C.RST}", flush=True)
+                    safe_print(f"  {line_s}  {C.DIM}# 显示帮助{C.RST}")
                 elif line_s.strip().startswith("status ") and "Show" in line_s:
-                    print(f"  {line_s}  {C.DIM}# 显示状态和计数器{C.RST}", flush=True)
+                    safe_print(f"  {line_s}  {C.DIM}# 显示状态和计数器{C.RST}")
                 elif line_s.strip().startswith("sniff ") and "Start" in line_s:
-                    print(f"  {line_s}  {C.DIM}# 启动 Wi-Fi 混杂模式嗅探{C.RST}", flush=True)
+                    safe_print(f"  {line_s}  {C.DIM}# 启动 Wi-Fi 混杂模式嗅探{C.RST}")
                 elif line_s.strip().startswith("stop ") and "Stop" in line_s:
-                    print(f"  {line_s}  {C.DIM}# 停止当前嗅探/注入{C.RST}", flush=True)
+                    safe_print(f"  {line_s}  {C.DIM}# 停止当前嗅探/注入{C.RST}")
                 elif line_s.strip().startswith("deauth ") and "Deauth" in line_s:
-                    print(f"  {line_s}  {C.DIM}# 构造 deauth 帧注入 (仅限授权使用){C.RST}", flush=True)
+                    safe_print(f"  {line_s}  {C.DIM}# 构造 deauth 帧注入 (仅限授权使用){C.RST}")
                 elif line_s.strip().startswith("beaconflood ") and "Beacon" in line_s:
-                    print(f"  {line_s}  {C.DIM}# 伪造 beacon 洪水 (仅限授权使用){C.RST}", flush=True)
+                    safe_print(f"  {line_s}  {C.DIM}# 伪造 beacon 洪水 (仅限授权使用){C.RST}")
                 elif line_s.strip().startswith("probeflood ") and "Probe" in line_s:
-                    print(f"  {line_s}  {C.DIM}# probe request 洪水{C.RST}", flush=True)
+                    safe_print(f"  {line_s}  {C.DIM}# probe request 洪水{C.RST}")
                 elif line_s.strip().startswith("http ") and "HTTP" in line_s:
-                    print(f"  {line_s}  {C.DIM}# HTTP REST API 远程控制面板{C.RST}", flush=True)
+                    safe_print(f"  {line_s}  {C.DIM}# HTTP REST API 远程控制面板{C.RST}")
                 elif line_s.strip().startswith("export ") and "Export" in line_s:
-                    print(f"  {line_s}  {C.DIM}# 导出数据 (TUI 自动保存本地文件){C.RST}", flush=True)
+                    safe_print(f"  {line_s}  {C.DIM}# 导出数据 (TUI 自动保存本地文件){C.RST}")
                 elif line_s.strip().startswith("dump ") and "Dump" in line_s:
-                    print(f"  {line_s}  {C.DIM}# 显示数据库表格 (TUI 彩色格式化){C.RST}", flush=True)
+                    safe_print(f"  {line_s}  {C.DIM}# 显示数据库表格 (TUI 彩色格式化){C.RST}")
                 elif line_s.strip().startswith("Usage:"):
-                    print(f"  {C.DIM}{line_s}{C.RST}", flush=True)
+                    safe_print(f"  {C.DIM}{line_s}{C.RST}")
                 elif line_s.strip().startswith("Type '<cmd>"):
-                    print(f"  {C.DIM}{line_s}  # 输入 '<cmd> --help' 查看详细参数{C.RST}", flush=True)
+                    safe_print(f"  {C.DIM}{line_s}  # 输入 '<cmd> --help' 查看详细参数{C.RST}")
                 # ===== export/dump 捕获 =====
                 # export json 开始: 以 { 开头 (非前面几种格式之一)
                 elif st.capture_mode == "json" and (line_s.startswith("{") or st.capture_buf):
@@ -320,10 +533,10 @@ def serial_reader():
                         st.capture_buf.append(line_s)
                 elif line_s.strip():
                     # 其他输出 (启动日志等)
-                    print(f"  {C.DIM}{line_s}{C.RST}", flush=True)
+                    safe_print(f"  {C.DIM}{line_s}{C.RST}")
         except (serial.SerialException, OSError) as e:
             if st.running:
-                print(f"  {C.R}[!] 串口异常: {e}, 重连...{C.RST}", flush=True)
+                safe_print(f"  {C.R}[!] 串口异常: {e}, 重连...{C.RST}")
                 time.sleep(0.5)
                 try:
                     if st.ser:
@@ -337,13 +550,13 @@ def serial_reader():
                         port = st.ser.portstr if st.ser else None
                         baud = st.ser.baudrate if st.ser else 115200
                         st.ser = serial.Serial(port, baud, timeout=0.3)
-                        print(f"  {C.G}[+] 串口重连成功{C.RST}", flush=True)
+                        safe_print(f"  {C.G}[+] 串口重连成功{C.RST}")
                         break
                     except:
                         time.sleep(0.5)
         except Exception as e:
             if st.running:
-                print(f"  {C.R}[!] reader error: {e}{C.RST}", flush=True)
+                safe_print(f"  {C.R}[!] reader error: {e}{C.RST}")
 
 # ==================== Export/Dump 辅助函数 ====================
 def _finalize_capture():
@@ -366,9 +579,9 @@ def _finalize_capture():
         with open(save, "w", encoding="utf-8") as f:
             f.write(chr(10).join(data) + chr(10))
         nbytes = os.path.getsize(save)
-        print(f"  {C.G}{C.BOLD}[export] 已保存 -> {save} ({nbytes} bytes, {len(data)} 行){C.RST}", flush=True)
+        safe_print(f"  {C.G}{C.BOLD}[export] 已保存 -> {save} ({nbytes} bytes, {len(data)} 行){C.RST}")
     except Exception as e:
-        print(f"  {C.R}[export] 保存失败: {e}{C.RST}", flush=True)
+        safe_print(f"  {C.R}[export] 保存失败: {e}{C.RST}")
 
 def _print_dump_header(line_s):
     """dump 表格表头 (type,bssid_or_mac,ssid,channel,rssi,...)"""
@@ -386,9 +599,9 @@ def _print_dump_header(line_s):
         w = max(8, len(cname) + 2)
         widths.append(w)
         header += f"{cname.upper():<{w}}"
-    print(f"  {C.BOLD}{'─'*(sum(widths)+6)}{C.RST}", flush=True)
-    print(f"{C.BOLD}{header}{C.RST}", flush=True)
-    print(f"  {C.BOLD}{'─'*(sum(widths)+6)}{C.RST}", flush=True)
+    safe_print(f"  {C.BOLD}{'─'*(sum(widths)+6)}{C.RST}")
+    safe_print(f"{C.BOLD}{header}{C.RST}")
+    safe_print(f"  {C.BOLD}{'─'*(sum(widths)+6)}{C.RST}")
     with st.lock:
         st._dump_showcols = show_cols
         st._dump_widths = widths
@@ -423,7 +636,7 @@ def _print_dump_row(line_s):
             col_map   = st._dump_colmap
     except AttributeError:
         # 无表头, 直接打印
-        print(f"  {C.DIM}{line_s}{C.RST}", flush=True)
+        safe_print(f"  {C.DIM}{line_s}{C.RST}")
         return
     out = "  "
     for idx, cname in enumerate(show_cols):
@@ -446,7 +659,7 @@ def _print_dump_row(line_s):
             elif val == "CLIENT": col = C.M
             elif val == "EAPOL":  col = C.R + C.BOLD
         out += f"{col}{val:<{w}}{C.RST}"
-    print(out, flush=True)
+    safe_print(out)
 
 # ==================== 状态变化提示 ====================
 _last_state = None
@@ -460,7 +673,7 @@ def maybe_print_status():
         cur_count = st.total_pkts
     if cur_state != _last_state:
         state_col = {"IDLE": C.B, "SNIFF": C.G, "INJECT": C.R}.get(cur_state, C.W)
-        print(f"  {C.DIM}--- {state_col}{cur_state}{C.RST}{C.DIM} ch={st.fw_channel} pkts={st.total_pkts} ---{C.RST}", flush=True)
+        safe_print(f"  {C.DIM}--- {state_col}{cur_state}{C.RST}{C.DIM} ch={st.fw_channel} pkts={st.total_pkts} ---{C.RST}")
         _last_state = cur_state
     _last_count = cur_count
 
@@ -493,8 +706,11 @@ def completer(text, state):
 
 # ==================== 主循环 ====================
 def cleanup():
+    global _input_buf, _input_prompt
     st.running = False
     time.sleep(0.2)
+    _input_buf = ""
+    _input_prompt = ""
     print(f"\n\n  {C.BOLD}========== 统计 =========={C.RST}")
     print(f"  总帧数:      {C.G}{st.total_pkts}{C.RST}")
     print(f"  注入帧数:    {C.R}{st.total_inject}{C.RST}")
@@ -551,6 +767,8 @@ def main():
 
     print(f"  {C.G}[*] 连接 {port} @ {args.baud}{C.RST}")
     print(f"  {C.DIM}[*] 输入 help 查看命令, Ctrl+C 退出{C.RST}")
+    if HAVE_MSVCRT:
+        print(f"  {C.Y}{C.BOLD}[*] Windows 模式: 输入 stop 不被顶掉, Ctrl+S 立即发送 stop{C.RST}")
     print()
 
     # 启动串口读取线程
@@ -566,11 +784,14 @@ def main():
     # 主循环: 读用户输入 -> 发命令
     while st.running:
         try:
-            line = input(f"{C.G}rftool>{C.RST} ")
+            line = custom_input(f"{C.G}rftool>{C.RST} ")
             if not line.strip():
                 continue
             if line.strip() in ("exit", "quit"):
                 raise KeyboardInterrupt
+            # 如果 csv capture 模式还在进行, 这里结束它
+            if st.capture_mode == "csv" and st.capture_buf:
+                _finalize_capture()
             # 发命令到固件
             st.ser.write((line + "\n").encode())
             time.sleep(0.05)  # 给固件一点处理时间
@@ -579,7 +800,7 @@ def main():
         except EOFError:
             break
         except Exception as e:
-            print(f"  {C.R}[!] {e}{C.RST}")
+            safe_print(f"  {C.R}[!] {e}{C.RST}")
             break
 
     cleanup()
