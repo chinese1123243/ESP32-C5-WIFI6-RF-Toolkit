@@ -39,6 +39,42 @@ try:
 except ImportError:
     HAVE_MSVCRT = False
 
+# Windows 控制台 VT 模式强制启用 (否则 \033[2K 擦行、颜色 ANSI 序列不生效)
+VT_ENABLED = False
+def enable_vt_mode():
+    """Windows: 用 kernel32.SetConsoleMode 打开 ENABLE_VIRTUAL_TERMINAL_PROCESSING.
+    这样 safe_print 里的 \r\033[2K 才能真的擦掉输入行, 颜色也能正常显示.
+    """
+    global VT_ENABLED
+    if not sys.platform.startswith("win"):
+        VT_ENABLED = True
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        STD_OUTPUT_HANDLE = -11
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        ENABLE_PROCESSED_OUTPUT = 0x0001
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        hConsole = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        if hConsole in (0, -1):
+            return
+        mode = wintypes.DWORD(0)
+        if not kernel32.GetConsoleMode(hConsole, ctypes.byref(mode)):
+            return
+        new_mode = mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT
+        if kernel32.SetConsoleMode(hConsole, new_mode):
+            VT_ENABLED = True
+        else:
+            # 失败的话尝试 SetConsoleOutputCP 65001, 但 VT 不一定能用
+            try:
+                kernel32.SetConsoleOutputCP(65001)
+            except Exception:
+                pass
+    except Exception:
+        VT_ENABLED = False
+enable_vt_mode()
+
 # ==================== 颜色 ====================
 class C:
     R   = "\033[31m"
@@ -119,10 +155,27 @@ _input_prompt = ""       # 当前提示符 (含颜色)
 _print_lock = threading.Lock()
 _stop_pending = False    # Ctrl+S 触发的紧急停止标志
 
+# 获取终端列宽 (fallback 擦行用)
+def _get_cols():
+    try:
+        cols = os.get_terminal_size().columns
+        return max(cols, 120)
+    except Exception:
+        return 200
+
+_COLS_CACHED = _get_cols()
+
 def _erase_current_line():
-    """擦除当前光标所在行 (CR + 清行 + CR)"""
-    # \r 回到行首, \033[2K 清除整行, 再 \r 回到行首
-    sys.stdout.write("\r\033[2K\r")
+    """擦除当前光标所在行.
+    优先 ANSI VT (\r\033[2K\r), 失败 fallback 到 "回车+N个空格+回车".
+    这样即使 PowerShell 的 VT 模式没开, 也能把当前输入行盖住.
+    """
+    if VT_ENABLED:
+        sys.stdout.write("\r\033[2K\r")
+    else:
+        # fallback: 回到行首, 写一整行空格覆盖, 再回行首
+        cols = _COLS_CACHED
+        sys.stdout.write("\r" + " " * cols + "\r")
     sys.stdout.flush()
 
 def _redraw_input():
@@ -768,7 +821,8 @@ def main():
     print(f"  {C.G}[*] 连接 {port} @ {args.baud}{C.RST}")
     print(f"  {C.DIM}[*] 输入 help 查看命令, Ctrl+C 退出{C.RST}")
     if HAVE_MSVCRT:
-        print(f"  {C.Y}{C.BOLD}[*] Windows 模式: 输入 stop 不被顶掉, Ctrl+S 立即发送 stop{C.RST}")
+        vt_tag = f"VT-ANSI 擦行" if VT_ENABLED else f"空格 fallback 擦行 (cols={_COLS_CACHED})"
+        print(f"  {C.Y}{C.BOLD}[*] Windows 模式: {vt_tag} | 输入 stop 不被顶掉, Ctrl+S 立即发送 stop{C.RST}")
     print()
 
     # 启动串口读取线程
