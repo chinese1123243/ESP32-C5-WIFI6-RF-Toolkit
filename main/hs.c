@@ -73,11 +73,18 @@ static void hex_into(char *dst, const uint8_t *src, int n)
     dst[n * 2] = '\0';
 }
 
-/* 802.11 里 EAPOL 帧的 Key Information (大端 16 位) 决定它是第几条消息 */
+/* 802.11 里 EAPOL 帧的 Key Information (大端 16 位) 决定它是第几条消息.
+ *
+ * 位定义 (802.11-2020 12.7.2):
+ *   0x0007 key descriptor version, 0x0008 key type (pairwise=1),
+ *   0x0040 install, 0x0080 ack, 0x0100 mic, 0x0200 secure
+ * 之前把 MIC 写成 0x0008, 那是 key type, 所有 EAPOL-Key 帧都是 1. 结果真实
+ * AP 的 M1 (0x008a) 被判成 M3, PMKID 提取那段从来没执行过. 自检没抓出来,
+ * 因为自检构造的 M1 用了 0x0082 (没置 key type), 正好绕开了这个位. */
 static int eapol_msg_no(uint16_t ki)
 {
     bool ack = (ki & 0x0080) != 0;
-    bool mic = (ki & 0x0008) != 0;
+    bool mic = (ki & 0x0100) != 0;
     bool sec = (ki & 0x0200) != 0;
     if (ack && !mic) return 1;              /* M1: AP→STA, 只带 ANonce */
     if (ack && mic)  return 3;              /* M3: AP→STA, 带 MIC */
@@ -361,8 +368,10 @@ static int build_eapol_frame(uint8_t *out, bool ap_to_sta, int msg,
     *p++ = (uint8_t)(eapol_len >> 8); *p++ = (uint8_t)(eapol_len & 0xFF);
     *p++ = 0x02;                                  /* RSN descriptor */
     uint16_t ki;
-    if (msg == 1)      ki = 0x0082;               /* ACK + keyver2 */
-    else if (msg == 2) ki = 0x000A;               /* MIC + keyver2 */
+    /* 用真实 AP 的取值: M1 一定置 key type (pairwise), 所以是 0x008a 而不是
+     * 0x0082. 这两位的差别正是当初漏掉 MIC 位的原因, 自检必须跟线上一致. */
+    if (msg == 1)      ki = 0x008A;               /* ACK + keytype + keyver2 */
+    else if (msg == 2) ki = 0x010A;               /* MIC + keytype + keyver2 */
     else if (msg == 3) ki = 0x13CA;               /* ACK|MIC|INSTALL|SECURE */
     else               ki = 0x030A;               /* MIC|SECURE */
     *p++ = (uint8_t)(ki >> 8); *p++ = (uint8_t)(ki & 0xFF);
