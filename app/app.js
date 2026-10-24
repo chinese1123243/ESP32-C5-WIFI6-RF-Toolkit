@@ -1416,6 +1416,25 @@ function parseOutputLine(line){
         reportRefusal(kv.msg, kv.detail, kv.cmd);
         return;
     }
+    if (line.startsWith('META,PMKID,ACTIVE,')){
+        /* META,PMKID,ACTIVE,ok,1,bssid,X,ssid,Y,ch,N,m1,N,pmkid,N,ms,N */
+        const p = line.split(',');
+        const kv = {};
+        for (let i = 3; i + 1 < p.length; i += 2) kv[p[i]] = p[i+1];
+        clearPendingAction();
+        if (kv.ok === '1'){
+            log('[PMKID] ' + (kv.ssid || kv.bssid) + ' · M1 ' + (kv.m1 || '0') +
+                ' · PMKID ' + (kv.pmkid || '0') + ' · ' + (kv.ms || '0') + 'ms',
+                (kv.pmkid && kv.pmkid !== '0') ? 'ok' : 'warn');
+            if (kv.pmkid && kv.pmkid !== '0') toast('拿到 PMKID: ' + kv.ssid, 'ok');
+        } else {
+            log('[PMKID] ' + (kv.ssid || '') + ' 失败: ' +
+                (ESP_ERR_TEXT[kv.code] || ('code ' + (kv.code || '?'))), 'err');
+            toast('PMKID 未拿到', 'warn');
+        }
+        return;
+    }
+
     if (line.startsWith('META,WIFI,PMF,')){
         /* META,WIFI,PMF,<BLOCKED|UNKNOWN>,bssid,X,reason,Y,advice,Z */
         const p = line.split(',');
@@ -2741,6 +2760,7 @@ const CLI_REF = [
         { c:'hs',                          d:'握手归档; complete 只列可破解, 22000 出 hashcat' },
         { c:'hs selftest',                 d:'握手配对自检 (RC 一致性)' },
         { c:'pmkid watch 6',               d:'被动等 PMKID; 也可 watch 加 BSSID' },
+        { c:'pmkid active 20:87:ec:0f:4e:82 --yes', d:'主动关联一次取 M1; AP 支持才有 PMKID', danger:true },
         { c:'locate AA:BB:CC:DD:EE:FF 30', d:'RSSI 测向 30s; status / stop / export' },
     ]},
     { g:'注入', items:[

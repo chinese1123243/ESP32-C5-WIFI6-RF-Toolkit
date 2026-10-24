@@ -237,5 +237,10 @@ check('OTA 状态算对容量', /2\.5MB/.test(ota), ota);
 M.feed('META,OTA,ERR,msg,rollback_disabled');
 check('OTA 错误翻成人话', /没开回滚/.test(M.el('otaHint').textContent), M.el('otaHint').textContent);
 
+M.reset(); M.expectConfirm('PMKID', 8000);
+M.feed('META,PMKID,ACTIVE,ok,1,bssid,20:87:ec:0f:4e:82,ssid,iTV-82456,ch,6,m1,1,pmkid,0,ms,4159');
+check('PMKID 回执清等待', M.pending() === null);
+check('PMKID 结果进日志', /PMKID/.test(JSON.stringify(M.logs())), JSON.stringify(M.logs()));
+
 console.log('\n=== 结果: ' + pass + ' passed, ' + fail + ' failed ===');
 process.exit(fail ? 1 : 0);

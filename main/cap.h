@@ -2,9 +2,15 @@
  * cap.h: 原始 802.11 帧落盘 / EAPOL+PMKID 过滤 / 分段拉取
  *
  * 存储: storage 分区 [1MB, 末尾) 直接落成一份线性 pcap 文件
- *   偏移 0      24B   pcap 全局头 (LINKTYPE_IEEE802_11 = 105)
- *   偏移 24     N     逐条记录: ts_sec(4) ts_usec(4) incl_len(4) orig_len(4) + 帧
- *                     帧体按 4 字节对齐填充, 保证 flash 写入地址/长度都 4 字节对齐
+ *   偏移 0      24B   pcap 全局头 (LINKTYPE_IEEE802_11_RADIOTAP = 127)
+ *   偏移 24     N     逐条记录: ts_sec(4) ts_usec(4) incl_len(4) orig_len(4)
+ *                     + 16B radiotap + 帧. incl_len 含 radiotap, 帧体按 4 字节
+ *                     对齐填充, 保证 flash 写入地址/长度都 4 字节对齐
+ *
+ * radiotap 只带抓包必需的射频元数据 (flags/rate/channel/signal/noise), 128 字节的
+ * 完整 radiotap 会让每条记录多出 100 多字节, 在 500KB 的段里等于少存两成帧.
+ * 用 127 而不是 105: 后者没有元数据, Wireshark 里看不到信道和 RSSI, 也没法按
+ * 信道过滤, 抓多信道时只能靠猜.
  *
  * 吞吐设计 (关键):
  *   混杂回调运行在 WiFi 驱动任务里, 里面绝不能碰 flash (会阻塞驱动 → 整机假死).
@@ -59,8 +65,10 @@ uint32_t cap_capacity(void);
 int      cap_segment_index(void);
 int      cap_segment_count(void);
 
-/* 混杂回调投喂: 只分类 + memcpy 入队, 非阻塞, 可在驱动任务里调用 */
-void cap_feed(const uint8_t *frame, uint16_t len, int8_t rssi, uint8_t chan);
+/* 混杂回调投喂: 只分类 + memcpy 入队, 非阻塞, 可在驱动任务里调用.
+ * noise 与 rate 直接来自 rx_ctrl, 写进 radiotap 供 Wireshark 显示. */
+void cap_feed(const uint8_t *frame, uint16_t len, int8_t rssi, uint8_t chan,
+              int8_t noise, uint8_t rate);
 
 /* 关键帧索引查询: 返回条数; 取第 i 条. 任意出参可传 NULL. */
 int  cap_key_get(uint32_t i, uint8_t *kind_out, uint32_t *off_out,

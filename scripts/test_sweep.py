@@ -221,6 +221,9 @@ CASES = [
     ("pmkid watch 6",                 "stop", None, None),
     ("pmkid status",                  None, None, None),
     ("pmkid clear",                   None, None, None),
+    ("pmkid active 00:11:22:33:44:55 --yes", None, "前置: 目标需先扫描入库", "reject"),
+    ("pmkid active 20:87:ec:0f:4e:82",       None, "缺 --yes: 应当被拒", "reject"),
+    ("cap hex 0 32",                  None, "串口自检: pcap 头十六进制回显", None),
 
     ("locate 00:11:22:33:44:55 2",    None, "前置: 目标需先扫描入库", "reject"),
     ("locate status",                 None, None, None),

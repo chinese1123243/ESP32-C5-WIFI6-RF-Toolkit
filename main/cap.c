@@ -40,9 +40,36 @@
 
 static const char *TAG = "CAP";
 
-/* pcap 全局头: magic + v2.4 + thiszone/sigfigs + snaplen + LINKTYPE_IEEE802_11 */
+/* pcap 全局头: magic + v2.4 + thiszone/sigfigs + snaplen + LINKTYPE_IEEE802_11_RADIOTAP */
 #define PCAP_MAGIC   0xa1b2c3d4u
-#define PCAP_LINKTYPE_IEEE802_11  105
+#define PCAP_LINKTYPE_RADIOTAP    127
+
+/* radiotap: 固定 16 字节. present 位 flags(1) rate(2) channel(3) signal(5) noise(6).
+ * 字段顺序必须按规范递增, channel 是 u16+u16, 要求 2 字节对齐 (偏移 10 满足). */
+#define RT_LEN 16
+
+static int rt_build(uint8_t *rt, uint8_t ch, int8_t rssi, int8_t noise, uint8_t rate)
+{
+    uint16_t freq, cflags;
+    if (ch == 14)       freq = 2484;
+    else if (ch <= 13)  freq = (uint16_t)(2407 + ch * 5);
+    else                freq = (uint16_t)(5000 + ch * 5);
+    /* 0x40=2GHz 0x80=5GHz, 0x20=OFDM (beacon/probe 都是 OFDM) */
+    cflags = (ch <= 14) ? 0x0060 : 0x00A0;
+
+    uint16_t rtlen = RT_LEN;
+    uint32_t present = 0x0000006Eu;          /* bits 1,2,3,5,6 */
+    rt[0] = 0; rt[1] = 0;
+    memcpy(rt + 2, &rtlen, 2);
+    memcpy(rt + 4, &present, 4);
+    rt[8] = 0;                                /* flags: 无 FCS */
+    rt[9] = rate;                             /* 500kbps 为单位, 0 表示未知 */
+    memcpy(rt + 10, &freq, 2);
+    memcpy(rt + 12, &cflags, 2);
+    rt[14] = (uint8_t)rssi;
+    rt[15] = (uint8_t)noise;
+    return RT_LEN;
+}
 
 /* 暂存环 (PSRAM). 只做一次 memcpy, 交给 flusher 落盘. */
 #define STAGE_BYTES   (384 * 1024)
@@ -57,7 +84,9 @@ typedef struct {
     int8_t   rssi;
     uint8_t  chan;
     uint8_t  flags;      /* CAP_K_* */
-    uint8_t  pad[3];
+    int8_t   noise;      /* rx_ctrl.noise_floor */
+    uint8_t  rate;       /* rx_ctrl.rate, 500kbps */
+    uint8_t  pad;
 } stage_hdr_t;           /* 16 字节, 天然对齐 */
 
 typedef struct {
@@ -123,7 +152,7 @@ void cap_pcap_header(uint8_t *dst)
     v32 = 0;                    memcpy(dst + o, &v32, 4); o += 4;   /* thiszone */
     v32 = 0;                    memcpy(dst + o, &v32, 4); o += 4;   /* sigfigs  */
     v32 = 65535;                memcpy(dst + o, &v32, 4); o += 4;   /* snaplen  */
-    v32 = PCAP_LINKTYPE_IEEE802_11;
+    v32 = PCAP_LINKTYPE_RADIOTAP;
     memcpy(dst + o, &v32, 4);
 }
 
@@ -241,7 +270,8 @@ static inline void ring_get(uint32_t pos, uint8_t *dst, uint32_t n)
     memcpy(dst + first, s_stage, n - first);
 }
 
-void cap_feed(const uint8_t *frame, uint16_t len, int8_t rssi, uint8_t chan)
+void cap_feed(const uint8_t *frame, uint16_t len, int8_t rssi, uint8_t chan,
+              int8_t noise, uint8_t rate)
 {
     if (!s_on || !s_stage || s_full) return;
     if (!frame || len == 0 || len > CAP_MAX_FRAME) return;
@@ -260,7 +290,9 @@ void cap_feed(const uint8_t *frame, uint16_t len, int8_t rssi, uint8_t chan)
     h.rssi = rssi;
     h.chan = chan;
     h.flags = flags;
-    memset(h.pad, 0, sizeof(h.pad));
+    h.noise = noise;
+    h.rate = rate;
+    h.pad = 0;
 
     ring_put(head, (const uint8_t *)&h, sizeof(h));
     ring_put(head + (uint32_t)sizeof(h), frame, len);
@@ -304,7 +336,11 @@ static void index_key(const stage_hdr_t *h, uint32_t rec_off, uint32_t rec_len)
 /* 把暂存区里的一条编码成 pcap 记录塞进写缓冲. body_pos 是帧体在环里的位置. */
 static bool append_rec(const stage_hdr_t *h, uint32_t body_pos)
 {
-    uint32_t plen = align4(h->len);
+    uint8_t rt[RT_LEN];
+    rt_build(rt, h->chan, h->rssi, h->noise, h->rate);
+
+    uint32_t flen = (uint32_t)RT_LEN + h->len;   /* incl_len: radiotap + 帧 */
+    uint32_t plen = align4(flen);
     uint32_t need = 16 + plen;
     if (need > WBUF_BYTES) return false;
 
@@ -325,10 +361,11 @@ static bool append_rec(const stage_hdr_t *h, uint32_t body_pos)
     uint32_t v;
     v = (uint32_t)sec;    memcpy(w + 0, &v, 4);
     v = usec;             memcpy(w + 4, &v, 4);
-    v = h->len;           memcpy(w + 8, &v, 4);     /* incl_len (不含填充) */
-    v = h->len;           memcpy(w + 12, &v, 4);    /* orig_len */
-    ring_get(body_pos, w + 16, h->len);
-    if (plen > h->len) memset(w + 16 + h->len, 0, plen - h->len);   /* 对齐填充 */
+    v = flen;             memcpy(w + 8, &v, 4);     /* incl_len (含 radiotap, 不含填充) */
+    v = flen;             memcpy(w + 12, &v, 4);    /* orig_len */
+    memcpy(w + 16, rt, RT_LEN);
+    ring_get(body_pos, w + 16 + RT_LEN, h->len);
+    if (plen > flen) memset(w + 16 + flen, 0, plen - flen);   /* 对齐填充 */
 
     s_wbuf_len += (int)need;
     s_frames++;

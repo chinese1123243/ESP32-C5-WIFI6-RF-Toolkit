@@ -43,6 +43,7 @@
 #include <freertos/task.h>
 #include <string.h>
 #include <ctype.h>
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_system.h"   /* esp_restart() */
 #include "esp_heap_caps.h"
@@ -647,6 +648,7 @@ static int cmd_cap(int argc, char **argv)
                "  cap info               show counters\n"
                "  cap keys               list key frames (EAPOL/PMKID/Deauth) index\n"
                "  cap read <off> <len>   pull pcap bytes (binary CHUNK frames)\n"
+               "  cap hex <off> <len>    hex dump pcap bytes (串口自检, 最多 1KB)\n"
                "  cap hdr                send 24-byte pcap global header\n");
         return 1;
     }
@@ -711,6 +713,30 @@ static int cmd_cap(int argc, char **argv)
         fflush(stdout);
         return 0;
     }
+    if (strcmp(sub, "hex") == 0) {
+        if (argc < 4) { printf("META,CAP,ERR,msg,need_off_len\n"); fflush(stdout); return 1; }
+        uint32_t off = (uint32_t)strtoul(argv[2], NULL, 0);
+        uint32_t len = (uint32_t)strtoul(argv[3], NULL, 0);
+        if (len == 0 || len > 1024) len = 1024;
+        uint8_t buf[256];
+        uint32_t done = 0;
+        while (done < len) {
+            uint32_t n = len - done;
+            if (n > sizeof(buf)) n = sizeof(buf);
+            int got = cap_read(off + done, buf, n);
+            if (got <= 0) break;
+            for (int i = 0; i < got; i++) {
+                printf("%02x", buf[i]);
+                if (((done + (uint32_t)i + 1) % 32) == 0) printf("\n");
+            }
+            done += (uint32_t)got;
+            if ((uint32_t)got < n) break;
+        }
+        if (done % 32) printf("\n");
+        printf("META,CAP,HEX,off,%u,n,%u\n", (unsigned)off, (unsigned)done);
+        fflush(stdout);
+        return 0;
+    }
     if (strcmp(sub, "read") == 0) {
         if (argc < 4) { printf("META,CAP,ERR,msg,need_off_len\n"); fflush(stdout); return 1; }
         uint32_t off = (uint32_t)strtoul(argv[2], NULL, 0);
@@ -738,7 +764,7 @@ static int cmd_cap(int argc, char **argv)
         return 0;
     }
 
-    printf("META,CAP,ERR,msg,bad_subcmd (start|stop|clear|info|keys|read|hdr)\n");
+    printf("META,CAP,ERR,msg,bad_subcmd (start|stop|clear|info|keys|read|hex|hdr)\n");
     fflush(stdout);
     return 1;
 }
@@ -1508,15 +1534,18 @@ static int cmd_locate(int argc, char **argv)
     return locate_start(m, is_client, secs) == ESP_OK ? 0 : 1;
 }
 
-/* pmkid (被动监听 PMKID)
- * 说明: 真正的 clientless 主动捕获需要完整走完 auth/assoc 并扮演 supplicant,
- * 当前固件没有这条状态机; 这里提供"定点监听 + 计数", 配合 deauth 逼出 M1 后
- * 由 hs 模块提取 PMKID. 输出里明确标 mode=passive, 不冒充主动能力. */
+/* pmkid
+ * 被动: 定点监听, 配合 deauth 逼客户端重连后由 hs 模块提取.
+ * 主动: 走驱动自己的 station 关联 (不是 raw 注入的 auth/assoc, 那条路在本硬件上
+ *       发不出去, 见 frame_build.c 里 fb_assoc_req_rsn 的注释). 关联一次就能拿到
+ *       AP 发来的 M1, PMKID 就在 M1 的 KDE 里, 不需要口令正确. */
 static int cmd_pmkid(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("usage:/n"
+        printf("usage:\n"
                "  pmkid watch <bssid|channel>   start passive PMKID watch\n"
+               "  pmkid active <bssid|ssid> [--timeout ms] --yes\n"
+               "                                associate once, grab M1/PMKID\n"
                "  pmkid status                  counters (total/complete/pmkid)\n"
                "  pmkid clear\n");
         return 1;
@@ -1553,6 +1582,49 @@ static int cmd_pmkid(int argc, char **argv)
                (unsigned)ch, hs_count(), hs_pmkid_count());
         fflush(stdout);
         return 0;
+    }
+    if (strcmp(sub, "active") == 0) {
+        if (!confirm_dangerous(argc, argv, "pmkid active")) return 1;
+        if (argc < 3) { printf("META,PMKID,ERR,msg,need_target\n"); fflush(stdout); return 1; }
+
+        uint8_t b[6];
+        const ap_entry_t *ap = NULL;
+        if (parse_mac(argv[2], b)) {
+            ap = wifi_db_find_ap(b);
+        } else {
+            int n = 0;
+            const ap_entry_t *aps = wifi_db_get_aps(&n);
+            for (int i = 0; i < n; i++) {
+                if (strcmp(aps[i].ssid, argv[2]) == 0) { ap = &aps[i]; break; }
+            }
+        }
+        if (!ap) { printf("META,PMKID,ERR,msg,ap_not_in_db (先扫一遍)\n"); fflush(stdout); return 1; }
+
+        uint32_t timeout = 4000;
+        for (int i = 3; i + 1 < argc; i++) {
+            if (strcmp(argv[i], "--timeout") == 0) {
+                int t = atoi(argv[i + 1]);
+                if (t >= 500 && t <= 20000) timeout = (uint32_t)t;
+            }
+        }
+
+        int m1 = 0, pm = 0;
+        int64_t t_start = esp_timer_get_time();
+        esp_err_t e = wifi_attack_pmkid_active(ap->bssid, ap->ssid, ap->channel,
+                                               timeout, &m1, &pm);
+        uint32_t ms = (uint32_t)((esp_timer_get_time() - t_start) / 1000);
+        char bstr[18];
+        mac_to_str(ap->bssid, bstr);
+        if (e != ESP_OK && m1 <= 0) {
+            printf("META,PMKID,ACTIVE,ok,0,bssid,%s,ssid,%s,ms,%u,code,%d\n",
+                   bstr, ap->ssid, (unsigned)ms, (int)e);
+            fflush(stdout);
+            return 1;
+        }
+        printf("META,PMKID,ACTIVE,ok,1,bssid,%s,ssid,%s,ch,%u,m1,%d,pmkid,%d,ms,%u\n",
+               bstr, ap->ssid, (unsigned)ap->channel, m1, pm, (unsigned)ms);
+        fflush(stdout);
+        return pm > 0 ? 0 : 1;
     }
     printf("META,PMKID,ERR,msg,bad_subcmd\n"); fflush(stdout);
     return 1;
@@ -1603,7 +1675,7 @@ static const cli_cmd_t g_cmds[] = {
     { "ota",         "Dual-slot OTA (status/confirm/rollback/url)", "status|confirm|rollback|url <url>|reboot", cmd_ota, NULL },
     { "scenario",    "One-shot orchestration (survey/handshake/pmf)", "survey [secs]|handshake <bssid> [secs]|pmf <bssid>|stop|status", cmd_scenario, NULL },
     { "locate",      "RSSI locate + CSV export", "<bssid|mac> [secs]|stop|status|export", cmd_locate, NULL },
-    { "pmkid",       "PMKID passive watch", "watch <bssid|ch>|status|clear", cmd_pmkid, NULL },
+    { "pmkid",       "PMKID: passive watch / active assoc", "watch <bssid|ch>|active <bssid|ssid>|status|clear", cmd_pmkid, NULL },
     { "events",      "Unified event bus snapshot", "[n]", cmd_events, NULL },
     { "export",      "Export data",          "<csv|json>",           cmd_export,      export_arg_reset },
     { "dump",        "Dump tables",          "<aps|clients|eapols|all|clear>", cmd_dump,   dump_arg_reset },
