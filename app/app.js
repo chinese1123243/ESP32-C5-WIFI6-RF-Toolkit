@@ -4,7 +4,7 @@
  */
 
 /* 版本 */
-const APP_VERSION  = '2.3.0';
+const APP_VERSION  = '2.3.1';
 const APP_BUILD    = '2026.09';
 const APP_AUTHOR      = 'CN112';
 const APP_AUTHOR_FULL = 'CN1123243';
@@ -341,6 +341,8 @@ function applyVersionUI(){
     set('fwVer2', fwVersion);
     set('ciApp', APP_VERSION);
     set('ciFw', fwVersion);
+    set('aboutVer', APP_VERSION);
+    set('aboutBuild', APP_BUILD);
     document.querySelectorAll('[data-author]').forEach(n => { n.textContent = APP_AUTHOR; });
     document.querySelectorAll('[data-author-full]').forEach(n => { n.textContent = APP_AUTHOR_FULL; });
     document.querySelectorAll('[data-author-mail]').forEach(n => { n.textContent = APP_AUTHOR_MAIL; });
@@ -1182,6 +1184,86 @@ function clearPendingAction(){
     if (pendingAction){ clearTimeout(pendingAction.timer); pendingAction = null; }
 }
 
+/* 固件拒绝原因 (META 里的 msg 字段是稳定机器码) -> 能直接照着做的话.
+ * 表里没有的码原样显示, 不做兜底猜测: 猜错比不猜更误导. */
+const REFUSE_TEXT = {
+    need_confirm:       '设备要确认, 命令没带 --yes',
+    arg_parse_failed:   '参数格式不对',
+    bad_option:         '参数格式不对',
+    unknown_command:    '设备不认识这条命令',
+    bad_bssid:          'BSSID 格式不对',
+    bad_station:        'STA MAC 格式不对',
+    bad_channel:        '信道超出范围',
+    bad_target:         '目标类型不存在',
+    bad_format:         '格式只支持 csv / json',
+    bad_subcmd:         '子命令不存在',
+    need_ssid:          '缺 SSID',
+    need_key:           '缺配置键名',
+    need_url:           '缺 URL',
+    need_size:          '缺大小',
+    need_hex:           '缺十六进制帧',
+    deauth_start_failed:   '注入任务起不来, 设备可能正忙',
+    sniff_start_failed:    '嗅探起不来, 设备可能正忙',
+    beacon_start_failed:   'Beacon 起不来, 设备可能正忙',
+    probe_start_failed:    'Probe 起不来, 设备可能正忙',
+    downgrade_start_failed:'降级 AP 起不来',
+    http_start_failed:  '板载服务起不来',
+    nothing_running:    '本来就没在跑',
+    not_running:        '功能未运行',
+    no_mem:             '设备内存不足',
+    pmf_required:       '目标是 PMF 必需, 广播 deauth 无效',
+    target_not_in_db:   '目标不在 AP 表里, 先扫描',
+    ap_not_in_db:       '目标不在 AP 表里, 先扫描',
+    ap_not_found:       '目标不在 AP 表里, 先扫描',
+    ssid_hidden:        '目标隐藏了 SSID, 无法克隆',
+    clone_failed:       '克隆没起来',
+    ap_start_failed:    '热点起不来, 射频可能被占',
+    confirm_failed:     '当前镜像确认失败',
+    rollback_failed:    '回滚失败',
+    rollback_disabled:  '这个固件没开回滚',
+    download_failed:    '下载失败',
+    validate_failed:    '镜像校验没过',
+    begin_failed:       'OTA 没能开始',
+    set_boot_failed:    '写启动分区失败',
+    no_ota_partition:   '没有 OTA 分区',
+    only_http_supported:'只支持 http 地址',
+    http_init_failed:   'HTTP 客户端起不来',
+    need_channel:       '目标不在库里, 要显式给信道',
+    timeout:            '超时',
+};
+
+/* esp_err_t -> 人话. 只收 CLI 会原样返回的那几个: 处理函数多数把 esp_err
+ * 折成 0/1, 剩下的裸 rc 就是 ESP-IDF 的 0x100 段. */
+const ESP_ERR_TEXT = {
+    0x101: '内存不足',
+    0x102: '参数无效',
+    0x103: '当前状态不允许',
+    0x104: '尺寸不对',
+    0x105: '找不到对象',
+    0x106: '设备不支持',
+    0x107: '超时',
+    0x108: '响应无效',
+    1:     '执行失败',
+    '-1':  '执行失败',
+};
+
+/* 设备明确拒绝一次操作: 先掐等待回执的计时器, 再报原因.
+ * 只写日志不清计时器, 8 秒后照样弹"设备无响应", 把一条明确的拒绝
+ * 说成链路故障, 排查方向从第一步就错了.
+ * 固件常把说明直接写进 msg 字段 ("ap_not_found (先 scan/sniff...)"),
+ * 所以按第一个空格切出机器码查表, 后半段原样留作细节. */
+function reportRefusal(code, detail, fallbackLabel){
+    const label = (pendingAction && pendingAction.label) || fallbackLabel || '命令';
+    clearPendingAction();
+    clearHandshake();
+    const raw = String(code || '');
+    const key = raw.split(' ')[0];
+    const why = REFUSE_TEXT[key] || raw || '未知原因';
+    const d = [detail, raw.slice(key.length).trim()].filter(Boolean).join(' · ');
+    log('[' + label + '] 拒绝: ' + why + (d ? ' · ' + d : ''), 'err');
+    toast(label + ' 未执行: ' + why, 'err');
+}
+
 /* Deauth 的结果判定
  *
  * 帧发出去只是手段, 不是结果: done 行只说明"板子把帧打出去了", 并不知道
@@ -1219,6 +1301,102 @@ function setText(ids, val){
     for (const id of ids){ const el = $(id); if (el) el.textContent = val; }
 }
 
+/* 几类 META 行原来把逗号换成点直接糊上去, "PMF · REPORT · bssid · xx" 看不出
+ * 结论. 按固件的字段顺序翻译成人话. */
+function kvOf(p, from){
+    const kv = {};
+    for (let i = from; i + 1 < p.length; i += 2) kv[p[i]] = p[i+1];
+    return kv;
+}
+
+function scenarioText(p){
+    const k = p[2];
+    /* PMF / SURVEY / HANDSHAKE 的 p[3] 是阶段名 (REPORT/START/DONE...), 不是
+     * 字段名; DONE / STOP / STATUS 的 p[3] 直接就是字段名. */
+    const phased = (k === 'PMF' || k === 'SURVEY' || k === 'HANDSHAKE');
+    const kv = kvOf(p, phased ? 4 : 3);
+    if (k === 'PMF'){
+        if (p[3] === 'REPORT')
+            return 'PMF: ' + (kv.mfpr === '1' ? '必需' : '未强制') +
+                   ' · 能力 ' + (kv.mfpc === '1' ? '支持' : '不支持') +
+                   ' · AKM ' + (kv.akm || '?') + ' · CH ' + (kv.channel || '?');
+        if (p[3] === 'VERDICT')
+            return kv.deauth_useless === '1'
+                ? '结论: 广播 Deauth 无效, 改走 ' + (kv.next || '降级 / Evil Twin')
+                : '结论: 可以 Deauth, 下一步 ' + (kv.next || '');
+        if (p[3] === 'ERR') return 'PMF 判定失败: ' + (kv.msg || '?');
+    }
+    if (k === 'SURVEY'){
+        if (p[3] === 'START') return '勘察开始 · ' + (kv.secs || '?') + 's';
+        if (p[3] === 'DONE')
+            return '勘察完成 · AP ' + (kv.aps || 0) + ' (新 ' + (kv.new_aps || 0) + ')' +
+                   ' · 客户端 ' + (kv.clients || 0) + ' (新 ' + (kv.new_clients || 0) + ')' +
+                   ' · 握手 ' + (kv.eapols || 0);
+    }
+    if (k === 'HANDSHAKE'){
+        if (p[3] === 'START')
+            return '抓握手 第 1 轮 · CH ' + (kv.channel || '?') +
+                   ' · PMF ' + (kv.pmf === '1' ? '必需' : '无');
+        if (p[3] === 'BLOCKED') return '目标强制 PMF, 这条路走不通';
+        if (p[3] === 'DONE')
+            return '抓握手结束 · ' + (kv.rounds || 0) + ' 轮 · 可用 ' +
+                   (kv.hs_complete || 0) + ' / 共 ' + (kv.hs_total || 0) +
+                   ' · PMKID ' + (kv.pmkid || 0);
+    }
+    if (k === 'DONE')   return '编排结束 (' + (kv.kind || '') + ')';
+    if (k === 'STOP')   return '编排已停止 (' + (kv.kind || '') + ')';
+    if (k === 'STATUS')
+        return kv.running === '1'
+            ? '编排中 · ' + (kv.kind || '') + ' / ' + (kv.phase || '') + ' · 第 ' + (kv.rounds || 0) + ' 轮'
+            : '编排空闲';
+    return p.slice(2).join(' · ');
+}
+
+function locateText(p){
+    const k = p[2];
+    const kv = kvOf(p, 3);
+    if (k === 'T')
+        return 'rssi ' + (kv.rssi || '?') + ' · 均 ' + (kv.avg || '?') +
+               ' · 区间 ' + (kv.min || '?') + '~' + (kv.max || '?') +
+               ' · n ' + (kv.n || 0) + ' · ' + (kv.trend || '');
+    if (k === 'START') return '采样开始 · ' + (kv.kind === 'client' ? '客户端' : 'AP') +
+                              ' · ' + (kv.secs || '?') + 's';
+    if (k === 'DONE')  return '采样完成 · ' + (kv.samples || 0) + ' 个 · 均值 ' +
+                              (kv.avg || '?') + ' · 丢失 ' + (kv.miss || 0);
+    if (k === 'STOP')  return '采样已停止';
+    if (k === 'ERR')   return '失败: ' + (kv.msg || '?');
+    return p.slice(2).join(' · ');
+}
+
+function otaText(p){
+    const k = p[2];
+    if (k === 'STATUS'){
+        const kv = kvOf(p, 3);
+        const mb = (parseInt(kv.slot_size || '0') || 0) / 1048576;
+        return '运行槽 ' + (kv.running || '?') + ' · 启动槽 ' + (kv.boot || '?') +
+               ' · ' + (kv.state || '?') + ' · v' + (kv.version || '?') +
+               ' · 回滚' + (kv.rollback_enabled === '1' ? '开' : '关') +
+               ' · 槽 ' + mb.toFixed(1) + 'MB';
+    }
+    if (k === 'ERR') return '失败: ' + (refuseText(p[3] === 'msg' ? p[4] : p[3]));
+    const kv = kvOf(p, k === 'URL' ? 4 : 3);
+    if (k === 'UPLOAD' && p[3] === 'DONE') return '上传完成 · ' + fmtBytes(parseInt(kv.bytes || '0'));
+    if (k === 'URL'){
+        if (p[3] === 'START') return '从 URL 升级到 ' + (kv.slot || '?') + ': ' + (kv.url || '');
+        if (p[3] === 'DONE')  return '下载完成 ' + fmtBytes(parseInt(kv.bytes || '0')) + ' · 重启生效';
+    }
+    if (k === 'CONFIRM') return kv.ok === '1' ? '已确认当前镜像, 取消回滚' : '回滚未启用';
+    if (k === 'ROLLBACK') return '正在回滚并重启';
+    return p.slice(2).join(' · ');
+}
+
+/* 机器码 -> 人话, 表里没有就原样返回 */
+function refuseText(code){
+    const raw = String(code || '');
+    const key = raw.split(' ')[0];
+    return REFUSE_TEXT[key] || raw || '未知原因';
+}
+
 function parseOutputLine(line){
     /* 去掉设备回显的 "rftool> " 提示符 */
     const raw = line.replace(/^\s*rftool>\s*/i, '').trim();
@@ -1227,6 +1405,51 @@ function parseOutputLine(line){
 
     /* 导出载荷采集: start 与 done 之间的非 META 行原样收进缓冲 */
     if (exportCap && !line.startsWith('META,')) exportCap.lines.push(line);
+
+    /* 设备拒绝: 协议层错误与 PMF 拦截.
+     * 这两类以前没有任何分支, 设备回了话 App 当普通日志滚过去, 调用方
+     * 还在等回执, 8 秒后报"设备无响应"。设备明明说了原因却没人听. */
+    if (line.startsWith('META,CLI,ERR,')){
+        const p = line.split(',');
+        const kv = {};
+        for (let i = 3; i + 1 < p.length; i += 2) kv[p[i]] = p[i+1];
+        reportRefusal(kv.msg, kv.detail, kv.cmd);
+        return;
+    }
+    if (line.startsWith('META,WIFI,PMF,')){
+        /* META,WIFI,PMF,<BLOCKED|UNKNOWN>,bssid,X,reason,Y,advice,Z */
+        const p = line.split(',');
+        const kv = {};
+        for (let i = 4; i + 1 < p.length; i += 2) kv[p[i]] = p[i+1];
+        reportRefusal(p[3] === 'BLOCKED' ? 'pmf_required' : 'target_not_in_db',
+                      kv.advice, 'Deauth');
+        return;
+    }
+    /* 命令收尾. rc 非 0 又没打 ERR 行的命令 (返回 esp_err 的处理函数就是
+     * 这种), 以前全被这条 END 行带过, 调用方只能等到超时. 这里把它接住.
+     * BEGIN/END 都是分帧标记, 平常不进日志: status 每 3 秒一条, 让它们
+     * 滚屏会把真实输出冲掉. */
+    if (line.startsWith('META,CLI,BEGIN,')) return;
+    if (line.startsWith('META,CLI,END,')){
+        const p = line.split(',');
+        const kv = {};
+        for (let i = 3; i + 1 < p.length; i += 2) kv[p[i]] = p[i+1];
+        const rc = parseInt(kv.rc || '0');
+        if (rc !== 0){
+            /* 有等待回执就按等待者的话说, 没有就按命令名说. 后台轮询
+             * (status) 失败不该弹窗, 但日志里必须留痕. */
+            const had = !!pendingAction;
+            const label = had ? pendingAction.label : (kv.cmd || '命令');
+            const why = ESP_ERR_TEXT[rc] || ('rc=' + rc);
+            clearPendingAction();
+            log('[' + label + '] 命令失败: ' + why + ' (' + (kv.cmd || '?') + ' rc=' + rc + ')', 'err');
+            if (had){
+                clearHandshake();
+                toast(label + ' 失败: ' + why, 'err');
+            }
+        }
+        return;
+    }
 
     /* 板载 HTTP 服务 (META,HTTP,) */
     if (line.startsWith('META,HTTP,')){
@@ -1283,8 +1506,9 @@ function parseOutputLine(line){
         } else if (p[2] === 'PUSH'){
             log('[Evil Twin] Deauth 推送结束', 'meta');
         } else {
-            log('[Evil Twin] ' + p.slice(3).join(','), 'err');
-            toast('克隆失败', 'err');
+            /* ERR: 要么带 msg 机器码, 要么带 code/err 名字 */
+            reportRefusal(kv.msg || kv.err || 'clone_failed',
+                          kv.code ? 'code ' + kv.code : '', '克隆');
         }
         return;
     }
@@ -1571,17 +1795,17 @@ function parseOutputLine(line){
      * 用户点了按钮看不出结果. 这里转成卡片里的一行可读文本. */
     if (line.startsWith('META,SCENARIO,')){
         const el = document.getElementById('scHint');
-        if (el) el.textContent = line.slice(14).replace(/,/g, ' · ');
+        if (el) el.textContent = scenarioText(line.split(','));
         return;
     }
     if (line.startsWith('META,LOCATE,')){
         const el = document.getElementById('locHint');
-        if (el) el.textContent = line.slice(12).replace(/,/g, ' · ');
+        if (el) el.textContent = locateText(line.split(','));
         return;
     }
     if (line.startsWith('META,OTA,')){
         const el = document.getElementById('otaHint');
-        if (el) el.textContent = line.slice(9).replace(/,/g, ' · ');
+        if (el) el.textContent = otaText(line.split(','));
         return;
     }
 
@@ -1615,7 +1839,15 @@ function parseOutputLine(line){
         } else if (kind === 'COMPLETE'){
             log('[握手] 抓到可用握手 ' + (kv.pair || '') + ' · BSSID ' + kv.bssid +
                 ' · STA ' + kv.sta + ' · CH' + kv.chan + ' · ' + kv.rssi + 'dBm', 'ok');
-            toast('抓到可用握手 (' + (kv.pair || '') + ')', 'ok');
+            /* Deauth 的唯一成功判据: 目标重新上线并握手成功 */
+            if (pendingHs && kv.bssid && kv.bssid.toLowerCase() === pendingHs.bssid){
+                const secs = ((Date.now() - pendingHs.t0) / 1000).toFixed(1);
+                clearHandshake();
+                log('[Deauth] 生效: ' + secs + 's 后 ' + kv.bssid + ' 重新握手 (' + (kv.pair || '') + ')', 'ok');
+                toast('Deauth 生效, 已拿到 ' + kv.bssid + ' 的握手', 'ok');
+            } else {
+                toast('抓到可用握手 (' + (kv.pair || '') + ')', 'ok');
+            }
         } else if (kind === '22000'){
             if (p[3] === 'start'){ hsGrab = { lines: [] }; }
             else if (p[3] === 'note'){
@@ -1778,8 +2010,8 @@ function parseOutputLine(line){
             }
             updatePhishUI();
         } else if (kind === 'ERR'){
-            log('门户错误: ' + p.slice(3).join(','), 'err');
-            clearPendingAction();
+            reportRefusal(kv.msg || p.slice(3).join(','),
+                          kv.code ? 'code ' + kv.code : '', '门户');
         } else {
             log(line, 'meta');
         }
@@ -1850,7 +2082,7 @@ function parseOutputLine(line){
         } else if (kind === 'SNIFF' && p[3] === 'PROGRESS'){
             /* META,WIFI,SNIFF,PROGRESS,total,N,channel,N,aps,N,clients,N */
             const kv = {};
-            for (let i=3; i<p.length-1; i+=2) kv[p[i]] = p[i+1];
+            for (let i=4; i<p.length-1; i+=2) kv[p[i]] = p[i+1];
             setStat('stSniff', kv.total || '0'); setStat('stSniff2', kv.total || '0');
             if (kv.channel){ setStat('stCh', kv.channel); setStat('stCh2', kv.channel); updateBand(bandOf(kv.channel)); }
             if (kv.aps !== undefined){ setStat('stAps', kv.aps); setStat('stAps2', kv.aps); }
@@ -1877,7 +2109,7 @@ function parseOutputLine(line){
         } else if (kind === 'INJECT' && p[3] === 'START'){
             /* META,WIFI,INJECT,START,mode,X,count,N,interval,N,channel,N */
             const kv = {};
-            for (let i=3; i<p.length-1; i+=2) kv[p[i]] = p[i+1];
+            for (let i=4; i<p.length-1; i+=2) kv[p[i]] = p[i+1];
             const ch = kv.channel && kv.channel !== '0' ? ' ch=' + kv.channel : '';
             setJobActive(true);
             confirmAction((kv.mode || '?') + ch + ' 已启动 (间隔 ' + (kv.interval || '0') + 'ms)');
@@ -1886,12 +2118,24 @@ function parseOutputLine(line){
              * 看起来就跟正常跑完一样. */
             log('[注入] 上一个作业被新任务接管', 'warn');
         } else if (kind === 'INJECT' && p[3] === 'DONE'){
+            /* META,WIFI,INJECT,DONE,mode,N,sent,N,err,N,ms,N,stopped,N */
             const kvDone = {};
-            for (let i=5; i<p.length-1; i+=2) kvDone[p[i]] = p[i+1];
+            for (let i=4; i<p.length-1; i+=2) kvDone[p[i]] = p[i+1];
             const cut = kvDone.stopped === '1';
-            log('[注入] ' + (cut ? '被中止' : '完成') + ' sent=' + (kvDone.sent || '0'), cut ? 'err' : 'warn');
+            const sent = parseInt(kvDone.sent || '0') || 0;
             clearPendingAction();
             setJobActive(false);
+            /* deauth(mode=0) 发完帧不算成功: 对面强制 PMF 时帧一样出得去,
+             * 按 sent==count 报成功是假成功. 唯一硬指标是后续能不能抓到
+             * 握手, 所以这里转入握手等待, 由 META,HS,COMPLETE 收尾. */
+            if (kvDone.mode === '0' && !cut && sent > 0 && deauthTarget){
+                log('[Deauth] 已发出 ' + sent + ' 帧, 等 ' + (HS_WAIT_MS/1000) +
+                    's 看有没有客户端重连握手', 'meta');
+                expectHandshake(deauthTarget, sent);
+            } else {
+                log('[注入] ' + (cut ? '被中止' : '完成') + ' sent=' + sent +
+                    (kvDone.err && kvDone.err !== '0' ? ' err=' + kvDone.err : ''), cut ? 'err' : 'warn');
+            }
         } else if (kind === 'INJECT' && p[3] === 'ERR'){
             const name = p[7] || p[5] || '';
             log('[注入] 错误 ' + name, 'err');
@@ -1908,10 +2152,15 @@ function parseOutputLine(line){
         } else if (kind === 'DOWNGRADE' && p[3] === 'STOP'){
             log('[降级] 已停止', 'warn');
             clearPendingAction();
-        } else if (kind === 'APS' && p[3] === 'count'){
-            log('[AP] 数据库 ' + (p[4] || '0') + ' 条', 'meta');
-        } else if (kind === 'CLIENTS' && p[3] === 'count'){
-            log('[客户端] 数据库 ' + (p[4] || '0') + ' 条', 'meta');
+        } else if (kind === 'DUMP'){
+            /* META,WIFI,DUMP,CLEARED,aps,0,clients,0,eapols,0 */
+            clearPendingAction();
+            log('[数据库] 已清空', 'warn');
+            toast('设备端数据库已清空', 'warn');
+        } else if (kind === 'AUTO'){
+            /* 自适应轮询的统计行 (STATS + 每信道一行), 随 status 轮询一起发.
+             * App 没有对应视图, 直接进日志会每 3 秒塞 9 行, 把真实输出冲掉;
+             * 需要时看串口或 CLI 的 status. */
         } else if (kind === 'EXPORT'){
             /* META,WIFI,EXPORT,<fmt>,start
              * META,WIFI,EXPORT,<fmt>,done,aps,N,clients,N,eapols,N */
@@ -1931,8 +2180,11 @@ function parseOutputLine(line){
                 log('[导出] ' + p.slice(3).join(' '), 'meta');
             }
         } else if (kind === 'ERR'){
-            log('错误: ' + (p[3] === 'msg' ? p.slice(4).join(',') : p.slice(3).join(',')), 'err');
-            clearPendingAction();
+            /* META,WIFI,ERR,msg,X[,code,N] */
+            const kv = {};
+            for (let i=3; i<p.length-1; i+=2) kv[p[i]] = p[i+1];
+            reportRefusal(kv.msg || p.slice(3).join(','),
+                          kv.code ? 'code ' + kv.code : '');
         } else {
             log(line, 'meta');
         }
@@ -2390,6 +2642,7 @@ $('btnDeauth').addEventListener('click', () => {
     cmd += ' --yes';
     log('发送破坏性命令: ' + cmd, 'warn');
     deauthTarget = bssid;          /* 供 DONE 后转入握手等待时比对 */
+    clearHandshake();              /* 上一轮没结束的等待作废, 否则旧计时器会在中途报超时 */
     expectConfirm('Deauth', 8000);
     sendCmd(cmd);
 });
@@ -2438,6 +2691,10 @@ $('btnRaw').addEventListener('click', () => {
         if (cmdHistory[cmdHistory.length-1] !== cmd) cmdHistory.push(cmd);
         if (cmdHistory.length > 50) cmdHistory.shift();
         histIdx = cmdHistory.length;
+        /* 手敲的 deauth 也要记住目标, 否则 DONE 之后没法判断哪台 AP 的
+         * 握手才算这条命令的结果 */
+        const m = cmd.match(/^deauth\b.*-b\s+([0-9a-fA-F:]{17})/);
+        if (m) deauthTarget = m[1];
         sendCmd(cmd);
         $('rawCmd').value = '';
     }
@@ -2458,6 +2715,94 @@ $('rawCmd').addEventListener('keydown', e => {
             $('rawCmd').value = cmdHistory[histIdx] || '';
         }
     }
+});
+
+/*
+   指令速查
+   用法串与 main/cli.c 的 g_cmds[].usage 及各 cmd_* 的 usage 文本对齐;
+   改固件命令必须同步改这张表, 否则速查会教人发不存在的参数.
+ */
+const CLI_REF = [
+    { g:'基础', items:[
+        { c:'help',                        d:'设备支持的命令与用法' },
+        { c:'version',                     d:'固件版本' },
+        { c:'status',                      d:'状态与计数器 (App 每 3s 自动拉一次)' },
+        { c:'health',                      d:'堆、任务数、各模块自检' },
+        { c:'log',                         d:'板载日志环形缓冲; log clear 清空' },
+        { c:'events 20',                   d:'事件总线最近 20 条' },
+        { c:'config list',                 d:'NVS 配置; set 键 值 / get 键 / reset' },
+    ]},
+    { g:'扫描与嗅探', items:[
+        { c:'sniff 6',                     d:'定信道嗅探, -n 0 表示不限包数' },
+        { c:'sniff auto --dwell 300',      d:'全信道轮询, 按命中率自适应驻留' },
+        { c:'stop',                        d:'停嗅探 / 注入 / 降级' },
+        { c:'dump aps',                    d:'读设备端 AP 表; clients / eapols / all / clear' },
+        { c:'export csv',                  d:'全量导出; 也可 json' },
+        { c:'hs',                          d:'握手归档; complete 只列可破解, 22000 出 hashcat' },
+        { c:'hs selftest',                 d:'握手配对自检 (RC 一致性)' },
+        { c:'pmkid watch 6',               d:'被动等 PMKID; 也可 watch 加 BSSID' },
+        { c:'locate AA:BB:CC:DD:EE:FF 30', d:'RSSI 测向 30s; status / stop / export' },
+    ]},
+    { g:'注入', items:[
+        { c:'deauth -b AA:BB:CC:DD:EE:FF -n 10 -r 7 -i 100 --yes', d:'踢客户端; 不带 -s 为广播。目标必须先在 AP 表里', danger:true },
+        { c:'beaconflood -p "FreeWiFi" -n 500 -i 20 --yes',         d:'Beacon 洪泛, -c 指定信道', danger:true },
+        { c:'probeflood -n 500 -i 20 --yes',                        d:'Probe 请求洪泛', danger:true },
+        { c:'downgrade "MySSID" --yes',                             d:'WPA3→WPA2 降级 AP 并抓握手', danger:true },
+        { c:'eviltwin clone AA:BB:CC:DD:EE:FF --yes',               d:'克隆 SSID+BSSID+信道; push 追加 deauth', danger:true },
+        { c:'raw tx 8000...',                                       d:'原始帧; 子命令 tx / deauth / auth / assoc / beacon / proberesp' },
+        { c:'karma follow 2',                                       d:'按探针请求改门户 SSID; follow 0 关闭' },
+    ]},
+    { g:'门户与落盘', items:[
+        { c:'phish start "FreeWiFi"',      d:'起钓鱼门户; stop / status / stations / creds' },
+        { c:'phish html size',             d:'自定义页面; clear / begin 字节数 / end' },
+        { c:'cap start key',               d:'原始帧落 Flash (仅关键帧); info / keys / read 偏移 长度' },
+        { c:'cap stop',                    d:'停止落盘, 回执带帧数与丢帧' },
+    ]},
+    { g:'无线扩展', items:[
+        { c:'blescan start',               d:'板载 BLE 扫描; stop / clear' },
+        { c:'ble power 15',                d:'BLE 发射功率 0-15 (15=+20dBm)' },
+        { c:'bleadv eddystone https://a.b', d:'BLE 广播伪造; ibeacon UUID major minor / stop / status' },
+        { c:'zbsniff 15',                  d:'802.15.4 嗅探 (11-26); status / dump / clear' },
+        { c:'ftm range AA:BB:CC:DD:EE:FF 6 8', d:'FTM 测距; 第 2 参数是信道, 目标不在表里时必须给' },
+    ]},
+    { g:'编排与系统', items:[
+        { c:'scenario survey 15',          d:'一轮勘察; handshake 目标BSSID / pmf 目标BSSID / status / stop' },
+        { c:'ota status',                  d:'双区 OTA; confirm / rollback / url 地址 / reboot' },
+        { c:'http start',                  d:'板载 REST 服务; status / stop' },
+    ]},
+];
+
+function renderCliRef(filter){
+    const box = $('cmdRef');
+    if (!box) return;
+    const f = (filter || '').toLowerCase();
+    /* 说明里可能出现 < > 之类的字符, 不转义会被当成标签吞掉 */
+    const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                             .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    let html = '', shown = 0;
+    for (const grp of CLI_REF){
+        const rows = grp.items.filter(it =>
+            !f || (it.c + ' ' + it.d + ' ' + grp.g).toLowerCase().includes(f));
+        if (!rows.length) continue;
+        html += '<div class="crt-group">' + esc(grp.g) + '</div>';
+        for (const it of rows){
+            shown++;
+            html += '<div class="crt" data-cmd="' + esc(it.c) + '">' +
+                        '<code class="' + (it.danger ? 'dg' : '') + '">' + esc(it.c) + '</code>' +
+                        '<span>' + (it.danger ? '需 --yes · ' : '') + esc(it.d) + '</span>' +
+                    '</div>';
+        }
+    }
+    box.innerHTML = shown ? html : '<div class="list-empty">没有匹配的指令</div>';
+}
+
+$('cmdSearch').addEventListener('input', e => renderCliRef(e.target.value));
+$('cmdRef').addEventListener('click', e => {
+    const row = e.target.closest('.crt');
+    if (!row) return;
+    $('rawCmd').value = row.dataset.cmd;
+    $('rawCmd').focus();
+    toast('已填入, 可改参数后执行', 'ok');
 });
 
 /*
@@ -2585,6 +2930,18 @@ $('btnClearAp').addEventListener('click', () => {
     renderApList();
     toast('本地 AP 列表已清空', 'ok');
 });
+
+/* 外部链接: Capacitor 里 window.open 没有窗口管理器支撑, 点了不会有反应.
+ * 改成主框架导航, 让原生 shouldOverrideUrlLoading 拦下交给系统浏览器:
+ * Capacitor 对非同源 URL 直接 startActivity 并返回 true, WebView 不跳走,
+ * BLE 连接保持. 桌面浏览器没有这层拦截, 才用 window.open. */
+function openExternal(url){
+    if (window.Capacitor){ window.location.href = url; return; }
+    window.open(url, '_blank', 'noopener');
+}
+for (const id of ['btnRepo', 'btnRelease']){
+    $(id).addEventListener('click', e => openExternal(e.currentTarget.dataset.url));
+}
 
 /*
    钓鱼门户 (Captive Portal)
@@ -3019,6 +3376,8 @@ function bleScanStop(silent){
 
 function evilTwin(push){
     if (!selectedAp){ toast('请先在嗅探页选一个目标 AP', 'warn'); return; }
+    /* 起 AP + 起 DNS + 起 HTTP, 慢于普通命令, 给 12s */
+    expectConfirm('克隆', 12000);
     sendCmd('eviltwin clone ' + selectedAp.bssid.replace(/:/g, '') + (push ? ' push' : '') + ' --yes');
 }
 
@@ -3326,10 +3685,14 @@ $('ftmRun').addEventListener('click', () => {
     if (!bssid){ markValid('ftmBssid', false); toast('请选择或输入目标 BSSID', 'err'); return; }
     if (!isMac(bssid)){ markValid('ftmBssid', false); toast('BSSID 格式非法', 'err'); return; }
     markValid('ftmBssid', true);
-    const ch  = clampInt($('ftmCh').value, 0, 177, 0);
+    let ch  = clampInt($('ftmCh').value, 0, 177, 0);
     const cnt = parseInt($('ftmCount').value || '0') || 0;
+    /* 固件不接受 channel=0 (回 ESP_ERR_INVALID_ARG 258)。
+     * 用户没填就用当前目标的信道。 */
+    if (ch === 0 && selectedAp && selectedAp.channel) ch = parseInt(selectedAp.channel, 10) || 0;
     let cmd = 'ftm range ' + bssid;
-    if (ch > 0 || cnt > 0) cmd += ' ' + ch;
+    if (ch > 0) cmd += ' ' + ch;
+    else if (cnt > 0) cmd += ' 0';
     if (cnt > 0) cmd += ' ' + cnt;
     ftmSt = { peer:bssid, status:'', code:0, distCm:0, distM:0, rttEst:0, rttRaw:0, entries:0 };
     ftmBursts = [];
@@ -4011,8 +4374,12 @@ const RF_NAV = [
       lb:'固件升级', d:'双分区, 可回滚', panel:'data', blks:[4] },
     { k:'diag', tip:'自检看堆、任务、模块状态。日志级别在 CLI 里改。',
       lb:'诊断', d:'自检与日志', panel:'data', blks:[5] },
+    { k:'about', tip:'仓库里有固件、App 与版本说明。链接跳系统浏览器，连接不会断。',
+      lb:'关于', d:'版本、作者、仓库', panel:'data', blks:[6] },
     { k:'cli', tip:'直接敲固件命令，输出原样回显。',
       lb:'CLI 控制台', d:'直接敲命令', panel:'raw', blks:[0] },
+    { k:'cmds', tip:'点一行填进控制台，参数可以再改。标红的需要 --yes。',
+      lb:'指令速查', d:'全部命令与用法', panel:'raw', blks:[1] },
   ]},
 ];
 
@@ -4139,4 +4506,5 @@ window.gotoTab = function(name){ rfOpen(name); };
     rfOpen('dash');
     rfSyncTarget();
     rfRefreshPicks();
+    renderCliRef('');
 })();

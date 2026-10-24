@@ -215,6 +215,19 @@ input[type=file]{ padding:8px 10px; font-size:10px; color:var(--dim); }
 /* 按钮 */
 .actions{ display:grid; grid-template-columns:repeat(auto-fit,minmax(0,1fr)); gap:8px; margin-top:16px; }
 .tool-grid{ display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+
+/* 指令速查: 点一行填进输入框, 不做弹层 */
+.cmdref .crt-group{
+  padding:14px 0 3px; font-size:9px; letter-spacing:.22em; color:var(--faint); text-transform:uppercase;
+}
+.cmdref .crt{
+  display:flex; flex-direction:column; gap:5px;
+  padding:10px 0; border-top:1px solid var(--line2); cursor:pointer;
+}
+.cmdref .crt:active{ background:rgba(255,255,255,.05); }
+.cmdref .crt code{ font-size:11px; color:var(--accent); letter-spacing:.02em; word-break:break-all; }
+.cmdref .crt code.dg{ color:var(--err); }
+.cmdref .crt span{ font-size:10px; line-height:1.65; color:var(--dim); }
 .btn{
   position:relative; overflow:hidden;
   background:rgba(255,255,255,.04); color:var(--fg);
@@ -791,6 +804,7 @@ button.mi{ width:100%; background:none; border:0; text-align:left; font:inherit;
           <span class="idx">00 — Scan</span>
           <h3>发现与选择<span class="h3-sub">Discovery</span></h3>
           <div class="note">点任意 AP 即设为全局目标，Deauth、降级、钓鱼、Evil Twin、原始帧构造器都跟着它走。</div>
+          <div class="note" id="scanTargetHint">未选择目标</div>
         </div>
 
         <div class="blk">
@@ -1367,6 +1381,20 @@ button.mi{ width:100%; background:none; border:0; text-align:left; font:inherit;
             <button class="btn" id="btnClearAp">清空 AP 列表</button>
           </div>
         </div>
+
+        <div class="blk">
+          <h3>关于<span class="h3-sub">About</span></h3>
+          <div class="kv">
+            <span>App</span><code id="aboutVer">--</code>
+            <span>构建</span><code class="dimv" id="aboutBuild">--</code>
+            <span>作者</span><code class="dimv"><b data-author-full>CN1123243</b></code>
+          </div>
+          <div class="note">源码、固件与版本说明都在仓库里。手机上点开会跳系统浏览器，不会切走当前连接。</div>
+          <div class="actions">
+            <button class="btn" id="btnRepo" data-url="https://github.com/chinese1123243/ESP32-C5-WIFI6-RF-Toolkit">项目主页</button>
+            <button class="btn" id="btnRelease" data-url="https://github.com/chinese1123243/ESP32-C5-WIFI6-RF-Toolkit/releases/latest">下载更新</button>
+          </div>
+        </div>
       
 </section>
 
@@ -1382,6 +1410,15 @@ button.mi{ width:100%; background:none; border:0; text-align:left; font:inherit;
             <button class="btn primary" id="btnRaw">执行</button>
             <button class="btn warn" id="btnStatus">Status</button>
           </div>
+        </div>
+
+        <div class="blk">
+          <h3>指令速查<span class="h3-sub">Cheat Sheet</span></h3>
+          <div class="note">点一行填进上面的输入框。标红的是破坏性命令，固件强制要 --yes，不带只回一条拒绝。</div>
+          <div class="list-search" style="display:block; padding-top:14px;">
+            <input id="cmdSearch" type="text" placeholder="过滤: deauth / sniff / cap / 嗅探…" />
+          </div>
+          <div class="cmdref" id="cmdRef"></div>
         </div>
       </section>
 
@@ -1452,7 +1489,7 @@ button.mi{ width:100%; background:none; border:0; text-align:left; font:inherit;
   </div>
 </div>
 
-<script src="app.js?v=2.3.0"></script>
+<script src="app.js?v=2.3.1"></script>
 
 <datalist id="dlAp"></datalist>
 <datalist id="dlSsid"></datalist>

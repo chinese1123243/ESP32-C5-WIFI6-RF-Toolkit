@@ -55,7 +55,7 @@ console.log('[4] output prefixes handled');
 /* 只列需要 App 结构化解析的前缀. 纯文本 dump 的行走通用 log(),
  * 不在此列 (如 wifi_db 的 EAPOL,<a>,<b>,<type>,<step>). */
 const FIRMWARE_PREFIXES = [
-    'AP,', 'CLIENT,', 'META,WIFI,', 'META,CAP,', 'META,HS,', 'META,PHISH,',
+    'AP,', 'CLIENT,', 'META,WIFI,', 'META,CLI,', 'META,CAP,', 'META,HS,', 'META,PHISH,',
     'META,RAW,', 'META,KARMA,', 'META,BLESCAN,', 'META,EVILTWIN,', 'CRED,', 'PSTA,',
     'KARMA,', 'BLEDEV,', 'WPA*',
 ];
@@ -78,6 +78,19 @@ const panIds = new Set([...html.matchAll(/id="pan-([^"]+)"/g)].map(m => m[1]));
 const noPanel = tabs.filter(t => !panIds.has(t));
 if (noPanel.length) bad('tab without panel: ' + noPanel.join(', '));
 else ok(tabs.length + ' tabs, all have panels');
+
+/* 7. META,WIFI 子类覆盖
+ * 固件新增一个 META,WIFI,<X>, App 的 else-if 链必须同步加分支. 漏了不会
+ * 报错, 只是落进最后的 else 当普通日志, 调用方等不到回执, 表现成
+ * "设备无响应". PMF,BLOCKED 就是这样漏掉的. */
+console.log('[7] META,WIFI subkinds');
+const fwFiles = ['cli.c', 'wifi_attack.c', 'wifi_db.c'];
+const fwSrc = fwFiles.map(f => fs.readFileSync(path.join(ROOT, 'main', f), 'utf8')).join('\n');
+const subkinds = new Set([...fwSrc.matchAll(/META,WIFI,([A-Z]+)/g)].map(m => m[1]));
+const noBranch = [...subkinds].filter(k =>
+    !js.includes("kind === '" + k + "'") && !js.includes('META,WIFI,' + k));
+if (noBranch.length) bad('META,WIFI subkind without branch: ' + noBranch.join(', '));
+else ok(subkinds.size + ' subkinds covered: ' + [...subkinds].join(' '));
 
 console.log(fail ? ('\nFAILED (' + fail + ' check(s))') : '\nALL CHECKS PASSED');
 process.exit(fail ? 1 : 0);
