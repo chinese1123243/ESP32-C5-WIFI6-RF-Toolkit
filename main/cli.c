@@ -436,6 +436,23 @@ static void downgrade_arg_reset(void)
 
 static int cmd_downgrade(int argc, char **argv)
 {
+    /* list 是只读查询, 不进 confirm: 列一下候选, 不启动任何东西 */
+    if (argc >= 2 && strcmp(argv[1], "list") == 0) {
+        int n = 0, cnt = 0;
+        const ap_entry_t *aps = wifi_db_get_aps(&n);
+        for (int i = 0; i < n; i++) {
+            const ap_entry_t *e = &aps[i];
+            if (!e->transition) continue;
+            char bs[18];
+            mac_to_str(e->bssid, bs);
+            printf("META,DOWNGRADE,CAND,bssid,%s,ssid,%s,ch,%u,rssi,%d\n",
+                   bs, e->ssid, (unsigned)e->channel, (int)e->rssi);
+            cnt++;
+        }
+        printf("META,DOWNGRADE,LIST,count,%d,total,%d\n", cnt, n);
+        fflush(stdout);
+        return 0;
+    }
     if (!confirm_dangerous(argc, argv, "<ssid>")) return 1;
     int nerrors = arg_parse(argc, argv, (void **)&downgrade_args);
     if (nerrors) { meta_arg_errors(downgrade_args.end, argv[0]); return 1; }
@@ -1693,6 +1710,59 @@ static int cmd_pmkid(int argc, char **argv)
     return 1;
 }
 
+/* airtime: 逐信道空口占用. 阻塞, 每信道驻留 dwell_ms.
+ * 用途是给注入挑一条真正空闲的信道: 只看 AP 数量不够, 一条刷视频的信道
+ * 可能只有一台 AP 但占用率 60%. */
+static int cmd_airtime(int argc, char **argv)
+{
+    /* 默认 300ms: beacon 间隔 102.4ms, 驻留只给 100ms 时单个 AP 只有 63%
+     * 的概率被看到, 空信道和"有 AP 但没扫到"会混在一起. */
+    uint32_t dwell = 300;
+    int band = 0, ch = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--dwell") == 0 && i + 1 < argc) {
+            dwell = (uint32_t)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--band") == 0 && i + 1 < argc) {
+            const char *b = argv[++i];
+            band = (strcmp(b, "5g") == 0) ? 1 : (strcmp(b, "all") == 0 ? 2 : 0);
+        } else if (strcmp(argv[i], "--ch") == 0 && i + 1 < argc) {
+            ch = atoi(argv[++i]);
+        } else {
+            printf("META,AIRTIME,ERR,msg,bad_option,%s\n", argv[i]);
+            fflush(stdout);
+            return 1;
+        }
+    }
+    if (ch && !((ch >= 1 && ch <= 14) || (ch >= 36 && ch <= 177))) {
+        printf("META,AIRTIME,ERR,msg,bad_channel\n"); fflush(stdout); return 1;
+    }
+    if (dwell < 50) dwell = 50;
+    if (dwell > 5000) dwell = 5000;
+
+    static air_ch_t rows[48];
+    int n = wifi_attack_airtime((uint8_t)band, (uint8_t)ch, dwell, rows, 48);
+    if (n <= 0) {
+        printf("META,AIRTIME,ERR,msg,nothing_measured\n"); fflush(stdout); return 1;
+    }
+
+    int best = 0;
+    if (dwell < 200) {
+        printf("META,AIRTIME,WARN,msg,dwell_short,ms,%u (beacon 102ms, 太短会漏 AP)\n",
+               (unsigned)dwell);
+    }
+    for (int i = 0; i < n; i++) {
+        printf("META,AIRTIME,CH,%u,util,%u,frames,%u,air_ms,%u,rssi,%d\n",
+               (unsigned)rows[i].ch, (unsigned)rows[i].util,
+               (unsigned)rows[i].frames, (unsigned)rows[i].air_ms,
+               (int)rows[i].rssi_max);
+        if (rows[i].util > rows[best].util) best = i;
+    }
+    printf("META,AIRTIME,DONE,chans,%d,busiest,%u,util,%u,dwell_ms,%u\n",
+           n, (unsigned)rows[best].ch, (unsigned)rows[best].util, (unsigned)dwell);
+    fflush(stdout);
+    return 0;
+}
+
 /* events (事件快照) */
 static int cmd_events(int argc, char **argv)
 {
@@ -1716,11 +1786,12 @@ static const cli_cmd_t g_cmds[] = {
     { "status",      "Show state/counters",  NULL,                   cmd_status,      NULL },
     { "sniff",       "Start promisc sniff",  "<ch|auto> [-n N] (1-14,36-177)", cmd_sniff,  sniff_arg_reset },
     { "stop",        "Stop sniff/inject",    NULL,                   cmd_stop,        NULL },
+    { "airtime",     "Per-channel airtime census", "[--dwell ms] [--band 2g|5g|all] [--ch N]", cmd_airtime, NULL },
     { "deauth",      "Deauth inject",        "-b <bssid> [opts]",    cmd_deauth,      deauth_arg_reset },
     { "beaconflood", "Beacon flood",         "-p <prefix> [opts]",   cmd_beaconflood, beacon_arg_reset },
     { "probeflood",  "Probe req flood",      "[opts]",               cmd_probeflood,  probe_arg_reset },
     { "http",        "HTTP REST API",        "<start|stop|status>",  cmd_http,        http_arg_reset },
-    { "downgrade",   "WPA3->WPA2 downgrade AP + EAPOL capture", "<ssid> [opts]", cmd_downgrade, downgrade_arg_reset },
+    { "downgrade",   "WPA3->WPA2 downgrade AP + EAPOL capture", "<ssid> [opts]|list", cmd_downgrade, downgrade_arg_reset },
     { "phish",       "Captive portal (phishing AP)", "start|stop|status|stations|creds|html", cmd_phish, NULL },
     { "cap",         "Raw frame capture to flash", "start|stop|clear|info|keys|read|hdr", cmd_cap, NULL },
     { "hs",          "EAPOL handshake -> hashcat 22000", "[complete]|clear|22000|selftest", cmd_hs, NULL },

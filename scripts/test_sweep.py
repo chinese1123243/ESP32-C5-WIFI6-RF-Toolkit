@@ -180,6 +180,10 @@ CASES = [
     ("sniff 0",                       None, "非法信道: 应当被拒", "reject"),
     ("sniff 15",                      None, "非法信道: 应当被拒", "reject"),
 
+    ("airtime --ch 6 --dwell 60",     None, "单信道短窗口 (会报 dwell_short)", None),
+    ("airtime --ch 999",              None, "非法信道: 应当被拒", "reject"),
+    ("airtime --bogus",               None, "未知参数: 应当被拒", "reject"),
+
     ("beaconflood -p SW -n 30 -i 20 --yes", None, None, None),
     ("beaconflood -p SW -n 30 -c 11 --yes", None, "带信道参数", None),
     ("beaconflood -p SW -n 30 -c 0 --yes",  None, "信道 0 回落到当前", None),
@@ -242,6 +246,7 @@ CASES = [
     ("eviltwin clone 00:11:22:33:44:55", None, "缺 --yes: 应当被拒 (need_confirm)", "reject"),
     ("eviltwin stop",                 None, None, None),
 
+    ("downgrade list",                None, "只读查询: 不需要 --yes", None),
     ("downgrade TestSSID",            None, "缺 --yes: 应当被拒 (need_confirm)", "reject"),
 
     ("ftm range 00:11:22:33:44:55 6 2", None, None, None),

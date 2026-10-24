@@ -1416,6 +1416,17 @@ function parseOutputLine(line){
         reportRefusal(kv.msg, kv.detail, kv.cmd);
         return;
     }
+    if (line.startsWith('META,AIRTIME,DONE,')){
+        const kv = kvOf(line.split(','), 3);
+        log('[空口] ' + kv.chans + ' 个信道 · 最忙 ch' + kv.busiest +
+            ' · 占用 ' + kv.util + '%', 'meta');
+        return;
+    }
+    if (line.startsWith('META,AIRTIME,WARN,')){
+        log('[空口] 驻留太短，可能漏掉 AP（beacon 间隔 102ms）', 'warn');
+        return;
+    }
+
     if (line.startsWith('META,CSA,TX,')){
         /* META,CSA,TX,ok,1,bssid,X,from,ch,to,ch,sent,N,fail,N,cloned,0|1 */
         const kv = kvOf(line.split(','), 3);
@@ -2765,6 +2776,8 @@ const CLI_REF = [
     { g:'扫描与嗅探', items:[
         { c:'sniff 6',                     d:'定信道嗅探, -n 0 表示不限包数' },
         { c:'sniff auto --dwell 300',      d:'全信道轮询, 按各信道发现数排序; --policy wrl 用旧的帧率加权' },
+        { c:'airtime --band 2g',           d:'逐信道测空口占用, 给注入挑一条真闲的信道' },
+        { c:'downgrade list',              d:'列出可降级的 WPA3 过渡模式目标' },
         { c:'stop',                        d:'停嗅探 / 注入 / 降级' },
         { c:'dump aps',                    d:'读设备端 AP 表; clients / eapols / all / clear' },
         { c:'export csv',                  d:'全量导出; 也可 json' },

@@ -901,6 +901,88 @@ esp_err_t wifi_attack_init(void)
     return ESP_OK;
 }
 
+/* 空口占用 */
+
+static volatile uint32_t s_air_frames, s_air_bytes, s_air_us;
+static volatile int32_t  s_air_rssi;
+static uint8_t           s_air_ch;
+
+static void air_rx_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (!buf || type == WIFI_PKT_MISC) return;
+    const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
+    if (p->rx_ctrl.rx_state != 0) return;
+    int len = p->rx_ctrl.sig_len - 4;
+    if (len < 10 || len > RFTOOL_MAX_FRAME_LEN) return;
+
+    /* 速率缺失时按 6Mbps 算: 管理帧在 rx_ctrl 里常常是 0. 加 56us 覆盖
+     * 前导 (20) 与 SIFS/ACK/DIFS 的均摊. 只看相对忙闲, 不做精确时序复算. */
+    uint32_t rate = p->rx_ctrl.rate ? (uint32_t)p->rx_ctrl.rate * 500000u : 6000000u;
+    uint32_t us = (uint32_t)(((uint64_t)len * 8u * 1000000u) / rate) + 56u;
+
+    s_air_frames++;
+    s_air_bytes += (uint32_t)len;
+    s_air_us += us;
+    if ((int32_t)p->rx_ctrl.rssi > s_air_rssi) s_air_rssi = (int32_t)p->rx_ctrl.rssi;
+
+    /* 同时喂抓包, 这样一次窗口里既有统计也有原始帧, 可以离线复算校验 */
+    cap_feed(p->payload, (uint16_t)len, (int8_t)p->rx_ctrl.rssi, s_air_ch,
+             (int8_t)p->rx_ctrl.noise_floor, (uint8_t)p->rx_ctrl.rate);
+}
+
+int wifi_attack_airtime(uint8_t band, uint8_t ch, uint32_t dwell_ms,
+                        air_ch_t *out, int max_out)
+{
+    if (!out || max_out <= 0) return 0;
+    if (dwell_ms < 50)   dwell_ms = 50;
+    if (dwell_ms > 5000) dwell_ms = 5000;
+
+    wifi_attack_stop_all();
+    if (atomic_load(&s_state) != WIFI_ATK_IDLE) return 0;
+
+    uint8_t list[N_CH_2G + N_CH_5G];
+    int n = 0;
+    if (ch) {
+        list[n++] = ch;
+    } else {
+        if (band == 0 || band == 2)
+            for (size_t i = 0; i < N_CH_2G; i++) list[n++] = s_channels_2g[i];
+        if (band == 1 || band == 2)
+            for (size_t i = 0; i < N_CH_5G; i++) list[n++] = s_channels_5g[i];
+    }
+    if (n > max_out) n = max_out;
+
+    esp_wifi_set_promiscuous_rx_cb(air_rx_cb);
+    esp_wifi_set_promiscuous(true);
+
+    int done = 0;
+    for (int i = 0; i < n; i++) {
+        uint8_t c = list[i];
+        if (!is_valid_channel(c)) continue;
+        if (esp_wifi_set_channel(c, WIFI_SECOND_CHAN_NONE) != ESP_OK) continue;
+        s_air_ch = c;
+        s_air_frames = 0; s_air_bytes = 0; s_air_us = 0; s_air_rssi = -128;
+
+        TickType_t t0 = xTaskGetTickCount();
+        while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(dwell_ms)) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        uint32_t air_ms = s_air_us / 1000u;
+        uint32_t util = (air_ms * 100u) / dwell_ms;
+        out[done].ch = c;
+        out[done].frames = s_air_frames;
+        out[done].bytes = s_air_bytes;
+        out[done].air_ms = air_ms;
+        out[done].util = (uint8_t)(util > 100 ? 100 : util);
+        out[done].rssi_max = (int8_t)s_air_rssi;
+        done++;
+    }
+
+    esp_wifi_set_promiscuous(false);
+    return done;
+}
+
 /* CSA: 在驱动任务里只做一次 memcpy, 不能在这里解析或打印 */
 static uint8_t        s_csa_frame[RFTOOL_MAX_FRAME_LEN];
 static volatile int   s_csa_len = 0;

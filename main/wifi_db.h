@@ -28,6 +28,8 @@ typedef struct {
     bool     hidden;
     bool     pmf;               /* PMF 必需 (MFPR): 为真时伪造 Deauth 基本无效 */
     bool     pmf_cap;           /* 支持 PMF (MFPC) */
+    bool     transition;        /* WPA3 过渡模式: 同时宣告 PSK 与 SAE, 且 MFP 非必需.
+                                 * 这种 AP 可以起一个只宣告 WPA2 的孪生, 让客户端降级. */
     uint8_t  akm;               /* CAP_AKM_* 位图 */
     uint8_t  cipher;            /* CAP_CIPHER_* 位图 */
     uint8_t  bw;                /* 20/40/80/160 MHz */

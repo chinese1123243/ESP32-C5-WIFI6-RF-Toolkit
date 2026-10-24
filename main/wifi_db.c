@@ -289,6 +289,10 @@ bool wifi_db_update_ap(const uint8_t *frame, int len, uint8_t channel, int8_t rs
     e->pmf        = (caps.pmf & CAP_PMF_REQUIRED) != 0;
     e->pmf_cap    = (caps.pmf & CAP_PMF_CAPABLE) != 0;
     e->akm        = caps.akm;
+    /* 过渡模式 = 同时宣告 PSK 与 SAE, 且没有强制 PMF. 只要 MFP 必需, 客户端
+     * 就会验 RSN IE, 伪造一个只宣告 WPA2 的孪生会被识破. */
+    e->transition = ((caps.akm & CAP_AKM_PSK) != 0) &&
+                    ((caps.akm & CAP_AKM_SAE) != 0) && !e->pmf;
     e->cipher     = caps.cipher;
     e->bw         = caps.bw;
     e->ht         = caps.ht;
@@ -415,13 +419,13 @@ void wifi_db_dump_aps(void)
         mac_to_str(e->bssid, bssid);
         /* 前 11 个字段保持原样 (App 既有的位置解析不受影响), 新字段追加在后面 */
         printf("AP,%s,%s,ch%d,rssi%d,%s,%s,pmf%d,bcn%u,data%u,%s,"
-               "akm,%s,cip,%s,bw,%u,std,%s,wps,%d,pmfc,%d,crk,%d\n",
+               "akm,%s,cip,%s,bw,%u,std,%s,wps,%d,pmfc,%d,crk,%d,trans,%d\n",
                bssid, e->ssid, e->channel, e->rssi,
                enc_str(e->encryption), e->hidden ? "HIDDEN" : "VISIBLE",
                e->pmf ? 1 : 0, (unsigned)e->beacon_count, (unsigned)e->data_count,
                e->vendor, akm, cipher_str(e->cipher), (unsigned)e->bw,
                caps_std_str(&c), e->wps ? 1 : 0, e->pmf_cap ? 1 : 0,
-               e->crackable ? 1 : 0);
+               e->crackable ? 1 : 0, e->transition ? 1 : 0);
     }
     fflush(stdout);
 }

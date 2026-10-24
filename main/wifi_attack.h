@@ -83,6 +83,21 @@ esp_err_t wifi_attack_csa(const uint8_t bssid[6], const char *ssid_fallback,
                           uint8_t ch, uint8_t new_ch, uint8_t count, bool dry,
                           csa_result_t *res);
 
+/* 单信道空口占用 */
+typedef struct {
+    uint8_t  ch;
+    uint32_t frames;
+    uint32_t bytes;
+    uint32_t air_ms;     /* 按帧长与速率估算的占用时间 */
+    uint8_t  util;       /* air_ms / dwell_ms, 百分比 */
+    int8_t   rssi_max;
+} air_ch_t;
+
+/* 逐信道测空口占用. band: 0=2.4G, 1=5G, 2=全部; ch 非 0 时只测该信道.
+ * 阻塞, 每信道驻留 dwell_ms. 返回写入 out 的信道数. */
+int wifi_attack_airtime(uint8_t band, uint8_t ch, uint32_t dwell_ms,
+                        air_ch_t *out, int max_out);
+
 /* 自动轮询的调度策略. 必须在 sniff_auto_start 之前设置才生效.
  *   0 = wrl: 按帧率加权 (旧行为)
  *   1 = psd: 按每信道发现数排序 + 探测下限 (默认) */
