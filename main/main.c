@@ -61,10 +61,15 @@ static void wdt_init_controlled(void)
 }
 #endif
 
-/* 第 3 层: CLI/REPL 独享 32KB 栈 */
+/* 第 3 层: CLI/REPL 独享 8KB 栈 */
+static volatile bool s_cli_ready = false;
+
 static void cli_task(void *arg)
 {
     (void)arg;
+    /* 栈在 init 之前就分配好了, 但这里要等 init 全部完成才允许跑命令:
+     * 提前跑起来会在 Wi-Fi/NimBLE 还没就绪时接命令, 那是另一种崩法. */
+    while (!s_cli_ready) vTaskDelay(pdMS_TO_TICKS(20));
     esp_err_t err = cli_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "cli_start failed: %s", esp_err_to_name(err));
@@ -73,7 +78,10 @@ static void cli_task(void *arg)
     vTaskDelete(NULL);
 }
 
-/* 第 2 层: RGB + Wi-Fi init 独享 32KB 栈 */
+/* 第 2 层: RGB + Wi-Fi init 独享 8KB 栈 (只调用各模块 init, 实测用量 1076) */
+/* init 任务跑完就自删, 栈低水位得在删之前存下来, 否则这个数永远拿不到.
+ * init 的栈是堆上第一块分配, 它有多大, 删掉后底部的空洞就有多大. */
+uint32_t g_init_stack_min = 0;
 static void init_task(void *arg)
 {
     (void)arg;
@@ -82,6 +90,16 @@ static void init_task(void *arg)
     /* 0. 受控看门狗 (最先做, 之后任何卡死都能自愈) */
     wdt_init_controlled();
 #endif
+
+    /* 0.5 CLI 任务先建出来, 把它的栈压在堆的头部.
+     * FreeRTOS 从低地址 first-fit 分配: 先建的栈在最低地址, 后面 Wi-Fi 与
+     * NimBLE 的顺序分配不会把它夹在中间. 实测同一份固件, 提前建 47104,
+     * 放到 init 末尾再建 45056. 2KB 不多, 但这条改起来只有一行.
+     * 建好不等于开跑: cli_task 会等 s_cli_ready. */
+    if (xTaskCreate(cli_task, "cli", 8192, NULL, 24, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "xTaskCreate(cli) FAILED");
+        rgb_led_set_status(RGB_ERROR);
+    }
 
     /* 1. RGB (启动紫色) */
     esp_err_t err = rgb_led_init();
@@ -130,18 +148,9 @@ static void init_task(void *arg)
         }
     }
 
-    /* 5. 创建 CLI 任务.
-     *    内部 RAM 很紧 (WiFi + NimBLE 抢得厉害), 32KB 栈的连续块经常申请不到
-     *    → 20000 字节 (最深调用链约 8KB, 仍有 2.5x 余量). */
+    /* 5. 启动 BLE GATT 服务 (手机直连收发 CLI 命令) */
     ESP_LOGI(TAG, "internal free=%u largest=%u", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-    BaseType_t r = xTaskCreate(cli_task, "cli", 20480, NULL, 24, NULL);
-    if (r != pdPASS) {
-        ESP_LOGE(TAG, "xTaskCreate(cli) FAILED");
-        rgb_led_set_status(RGB_ERROR);
-    }
-
-    /* 6. 启动 BLE GATT 服务 (手机直连收发 CLI 命令) */
     esp_err_t berr = ble_cli_start();
     if (berr != ESP_OK) {
         ESP_LOGW(TAG, "ble_cli_start failed: %s (BLE 不可用, 仅 UART)", esp_err_to_name(berr));
@@ -150,13 +159,23 @@ static void init_task(void *arg)
         bleadv_init();
     }
 
+    /* 6. 到这里才放 CLI 跑命令. 栈早在 0.5 就分配好了, 放行晚一点只是不让
+     *    用户命令和 Wi-Fi / NimBLE 的初始化抢跑, 与堆布局无关. */
+    s_cli_ready = true;
+
+    /* 量一下本任务的栈低水位再自删: 这个数是 init 栈该给多大的唯一依据. */
+    g_init_stack_min = (uint32_t)uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+    ESP_LOGI(TAG, "init stack left=%u bytes", (unsigned)g_init_stack_min);
     vTaskDelete(NULL);
 }
 
-/* 第 1 层: main task 只创建 init_task */
+/* 第 1 层: main task 只创建 init_task
+ * 栈 8192: init_task 只调用各模块的 init, 实测低水位 31700/32768 (只用了 1068).
+ * 这块栈是堆上第一笔分配, 它有多大, 退出后底部就留多大的洞, 而这个洞正是
+ * 之前 largest 卡在 32768 的原因. 缩到 8KB 后 largest 变成 48KB 上下. */
 void app_main(void)
 {
-    BaseType_t r = xTaskCreate(init_task, "rf_init", 32768, NULL, 5, NULL);
+    BaseType_t r = xTaskCreate(init_task, "rf_init", 8192, NULL, 5, NULL);
     if (r != pdPASS) {
         ESP_LOGE(TAG, "FATAL: xTaskCreate(init_task) failed");
     }
