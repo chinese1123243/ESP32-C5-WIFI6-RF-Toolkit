@@ -19,9 +19,12 @@
 #define IE_ID_VHT_OP    192
 #define IE_ID_EXT       255
 #define IE_ID_VENDOR    221
+#define IE_ID_TWT       216
 
 #define EXT_HE_CAP      35
+#define EXT_HE_OP       36
 #define EXT_HE_6GHZ_OP  59
+#define EXT_RNR         201
 
 /* 0x00-0x0F-0xAC 是 RSN 的标准 OUI, 所有密套件/AKM 都带它 */
 static inline bool oui_rsn(const uint8_t *p)
@@ -96,6 +99,32 @@ static void parse_vht_op(const uint8_t *ie, int n, ap_caps_t *c)
     else if (w == 2 || w == 3) { if (c->bw < 160) c->bw = 160; }
 }
 
+/* HE Operation: 3 字节 HE Operation Parameters.
+ * B0-B5 = BSS Color, B9 = TWT Required. 后面还有 Basic HE-MCS/NSS (2B) 与
+ * 可选的 VHT/6GHz Operation Info, 这里只取前两个字段. */
+static void parse_he_op(const uint8_t *p, int n, ap_caps_t *c)
+{
+    if (n < 3) return;
+    c->bss_color = (uint8_t)(p[0] & 0x3F);
+    c->twt_req   = (p[1] & 0x02) != 0;
+}
+
+/* RNR (Reduced Neighbor Report): 邻居 AP 信息 = TBTT Info Header(2) +
+ * Operating Class(1) + Channel(1) + TBTT Info Set. 只取第一个邻居的类型与
+ * 信道: 走完整 TBTT Info Set 要按 header 里的长度字段跳, 各家实现长度不同,
+ * 取多了会越界. 6GHz 的操作类是 131-137. */
+static void parse_rnr(const uint8_t *p, int n, ap_caps_t *c)
+{
+    if (n < 4 || c->rnr_count) return;
+    uint16_t hdr = (uint16_t)(p[0] | (p[1] << 8));
+    uint8_t cnt = (uint8_t)(hdr >> 8);
+    if (cnt == 0 && n > 4) cnt = 1;      /* 有的实现把 1 个邻居写成 0 */
+    c->rnr_count = cnt;
+    c->rnr_ch    = p[3];
+    uint8_t opclass = p[2];
+    c->rnr_6g = (opclass >= 131 && opclass <= 137);
+}
+
 void ie_parse_ies(const uint8_t *ies, int len, ap_caps_t *out)
 {
     ap_caps_t c;
@@ -129,8 +158,19 @@ void ie_parse_ies(const uint8_t *ies, int len, ap_caps_t *out)
             case IE_ID_VHT_OP:  parse_vht_op(p, sl, &c);    break;
 
             case IE_ID_EXT:
-                if (sl >= 1 && p[0] == EXT_HE_CAP) c.he = true;
+                if (sl >= 1 && p[0] == EXT_HE_CAP) {
+                    c.he = true;
+                } else if (sl >= 1 && p[0] == EXT_HE_OP) {
+                    c.he = true;
+                    parse_he_op(p + 1, sl - 1, &c);
+                } else if (sl >= 1 && p[0] == EXT_RNR) {
+                    parse_rnr(p + 1, sl - 1, &c);
+                }
                 /* HE 6GHz Operation 不做带宽推断 (靠 VHT/HT 已足够) */
+                break;
+
+            case IE_ID_TWT:
+                if (sl >= 1) c.twt = true;
                 break;
 
             default: break;

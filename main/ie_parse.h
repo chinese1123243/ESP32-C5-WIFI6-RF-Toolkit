@@ -44,6 +44,14 @@ typedef struct {
     bool    ht;         /* 11n */
     bool    vht;        /* 11ac */
     bool    he;         /* 11ax */
+    /* Wi-Fi 6 结构. 这些字段只在 HE Operation / TWT / RNR 元素里出现,
+     * 老 AP 全是 0, 用 0 表示"没宣告"而不是"值是 0". */
+    uint8_t bss_color;  /* HE Operation 的 6 位 BSS Color, 0 = 未宣告 */
+    bool    twt_req;    /* HE Operation 的 TWT Required 位 */
+    bool    twt;        /* beacon 里带 TWT 元素 */
+    uint8_t rnr_count;  /* RNR 里的邻居数 */
+    uint8_t rnr_ch;     /* 第一个邻居的信道 */
+    bool    rnr_6g;     /* 第一个邻居属于 6GHz 操作类 (131-137) */
     /* 该 AP 是否值得打: PMC 表示可离线破握手 */
     bool    crackable;
 } ap_caps_t;

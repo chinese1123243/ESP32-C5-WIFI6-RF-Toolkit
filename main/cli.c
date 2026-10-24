@@ -1763,6 +1763,88 @@ static int cmd_airtime(int argc, char **argv)
     return 0;
 }
 
+/* wifi6: BSS Color / TWT / RNR 一览.
+ * BSS Color 是空间复用标记: 同色 + 同信道 + 都够强的两个 BSS 会互相把对方
+ * 的帧当成"自己人", 空间复用失效. 不同信道本来就不在同一个 OBSS 里, 不算冲突. */
+static int cmd_wifi6(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    int n = 0, he = 0, colors = 0, twt_req = 0, twt_ie = 0, sixg = 0, conflicts = 0;
+    const ap_entry_t *aps = wifi_db_get_aps(&n);
+
+    for (int i = 0; i < n; i++) {
+        const ap_entry_t *e = &aps[i];
+        if (!e->he) continue;
+        he++;
+        if (e->bss_color) colors++;
+        if (e->twt_req) twt_req++;
+        if (e->twt) twt_ie++;
+        if (e->rnr_6g) sixg++;
+
+        char bs[18];
+        mac_to_str(e->bssid, bs);
+        printf("META,WIFI6,AP,bssid,%s,ssid,%s,ch,%u,color,%u,twt,%d,twt_req,%d,"
+               "rnr,%u,rnr_ch,%u,rnr6g,%d\n",
+               bs, e->ssid, (unsigned)e->channel, (unsigned)e->bss_color,
+               e->twt ? 1 : 0, e->twt_req ? 1 : 0,
+               (unsigned)e->rnr_count, (unsigned)e->rnr_ch, e->rnr_6g ? 1 : 0);
+    }
+
+    for (int i = 0; i < n; i++) {
+        const ap_entry_t *a = &aps[i];
+        if (!a->he || a->bss_color == 0 || a->rssi < -85) continue;
+
+        /* 同一组只由第一个成员报一次 */
+        bool first = true;
+        for (int j = 0; j < i; j++) {
+            const ap_entry_t *b = &aps[j];
+            if (b->he && b->bss_color == a->bss_color &&
+                b->channel == a->channel && b->rssi >= -85) { first = false; break; }
+        }
+        if (!first) continue;
+
+        const ap_entry_t *mate = NULL;
+        int k = 0;
+        for (int j = i + 1; j < n; j++) {
+            const ap_entry_t *b = &aps[j];
+            if (b->he && b->bss_color == a->bss_color &&
+                b->channel == a->channel && b->rssi >= -85) {
+                if (!mate) mate = b;
+                k++;
+            }
+        }
+        if (k && mate) {
+            /* 同一个物理 AP 常发多个 BSSID (主/访客/隐藏), 这些同色是正常的.
+             * 判据一: 前 3 字节 OUI 相同且末字节相差 4 以内.
+             * 判据二: 一个全局地址配一个本地管理地址, 且 SSID 相同或其中一个是
+             * 隐藏的. 多 BSSID 设备常用派生出来的本地 MAC 发隐藏 SSID.
+             * 判据二会漏掉"攻击者用本地 MAC 复制同名 SSID"这种情况, 但这条命令
+             * 看的是空间复用, 不是找孪生. */
+            bool oui_same = memcmp(a->bssid, mate->bssid, 3) == 0;
+            bool adj = abs((int)a->bssid[5] - (int)mate->bssid[5]) <= 4;
+            bool loc_a = (a->bssid[0] & 0x02) != 0;
+            bool loc_b = (mate->bssid[0] & 0x02) != 0;
+            bool same_ssid = strcmp(a->ssid, mate->ssid) == 0;
+            bool one_hidden = a->hidden != mate->hidden;
+            bool same_dev = (oui_same && adj) ||
+                            (loc_a != loc_b && (same_ssid || one_hidden));
+            char b1[18], b2[18];
+            mac_to_str(a->bssid, b1);
+            mac_to_str(mate->bssid, b2);
+            printf("META,WIFI6,CONFLICT,ch,%u,color,%u,aps,%d,bssids,%s|%s,same_dev,%d\n",
+                   (unsigned)a->channel, (unsigned)a->bss_color, k + 1,
+                   b1, b2, same_dev ? 1 : 0);
+            if (!same_dev) conflicts++;
+        }
+    }
+
+    printf("META,WIFI6,DONE,aps,%d,he,%d,colors,%d,conflicts,%d,"
+           "twt_req,%d,twt_ie,%d,sixg,%d\n",
+           n, he, colors, conflicts, twt_req, twt_ie, sixg);
+    fflush(stdout);
+    return 0;
+}
+
 /* events (事件快照) */
 static int cmd_events(int argc, char **argv)
 {
@@ -1787,6 +1869,7 @@ static const cli_cmd_t g_cmds[] = {
     { "sniff",       "Start promisc sniff",  "<ch|auto> [-n N] (1-14,36-177)", cmd_sniff,  sniff_arg_reset },
     { "stop",        "Stop sniff/inject",    NULL,                   cmd_stop,        NULL },
     { "airtime",     "Per-channel airtime census", "[--dwell ms] [--band 2g|5g|all] [--ch N]", cmd_airtime, NULL },
+    { "wifi6",       "Wi-Fi 6 structure: BSS color / TWT / RNR", NULL, cmd_wifi6, NULL },
     { "deauth",      "Deauth inject",        "-b <bssid> [opts]",    cmd_deauth,      deauth_arg_reset },
     { "beaconflood", "Beacon flood",         "-p <prefix> [opts]",   cmd_beaconflood, beacon_arg_reset },
     { "probeflood",  "Probe req flood",      "[opts]",               cmd_probeflood,  probe_arg_reset },

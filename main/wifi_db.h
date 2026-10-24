@@ -30,6 +30,13 @@ typedef struct {
     bool     pmf_cap;           /* 支持 PMF (MFPC) */
     bool     transition;        /* WPA3 过渡模式: 同时宣告 PSK 与 SAE, 且 MFP 非必需.
                                  * 这种 AP 可以起一个只宣告 WPA2 的孪生, 让客户端降级. */
+    /* Wi-Fi 6 结构 (HE Operation / TWT / RNR) */
+    uint8_t  bss_color;         /* 0 = 未宣告 */
+    uint8_t  rnr_count;         /* RNR 邻居数 */
+    uint8_t  rnr_ch;            /* 第一个邻居的信道 */
+    bool     twt;               /* beacon 带 TWT 元素 */
+    bool     twt_req;           /* HE Operation 置了 TWT Required */
+    bool     rnr_6g;            /* 邻居在 6GHz 操作类 */
     uint8_t  akm;               /* CAP_AKM_* 位图 */
     uint8_t  cipher;            /* CAP_CIPHER_* 位图 */
     uint8_t  bw;                /* 20/40/80/160 MHz */

@@ -293,6 +293,12 @@ bool wifi_db_update_ap(const uint8_t *frame, int len, uint8_t channel, int8_t rs
      * 就会验 RSN IE, 伪造一个只宣告 WPA2 的孪生会被识破. */
     e->transition = ((caps.akm & CAP_AKM_PSK) != 0) &&
                     ((caps.akm & CAP_AKM_SAE) != 0) && !e->pmf;
+    e->bss_color  = caps.bss_color;
+    e->twt        = caps.twt;
+    e->twt_req    = caps.twt_req;
+    e->rnr_count  = caps.rnr_count;
+    e->rnr_ch     = caps.rnr_ch;
+    e->rnr_6g     = caps.rnr_6g;
     e->cipher     = caps.cipher;
     e->bw         = caps.bw;
     e->ht         = caps.ht;

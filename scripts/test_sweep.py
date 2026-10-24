@@ -247,6 +247,7 @@ CASES = [
     ("eviltwin stop",                 None, None, None),
 
     ("downgrade list",                None, "只读查询: 不需要 --yes", None),
+    ("wifi6",                         None, "BSS Color / TWT / RNR 一览", None),
     ("downgrade TestSSID",            None, "缺 --yes: 应当被拒 (need_confirm)", "reject"),
 
     ("ftm range 00:11:22:33:44:55 6 2", None, None, None),

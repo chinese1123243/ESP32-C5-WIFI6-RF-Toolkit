@@ -1416,6 +1416,23 @@ function parseOutputLine(line){
         reportRefusal(kv.msg, kv.detail, kv.cmd);
         return;
     }
+    if (line.startsWith('META,WIFI6,')){
+        /* AP 明细太多, 只把冲突与汇总放进日志 */
+        if (line.startsWith('META,WIFI6,CONFLICT,')){
+            const kv = kvOf(line.split(','), 3);
+            const same = kv.same_dev === '1';
+            log('[Wi-Fi 6] 同色 ch' + kv.ch + ' color ' + kv.color + ' · ' +
+                kv.aps + ' 个 BSS' + (same ? '（同一台设备的多个 BSSID）' : '（不同设备，空间复用冲突）'),
+                same ? 'meta' : 'warn');
+        } else if (line.startsWith('META,WIFI6,DONE,')){
+            const kv = kvOf(line.split(','), 3);
+            log('[Wi-Fi 6] ' + kv.he + '/' + kv.aps + ' 台 11ax · Color ' + kv.colors +
+                ' · 冲突 ' + kv.conflicts + ' · TWT 必需 ' + kv.twt_req +
+                ' · TWT 元素 ' + kv.twt_ie + ' · 6G 邻居 ' + kv.sixg, 'meta');
+        }
+        return;
+    }
+
     if (line.startsWith('META,AIRTIME,DONE,')){
         const kv = kvOf(line.split(','), 3);
         log('[空口] ' + kv.chans + ' 个信道 · 最忙 ch' + kv.busiest +
@@ -2777,6 +2794,7 @@ const CLI_REF = [
         { c:'sniff 6',                     d:'定信道嗅探, -n 0 表示不限包数' },
         { c:'sniff auto --dwell 300',      d:'全信道轮询, 按各信道发现数排序; --policy wrl 用旧的帧率加权' },
         { c:'airtime --band 2g',           d:'逐信道测空口占用, 给注入挑一条真闲的信道' },
+        { c:'wifi6',                       d:'看 BSS Color 冲突、TWT 与 6GHz 邻居' },
         { c:'downgrade list',              d:'列出可降级的 WPA3 过渡模式目标' },
         { c:'stop',                        d:'停嗅探 / 注入 / 降级' },
         { c:'dump aps',                    d:'读设备端 AP 表; clients / eapols / all / clear' },
