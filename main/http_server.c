@@ -1060,7 +1060,11 @@ esp_err_t http_server_start(const char *ssid, const char *pass)
 
     esp_netif_ip_info_t ip;
     esp_netif_get_ip_info(s_ap_netif, &ip);
-    ESP_LOGI(TAG, "HTTP OK: SSID='%s' pass='%s' IP=" IPSTR, s_ssid, p, IP2STR(&ip.ip));
+    /* Evil Twin 克隆时 p 为 NULL (开放网络), 而 ESP-IDF 的 printf 对 %s
+     * 不做 NULL 保护, 直接传进去会解引用 0 地址触发 Load access fault.
+     * 实测 eviltwin clone 就崩在这一行. */
+    ESP_LOGI(TAG, "HTTP OK: SSID='%s' pass='%s' IP=" IPSTR, s_ssid,
+             p ? p : "(open)", IP2STR(&ip.ip));
     printf("META,HTTP,START,ok,1,ssid,%s,ip," IPSTR "\n", s_ssid, IP2STR(&ip.ip));
     fflush(stdout);
     return ESP_OK;

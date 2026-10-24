@@ -1149,6 +1149,19 @@ static int cmd_ftm(int argc, char **argv)
         uint8_t frm = 0;
         if (cnt == 16 || cnt == 24 || cnt == 32 || cnt == 64) frm = (uint8_t)cnt;
 
+        /* esp_wifi_ftm_initiate_session() 不接受 channel=0, 会直接回
+         * ESP_ERR_INVALID_ARG(258)。不填信道时从库里取目标的信道。 */
+        if (ch == 0) {
+            char fssid[33] = {0};
+            uint8_t apch = 0;
+            if (find_ap(bssid, fssid, sizeof(fssid), &apch)) ch = apch;
+        }
+        if (ch == 0) {
+            printf("META,FTM,ERR,msg,need_channel (目标不在库里, 请显式给信道)\n");
+            fflush(stdout);
+            return 1;
+        }
+
         /* FTM 与嗅探/注入共用同一射频: 先停掉 Wi-Fi 作业 */
         wifi_attack_stop_all();
         esp_err_t e = ftm_range(bssid, (uint8_t)ch, frm, 0);
