@@ -168,7 +168,7 @@ static int cmd_sniff(int argc, char **argv)
 {
     /* 检测 auto 子命令: argv[1] == "auto" */
     if (argc >= 2 && strcmp(argv[1], "auto") == 0) {
-        /* "auto" 不是合法 int，手动解析 [--dwell N] [-n N] */
+        /* "auto" 不是合法 int，手动解析 [--dwell N] [-n N] [--policy wrl|psd] */
         uint32_t dwell = 1000;
         uint32_t cnt = 0;
         int i = 2;
@@ -181,6 +181,16 @@ static int cmd_sniff(int argc, char **argv)
                 i += 2;
             } else if ((strcmp(a, "--count") == 0 || strcmp(a, "-n") == 0) && i + 1 < argc) {
                 cnt = (uint32_t)atoi(argv[i+1]);
+                i += 2;
+            } else if (strcmp(a, "--policy") == 0 && i + 1 < argc) {
+                const char *p = argv[i+1];
+                if (strcmp(p, "psd") == 0)      wifi_attack_set_auto_policy(1);
+                else if (strcmp(p, "wrl") == 0) wifi_attack_set_auto_policy(0);
+                else {
+                    printf("META,WIFI,ERR,msg,bad_policy (wrl|psd)\n");
+                    fflush(stdout);
+                    return 1;
+                }
                 i += 2;
             } else {
                 printf("META,WIFI,ERR,msg,bad_option,%s\n", a);

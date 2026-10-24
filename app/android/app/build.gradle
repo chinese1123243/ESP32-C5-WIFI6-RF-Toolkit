@@ -11,7 +11,7 @@ android {
          * 约定: 1.<功能批次>.<修复>, 每批改动都要动 versionName,
          * versionCode 单调递增 (Android 靠它判断能否覆盖安装). */
         versionCode 7
-        versionName "2.3.2"
+        versionName "2.3.3"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.

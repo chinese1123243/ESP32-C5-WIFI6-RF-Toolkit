@@ -14,6 +14,7 @@
  *   可能死锁. 故回调只递减计数 + 唤醒独立 stopper task, 由后者执行真正停止.
  */
 #include "wifi_attack.h"
+#include <math.h>
 #include "radio_common.h"
 #include "rgb_led.h"
 #include "wifi_db.h"
@@ -218,6 +219,43 @@ static inline void chan_hit(uint8_t ch, uint16_t w)
     atomic_fetch_add(&s_ch_hits_total, (uint32_t)w);
 }
 
+/* 覆盖优先调度 (PSD) 的输入: 每个信道"本轮作业里新发现过几台 AP".
+ *
+ * 为什么不能拿帧率当目标: 帧率高的信道往往是"一台 AP 在刷视频", 那里没有
+ * 新目标可找; 反之一台静默 AP 每秒只发 10 个 beacon, 帧率永远排不上号.
+ * 调度的目标应该是"还有多少台没被发现", 这个计数直接对应该目标.
+ *
+ * 只在自动轮询期间累计, 每次 auto 启动清零. */
+static _Atomic uint16_t s_ch_found[CH_IDX_MAX + 1];
+static _Atomic uint32_t s_ch_found_total = 0;
+/* 每信道被驻留过几次. 第一次必须给足探测下限, 之后才敢用便宜的 150ms:
+ * 首轮的 150ms 会让"没探过"和"探过是空的"变成同一件事, 实测 5 秒时比
+ * 均匀扫描少发现 3.8 台. */
+static _Atomic uint16_t s_ch_visits[CH_IDX_MAX + 1];
+
+static inline void chan_new_ap(uint8_t ch)
+{
+    if (ch == 0 || ch > CH_IDX_MAX) return;
+    if (!atomic_load(&s_channel_rotate)) return;
+    atomic_fetch_add(&s_ch_found[ch], 1);
+    atomic_fetch_add(&s_ch_found_total, 1);
+}
+
+/* 调度策略. wrl = 原来的按帧率加权, psd = 按发现数排序 + 探测下限. */
+typedef enum { AUTO_POLICY_WRL = 0, AUTO_POLICY_PSD = 1 } auto_policy_t;
+/* 默认 psd: 实测 dwell=150 时 15 秒内多发现 1.1 台 (bootstrap 区间 +0.2~+1.8),
+ * dwell=300 时与 wrl 打平. 短驻留正是"想快扫"的用户会选的配置, 那里旧的
+ * 每信道 floor(base/6=25ms) 已经低于 beacon 间隔, 系统性地漏检. */
+static _Atomic uint8_t s_auto_policy = AUTO_POLICY_PSD;
+
+/* 探测下限.
+ * 一台 AP 的 beacon 间隔默认 102.4ms, 驻留 d 毫秒能看到的概率是
+ *   1 - exp(-d / 102.4)
+ * d=50 时只有 39%, d=250 时 91%. 低于 2 个 beacon 周期就漏检, 而漏检会被
+ * 调度器读成"这个信道没货", 于是下次给得更短, 形成越漏越短的死循环.
+ * 250ms 是 2.4 个周期, 仿真里漏检率从 27% 降到 8%. */
+#define AUTO_DET_FLOOR_MS 250u
+
 /* 一次驻留结束: 把这段驻留时间记到该信道上. 与 chan_hit() 配合构成收益率. */
 static void chan_close(uint8_t ch, uint32_t dwell_ms)
 {
@@ -273,6 +311,74 @@ static uint32_t auto_dwell_for(uint8_t ch, uint32_t base)
     return d;
 }
 
+/* PSD 的驻留: 按"本信道发现了多少台 AP"分配.
+ *   热信道  d = base × sqrt(该信道发现数 / 全部信道平均发现数), 夹到 [下限, 2×base]
+ *   冷信道  下限的 60%
+ * 开方是为了抑制独占: 线性分配时 ch6 会拿走 base 的 4 倍, 其它信道饿死;
+ * 开方后最热与最冷的驻留比约 2.4:1, 与仿真的最优区间一致. */
+static uint32_t auto_dwell_psd(uint8_t ch, uint32_t base)
+{
+    uint32_t floor_ms = AUTO_DET_FLOOR_MS;
+    if (base <= floor_ms) floor_ms = base;   /* 用户把 base 调到下限以下才跟着降 */
+
+    uint32_t w      = (ch <= CH_IDX_MAX) ? atomic_load(&s_ch_found[ch]) : 0;
+    uint32_t total  = atomic_load(&s_ch_found_total);
+    uint32_t visits = (ch <= CH_IDX_MAX) ? atomic_load(&s_ch_visits[ch]) : 0;
+    uint32_t n      = (uint32_t)(N_CH_2G + N_CH_5G);
+
+    /* 第一次接触一律给 base, 与旧策略的首轮完全一致:
+     * 首轮就压到下限以下会少发现约 1.3 台 (实测 10 次 A/B), 而首轮的覆盖
+     * 速度并不值得拿检出率去换. 便宜只用在"探过、确认是空的"信道上. */
+    if (visits == 0) return base;
+    if (w == 0 || total == 0) return floor_ms * 3 / 5;   /* 探过是空的: 便宜地复检 */
+
+    float mean = (float)total / (float)n;
+    uint32_t d = (uint32_t)((float)base * sqrtf((float)w / mean));
+
+    uint32_t hi = base * 2;
+    if (hi > 2000) hi = 2000;
+    if (d < floor_ms) d = floor_ms;
+    if (d > hi) d = hi;
+    return d;
+}
+
+static void auto_visit(uint8_t ch, uint32_t base)
+{
+    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    atomic_store(&s_sniff_channel, ch);
+    rgb_led_event(RGB_EV_CHAN_SWITCH, 300);
+
+    uint32_t dwell = (atomic_load(&s_auto_policy) == AUTO_POLICY_PSD)
+                     ? auto_dwell_psd(ch, base) : auto_dwell_for(ch, base);
+    atomic_store(&s_auto_dwell_now, dwell);
+    vTaskDelay(pdMS_TO_TICKS(dwell));
+    chan_close(ch, dwell);
+    if (ch <= CH_IDX_MAX) atomic_fetch_add(&s_ch_visits[ch], 1);
+}
+
+/* PSD 每轮重排访问顺序: 发现数多的信道先走.
+ * 41 个元素, 插入排序足够, 且天然稳定 (相同权重保持原顺序, 不会来回抖). */
+static uint8_t s_psd_order[N_CH_2G + N_CH_5G];
+
+static int psd_build_order(void)
+{
+    int n = 0;
+    for (size_t i = 0; i < N_CH_2G; i++) s_psd_order[n++] = s_channels_2g[i];
+    for (size_t i = 0; i < N_CH_5G; i++) s_psd_order[n++] = s_channels_5g[i];
+    for (int i = 1; i < n; i++) {
+        uint8_t  v  = s_psd_order[i];
+        uint16_t wv = (v <= CH_IDX_MAX) ? atomic_load(&s_ch_found[v]) : 0;
+        int j = i - 1;
+        while (j >= 0 && ((s_psd_order[j] <= CH_IDX_MAX
+                           ? atomic_load(&s_ch_found[s_psd_order[j]]) : 0) < wv)) {
+            s_psd_order[j + 1] = s_psd_order[j];
+            j--;
+        }
+        s_psd_order[j + 1] = v;
+    }
+    return n;
+}
+
 static void channel_rotate_task(void *pv)
 {
     /* 会话号在创建时固定: 见 sniff_progress_task 里同样的处理.
@@ -281,10 +387,24 @@ static void channel_rotate_task(void *pv)
      * 同时抢着切信道, 表现是自动轮询乱跳、命中率全线掉. 号不对就退出. */
     uint32_t mine = (uint32_t)(uintptr_t)pv;
     WDT_ADD();
-    /* 先扫 2.4G 全信道, 再扫 5G 全信道, 循环 */
+    /* WR-λ 按固定顺序 2.4G→5G 走; PSD 每轮按发现数重排 */
     size_t idx_2g = 0, idx_5g = 0;
     bool band_2g = true;
     while (atomic_load(&s_channel_rotate) && atomic_load(&s_rotate_gen) == mine) {
+        uint32_t base = atomic_load(&s_dwell_ms);
+
+        if (atomic_load(&s_auto_policy) == AUTO_POLICY_PSD) {
+            int n = psd_build_order();
+            for (int i = 0; i < n; i++) {
+                if (!atomic_load(&s_channel_rotate) ||
+                    atomic_load(&s_rotate_gen) != mine) break;
+                auto_visit(s_psd_order[i], base);
+                WDT_RESET();
+            }
+            atomic_fetch_add(&s_auto_round, 1);
+            continue;
+        }
+
         uint8_t ch;
         if (band_2g) {
             ch = s_channels_2g[idx_2g % N_CH_2G];
@@ -300,15 +420,7 @@ static void channel_rotate_task(void *pv)
                 atomic_fetch_add(&s_auto_round, 1);
             }
         }
-        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-        atomic_store(&s_sniff_channel, ch);
-        rgb_led_event(RGB_EV_CHAN_SWITCH, 300);
-
-        uint32_t base  = atomic_load(&s_dwell_ms);
-        uint32_t dwell = auto_dwell_for(ch, base);
-        atomic_store(&s_auto_dwell_now, dwell);
-        vTaskDelay(pdMS_TO_TICKS(dwell));
-        chan_close(ch, dwell);       /* WR-λ: 记驻留时长, 与命中数算收益率 */
+        auto_visit(ch, base);
         WDT_RESET();
     }
     WDT_DEL();
@@ -518,7 +630,9 @@ static void wifi_sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type)
      * 输出 (默认关闭), 常规情况由 DB 快照 (dump aps/clients) + 进度行提供数据. */
     const uint8_t cur_ch = atomic_load(&s_sniff_channel);
     if (ftype == FC_TYPE_MGMT && (fsub == 0x8 || fsub == 0x5)) {
-        wifi_db_update_ap(f, frame_len, cur_ch, rssi);
+        if (wifi_db_update_ap(f, frame_len, cur_ch, rssi)) {
+            chan_new_ap(cur_ch);                 /* PSD: 这台是本次作业新发现的 */
+        }
         chan_hit(cur_ch, 1);                     /* Beacon/ProbeResp 权重 1 */
     }
     if (ftype == FC_TYPE_DATA) {
@@ -923,6 +1037,16 @@ esp_err_t wifi_attack_inject_stop(void)
     return atomic_load(&s_inject_running) ? ESP_ERR_TIMEOUT : ESP_OK;
 }
 
+void wifi_attack_set_auto_policy(int policy)
+{
+    atomic_store(&s_auto_policy, policy ? AUTO_POLICY_PSD : AUTO_POLICY_WRL);
+}
+
+int wifi_attack_get_auto_policy(void)
+{
+    return atomic_load(&s_auto_policy) == AUTO_POLICY_PSD ? 1 : 0;
+}
+
 esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms, uint32_t count)
 {
     /* 互斥: 自动停其他功能 (inject / downgrade) */
@@ -950,12 +1074,15 @@ esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms, uint32_t count)
      * 用户敲 `sniff auto -n 200` 以为到数会停, 实际一直跑到手停. */
     atomic_store(&s_sniff_remaining, count ? count : UINT32_MAX);
     atomic_store(&s_sniff_total, 0);
-    /* 每次 auto 启动清空命中统计, 避免上一次作业的热点权重污染 */
+    /* 每次 auto 启动清空发现计数, 上一次作业的发现不能算到这一次头上 */
     for (int i = 0; i <= CH_IDX_MAX; i++) {
         atomic_store(&s_ch_hits[i], 0);
+        atomic_store(&s_ch_found[i], 0);
+        atomic_store(&s_ch_visits[i], 0);
         atomic_store(&s_ch_listen[i], 0);
     }
     atomic_store(&s_ch_hits_total, 0);
+    atomic_store(&s_ch_found_total, 0);
     atomic_store(&s_rate_mean, 0);
     atomic_store(&s_auto_round, 0);
     atomic_store(&s_auto_dwell_now, dwell_ms);
@@ -975,8 +1102,9 @@ esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms, uint32_t count)
         return ESP_FAIL;
     }
 
-    printf("META,WIFI,SNIFF,AUTO,START,dwell_ms,%u,adaptive,%u\n",
-           (unsigned)dwell_ms, atomic_load(&s_auto_adaptive) ? 1u : 0u);
+    printf("META,WIFI,SNIFF,AUTO,START,dwell_ms,%u,adaptive,%u,policy,%s\n",
+           (unsigned)dwell_ms, atomic_load(&s_auto_adaptive) ? 1u : 0u,
+           atomic_load(&s_auto_policy) == AUTO_POLICY_PSD ? "psd" : "wrl");
     event_publish("WIFI", "sniff auto start dwell=%u", (unsigned)dwell_ms);
     fflush(stdout);
     return ESP_OK;
@@ -1087,9 +1215,12 @@ void wifi_attack_auto_dump(void)
     }
 
     for (int i = 0; i < top_n; i++) {
-        printf("META,WIFI,AUTO,CH,%d,hits,%u,dwell,%u\n",
+        printf("META,WIFI,AUTO,CH,%d,hits,%u,dwell,%u,found,%u\n",
                top_ch[i], (unsigned)top_v[i],
-               (unsigned)auto_dwell_for((uint8_t)top_ch[i], base));
+               (unsigned)((atomic_load(&s_auto_policy) == AUTO_POLICY_PSD)
+                          ? auto_dwell_psd((uint8_t)top_ch[i], base)
+                          : auto_dwell_for((uint8_t)top_ch[i], base)),
+               (unsigned)atomic_load(&s_ch_found[top_ch[i]]));
     }
 }
 

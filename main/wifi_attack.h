@@ -58,6 +58,12 @@ esp_err_t wifi_attack_inject_stop(void);
  * 默认开启自适应调度, 按各信道命中率在 [0.55x, 3x] 范围内缩放驻留. */
 esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms, uint32_t count);
 
+/* 自动轮询的调度策略. 必须在 sniff_auto_start 之前设置才生效.
+ *   0 = wrl: 按帧率加权 (旧行为)
+ *   1 = psd: 按每信道发现数排序 + 探测下限 (默认) */
+void wifi_attack_set_auto_policy(int policy);
+int  wifi_attack_get_auto_policy(void);
+
 /* 打印自适应轮询统计 (滚轮轮次 / 总命中 / 热点信道 TOP8). */
 void wifi_attack_auto_dump(void);
 

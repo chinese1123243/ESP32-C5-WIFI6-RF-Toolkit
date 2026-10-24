@@ -4,7 +4,7 @@
  */
 
 /* 版本 */
-const APP_VERSION  = '2.3.2';
+const APP_VERSION  = '2.3.3';
 const APP_BUILD    = '2026.09';
 const APP_AUTHOR      = 'CN112';
 const APP_AUTHOR_FULL = 'CN1123243';
@@ -2734,7 +2734,7 @@ const CLI_REF = [
     ]},
     { g:'扫描与嗅探', items:[
         { c:'sniff 6',                     d:'定信道嗅探, -n 0 表示不限包数' },
-        { c:'sniff auto --dwell 300',      d:'全信道轮询, 按命中率自适应驻留' },
+        { c:'sniff auto --dwell 300',      d:'全信道轮询, 按各信道发现数排序; --policy wrl 用旧的帧率加权' },
         { c:'stop',                        d:'停嗅探 / 注入 / 降级' },
         { c:'dump aps',                    d:'读设备端 AP 表; clients / eapols / all / clear' },
         { c:'export csv',                  d:'全量导出; 也可 json' },

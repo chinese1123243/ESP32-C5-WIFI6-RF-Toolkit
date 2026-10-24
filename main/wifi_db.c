@@ -256,13 +256,16 @@ void wifi_db_clear(void)
     db_index_reset();
 }
 
-void wifi_db_update_ap(const uint8_t *frame, int len, uint8_t channel, int8_t rssi)
+bool wifi_db_update_ap(const uint8_t *frame, int len, uint8_t channel, int8_t rssi)
 {
-    if (!s_aps) { ESP_LOGE(DB_TAG, "update_ap: s_aps is NULL!"); return; }
-    if (len < 24) return;
+    if (!s_aps) { ESP_LOGE(DB_TAG, "update_ap: s_aps is NULL!"); return false; }
+    if (len < 24) return false;
     const uint8_t *bssid = frame + 16; /* addr3 */
     ap_entry_t *e = find_ap(bssid);
-    if (!e) return;
+    if (!e) return false;
+    /* find_ap 未命中时会新建条目, 新条目的 beacon_count 为 0.
+     * 在自增之前取这个标志, 就是"这台 AP 是不是刚被发现". */
+    bool is_new = (e->beacon_count == 0);
     e->rssi = rssi;
     e->channel = channel;
     e->last_seen_tick = (uint32_t)esp_timer_get_time();
@@ -293,6 +296,7 @@ void wifi_db_update_ap(const uint8_t *frame, int len, uint8_t channel, int8_t rs
     e->he         = caps.he;
     e->wps        = caps.wps;
     e->crackable  = caps.crackable;
+    return is_new;
 }
 
 void wifi_db_update_client(const uint8_t *frame, int len, int8_t rssi)

@@ -66,7 +66,8 @@ const char *enc_str(uint8_t enc);
 esp_err_t wifi_db_init(void);
 void wifi_db_clear(void);
 
-void wifi_db_update_ap(const uint8_t *frame, int len, uint8_t channel, int8_t rssi);
+/* 返回 true 表示这是一台新 AP (首次入库). 调度策略靠它统计每个信道的发现数. */
+bool wifi_db_update_ap(const uint8_t *frame, int len, uint8_t channel, int8_t rssi);
 void wifi_db_update_client(const uint8_t *frame, int len, int8_t rssi);
 bool wifi_db_check_eapol(const uint8_t *frame, int len, int8_t rssi);
 
