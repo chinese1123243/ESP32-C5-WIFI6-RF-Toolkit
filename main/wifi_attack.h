@@ -67,6 +67,22 @@ esp_err_t wifi_attack_pmkid_active(const uint8_t bssid[6], const char *ssid,
                                    uint8_t ch, uint32_t timeout_ms,
                                    int *m1_out, int *pmkid_out);
 
+/* CSA 伪造的结果. bytes 里是改过的完整 beacon, dry 模式回给 CLI 打印 hex. */
+typedef struct {
+    uint8_t bytes[512];
+    int     len;
+    int     sent;
+    int     fail;
+    bool    cloned;      /* true = 用了空口抓到的真实 beacon, false = 合成 */
+} csa_result_t;
+
+/* 克隆目标 beacon, 追加 CSA IE, 在目标信道连发 count 个 (倒计时递减).
+ * 抓不到 beacon 时用 ssid_fallback 合成一个. dry=true 只组帧不发射.
+ * 单射频: 会先停掉嗅探/注入/降级. */
+esp_err_t wifi_attack_csa(const uint8_t bssid[6], const char *ssid_fallback,
+                          uint8_t ch, uint8_t new_ch, uint8_t count, bool dry,
+                          csa_result_t *res);
+
 /* 自动轮询的调度策略. 必须在 sniff_auto_start 之前设置才生效.
  *   0 = wrl: 按帧率加权 (旧行为)
  *   1 = psd: 按每信道发现数排序 + 探测下限 (默认) */

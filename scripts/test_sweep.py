@@ -195,6 +195,8 @@ CASES = [
                                             None, "广播目标", None),
 
     ("raw beacon TESTSW 6",      None, "单帧构造", None),
+    ("raw csa 00:11:22:33:44:55 1", None, "缺 --yes: 应当被拒", "reject"),
+    ("raw csa 00:11:22:33:44:55 1 1 --ssid TESTSW --ch 6 --dry", None, "只组帧不发射", None),
     ("raw tx 00",                     None, "hex 太短: 应当被拒", "reject"),
     ("raw tx 0011223344",             None, "5 字节太短: 应当被拒", "reject"),
 

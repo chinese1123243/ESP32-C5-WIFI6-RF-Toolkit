@@ -242,5 +242,10 @@ M.feed('META,PMKID,ACTIVE,ok,1,bssid,20:87:ec:0f:4e:82,ssid,iTV-82456,ch,6,m1,1,
 check('PMKID 回执清等待', M.pending() === null);
 check('PMKID 结果进日志', /PMKID/.test(JSON.stringify(M.logs())), JSON.stringify(M.logs()));
 
+M.reset(); M.expectConfirm('CSA', 8000);
+M.feed('META,CSA,TX,ok,1,bssid,20:87:ec:0f:4e:82,from,6,to,1,sent,3,fail,0,cloned,1');
+check('CSA 回执清等待', M.pending() === null);
+check('CSA 结果进日志', /CSA/.test(JSON.stringify(M.logs())), JSON.stringify(M.logs()));
+
 console.log('\n=== 结果: ' + pass + ' passed, ' + fail + ' failed ===');
 process.exit(fail ? 1 : 0);

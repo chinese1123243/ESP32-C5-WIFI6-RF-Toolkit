@@ -1416,6 +1416,17 @@ function parseOutputLine(line){
         reportRefusal(kv.msg, kv.detail, kv.cmd);
         return;
     }
+    if (line.startsWith('META,CSA,TX,')){
+        /* META,CSA,TX,ok,1,bssid,X,from,ch,to,ch,sent,N,fail,N,cloned,0|1 */
+        const kv = kvOf(line.split(','), 3);
+        log('[CSA] ' + kv.bssid + ' ch' + kv.from + ' → ch' + kv.to +
+            ' · 发送 ' + (kv.sent || '0') + ' 帧' +
+            (kv.cloned === '1' ? ' · 克隆真实 beacon' : ' · 合成帧'),
+            kv.fail && kv.fail !== '0' ? 'warn' : 'ok');
+        clearPendingAction();
+        return;
+    }
+
     if (line.startsWith('META,PMKID,ACTIVE,')){
         /* META,PMKID,ACTIVE,ok,1,bssid,X,ssid,Y,ch,N,m1,N,pmkid,N,ms,N */
         const p = line.split(',');
@@ -2761,6 +2772,7 @@ const CLI_REF = [
         { c:'hs selftest',                 d:'握手配对自检 (RC 一致性)' },
         { c:'pmkid watch 6',               d:'被动等 PMKID; 也可 watch 加 BSSID' },
         { c:'pmkid active 20:87:ec:0f:4e:82 --yes', d:'主动关联一次取 M1; AP 支持才有 PMKID', danger:true },
+        { c:'raw csa 20:87:ec:0f:4e:82 1 3 --yes', d:'伪造 CSA 把客户端赶到指定信道; PMF 挡不住', danger:true },
         { c:'locate AA:BB:CC:DD:EE:FF 30', d:'RSSI 测向 30s; status / stop / export' },
     ]},
     { g:'注入', items:[

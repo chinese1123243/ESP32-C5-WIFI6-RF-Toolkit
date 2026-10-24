@@ -165,6 +165,17 @@ int fb_probe_resp(uint8_t *out, int cap, const uint8_t dst[6], const uint8_t bss
 }
 
 
+int fb_append_csa(uint8_t *frame, int len, int cap, uint8_t new_ch, uint8_t count)
+{
+    if (!frame || len <= 0 || len + 5 > cap) return 0;
+    frame[len++] = 37;          /* Element ID: Channel Switch Announcement */
+    frame[len++] = 3;
+    frame[len++] = 0;           /* switch mode 0: 立即切换 */
+    frame[len++] = new_ch;
+    frame[len++] = count;       /* 剩余 beacon 数, 1 表示下一个就切 */
+    return len;
+}
+
 static int hex_nibble(char c)
 {
     if (c >= '0' && c <= '9') return c - '0';

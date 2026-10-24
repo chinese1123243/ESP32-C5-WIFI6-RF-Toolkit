@@ -37,5 +37,11 @@ int fb_beacon(uint8_t *out, int cap, const uint8_t bssid[6],
 int fb_probe_resp(uint8_t *out, int cap, const uint8_t dst[6], const uint8_t bssid[6],
                   const uint8_t *ssid, int ssid_len, uint8_t ch);
 
+/* 在已有 beacon/probe-resp 末尾追加 CSA (Channel Switch Announcement) IE.
+ * 802.11w 只保护一部分管理帧, beacon 不在其中, 所以伪造的 CSA 对开了 PMF 的
+ * 客户端仍然有效, 这是 deauth 被挡住时的替代路径.
+ * 返回新帧长, 0 表示失败. */
+int fb_append_csa(uint8_t *frame, int len, int cap, uint8_t new_ch, uint8_t count);
+
 /* 生成一个本地管理地址 (第一个字节的 bit1 置位) */
 void fb_random_local_mac(uint8_t out[6]);
