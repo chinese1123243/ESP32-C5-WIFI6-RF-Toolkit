@@ -16,20 +16,33 @@ PCAP_MAGIC = 0xA1B2C3D4
 
 
 def read_hex_from_port(port, baud, off, length):
+    """cap hex 单次上限 1024 字节, 超过就分片拉."""
     import serial
+    import time
     s = serial.Serial(port, baud, timeout=0.05)
-    buf = ""
-    s.write(b"cap hex %d %d\r\n" % (off, length))
-    s.flush()
-    deadline = __import__("time").time() + 6
-    while __import__("time").time() < deadline:
-        c = s.read(4096)
-        if c:
-            buf += c.decode("utf-8", "replace")
-            if "META,CAP,HEX" in buf:
-                break
+    out = []
+    done = 0
+    while done < length:
+        n = min(1024, length - done)
+        buf = ""
+        s.write(b"cap hex %d %d\r\n" % (off + done, n))
+        s.flush()
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            c = s.read(8192)
+            if c:
+                buf += c.decode("utf-8", "replace")
+                if "META,CAP,HEX" in buf:
+                    break
+        out.append(buf)
+        got = sum(len(x) for x in out[-1].splitlines() if x.strip() and
+                  not x.strip().startswith("META") and
+                  re.fullmatch(r"[0-9a-f]+", x.strip()))
+        done += got // 2
+        if got == 0:
+            break
     s.close()
-    return buf
+    return "\n".join(out)
 
 
 def extract_hex(text):
@@ -119,6 +132,7 @@ def main():
     ap.add_argument("--off", type=int, default=0)
     ap.add_argument("--len", type=int, default=2048)
     ap.add_argument("--file", default="", help="从已保存的 hex 文本解析")
+    ap.add_argument("--save", default="", help="把解析到的字节写成 .pcap")
     args = ap.parse_args()
 
     if args.file:
@@ -128,6 +142,9 @@ def main():
     data = extract_hex(text)
     if not data:
         raise SystemExit("没有拿到十六进制数据; 原文尾部: %r" % text[-200:])
+    if args.save:
+        open(args.save, "wb").write(data)
+        print("已保存 %s (%d 字节)" % (args.save, len(data)))
     parse(data)
 
 
