@@ -1,5 +1,5 @@
 /*
- * http_server.h — HTTP REST API + SoftAP 接入点
+ * http_server.h: HTTP REST API + SoftAP 接入点
  *
  * 远程控制接口 (JSON):
  *   GET  /api/status            -> {state, channel, auto_ch, sniff_total, inject_total, aps, clients, eapols}
@@ -37,8 +37,20 @@ esp_err_t http_server_stop(void);
 /* 是否已运行. */
 bool http_server_is_running(void);
 
+/* 当前 SoftAP 实际 SSID (未运行时为空串). */
+const char *http_server_ap_ssid(void);
+
 /* 打印运行状态 (IP / SSID / 连接数). */
 void http_server_status(void);
+
+/* 暴露 httpd 句柄, 供钓鱼门户等模块注册额外 URI (未运行时为 NULL). */
+#include "esp_http_server.h"
+httpd_handle_t http_server_handle(void);
+
+/* Evil Twin 克隆: 指定 SoftAP 的信道与 BSSID (MAC).
+ * bssid 传 NULL 表示不改 MAC. 只对紧接着的一次 http_server_start() 生效.
+ * 注意: 必须在 start 之前调用 (esp_wifi_set_mac 不能在 AP 起来之后改). */
+void http_server_set_clone(uint8_t channel, const uint8_t *bssid);
 
 #ifdef __cplusplus
 }

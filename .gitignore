@@ -1,12 +1,52 @@
+# ---- ESP-IDF 构建产物 ----
 build/
 sdkconfig
 sdkconfig.old
-logs/
-*.pcap
-*.pcapng
 managed_components/
 dependencies.lock
 .cache/
 .vscode/
 
+# ---- 运行时产物 ----
+logs/
+*.pcap
+*.pcapng
+*.bin.tmp
+
+# ---- APK 产物 (仅本地构建, 不入库) ----
+*.apk
+*.aab
+*.ap_
+*.dex
+*.jks
+*.keystore
+
+# ---- Android / Capacitor ----
+app/node_modules/
+app/android/.gradle/
+app/android/build/
+app/android/app/build/
+app/android/local.properties
+app/android/capacitor-cordova-android-plugins/
+app/android/app/src/main/assets/public/
+app/www/
+
+# ---- 本地备份 (保留本地) ----
+backup/
+
+# ---- Python ----
 __pycache__/
+*.pyc
+
+# ---- 系统 / 编辑器 ----
+.DS_Store
+Thumbs.db
+*~
+
+# ---- 内部文档: 只保留本地, 不随发布 ----
+docs/开发交接.md
+docs/设计决策.md
+docs/assets/
+
+# ---- 遗留开发产物 ----
+app/_ui5.css

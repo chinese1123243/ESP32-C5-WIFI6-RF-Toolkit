@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# coding: utf-8
 """
 rftool monitor: 读取固件控制台输出, 重组 pcap + 实时摘要 + 统计.
 
@@ -20,7 +20,7 @@ rftool monitor: 读取固件控制台输出, 重组 pcap + 实时摘要 + 统计
 import serial, sys, time, struct, argparse, signal
 from collections import Counter
 
-# ---- pcap 全局头 (24 字节) ----
+# pcap 全局头 (24 字节)
 PCAP_MAGIC   = 0xA1B2C3D4
 PCAP_VERSION = (2, 4)
 PCAP_LINKTYPE_IEEE802_11 = 105  # DLT_IEEE802_11

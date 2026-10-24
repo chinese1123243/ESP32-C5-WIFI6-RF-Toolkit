@@ -1,5 +1,5 @@
 /*
- * wifi_attack.h — Wi-Fi 攻击模块 (嗅探 / deauth 注入 / beacon flood / probe flood)
+ * wifi_attack.h: Wi-Fi 攻击模块 (嗅探 / deauth 注入 / beacon flood / probe flood)
  *
  * 设计: 状态机 + 独立 FreeRTOS 注入任务. 嗅探在 promiscuous 回调内直接打印
  *   PKT/HEX 行 (低延迟, 不经队列). 注入由独立 task 循环 esp_wifi_80211_tx.
@@ -44,7 +44,8 @@ esp_err_t wifi_attack_deauth_start(const uint8_t bssid[6], const uint8_t sta[6],
 
 /* 启动 beacon flood 任务. prefix: SSID 前缀 (实际 SSID = prefix+随机N).
  * count=0 持续. interval_ms 每发间隔. */
-esp_err_t wifi_attack_beacon_flood_start(const char *prefix, uint32_t count, uint32_t interval_ms);
+esp_err_t wifi_attack_beacon_flood_start(const char *prefix, uint32_t count,
+                                        uint32_t interval_ms, uint8_t channel);
 
 /* 启动 probe request flood. count=0 持续. */
 esp_err_t wifi_attack_probe_flood_start(uint32_t count, uint32_t interval_ms);
@@ -52,10 +53,15 @@ esp_err_t wifi_attack_probe_flood_start(uint32_t count, uint32_t interval_ms);
 /* 停止当前注入任务 (若有). 安全可重复调用. */
 esp_err_t wifi_attack_inject_stop(void);
 
-/* 启动信道自动轮询嗅探. dwell_ms: 每信道停留毫秒. */
-esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms);
+/* 启动信道自动轮询嗅探. dwell_ms: 每信道基准停留毫秒.
+ * count: 抓够这么多包自动停 (0 = 永续).
+ * 默认开启自适应调度, 按各信道命中率在 [0.55x, 3x] 范围内缩放驻留. */
+esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms, uint32_t count);
 
-/* ====== WPA3 -> WPA2 Downgrade AP ======
+/* 打印自适应轮询统计 (滚轮轮次 / 总命中 / 热点信道 TOP8). */
+void wifi_attack_auto_dump(void);
+
+/* WPA3 -> WPA2 Downgrade AP
  * 启动一个 WPA2-PSK PMF-Disabled 同名 SoftAP, 诱导 WPA3-Transition 客户端
  * 降级走 WPA2 4-way handshake. 同时开 promiscuous 抓 EAPOL 存 wifi_db.
  * ssid: 伪造同名 AP 的 SSID (与目标网络同名)
@@ -66,7 +72,7 @@ esp_err_t wifi_attack_downgrade_start(const char *ssid, const char *pass);
 /* 停止 downgrade AP (回到 IDLE). */
 esp_err_t wifi_attack_downgrade_stop(void);
 
-/* ====== 全局互斥控制 ======
+/* 全局互斥控制
  * 停止所有正在运行的功能 (sniff + inject + downgrade), 等 inject task 退出.
  * 任何 _start 函数内部都会先调用此函数实现"启动一个就停其他". */
 esp_err_t wifi_attack_stop_all(void);

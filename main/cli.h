@@ -1,5 +1,5 @@
 /*
- * cli.h — 极简 fgets+dispatch REPL
+ * cli.h: 极简 fgets+dispatch REPL
  *
  * 命令 (用 argtable3 解析, '<cmd> --help' 查看详细选项):
  *   help                                 命令列表
@@ -23,6 +23,11 @@ extern "C" {
 
 /* 启动 REPL 主循环 (阻塞不返回) */
 esp_err_t cli_start(void);
+
+/* 执行一行命令 (供 BLE / HTTP 等外部通道调用).
+ * line 会被修改 (split_args 加 \0), 调用方传入可写缓冲区.
+ * 返回 0 = 成功, 非 0 = 失败. */
+int cli_exec_line(char *line);
 
 #ifdef __cplusplus
 }

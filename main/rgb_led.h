@@ -1,44 +1,20 @@
 /*
- * rgb_led.h — 板载 WS2812B-0807 RGB LED 状态指示 (v2 扩展版)
+ * rgb_led.h: WS2812B-0807 状态指示 (RMT TX + 自定义 encoder)
  *
- * 硬件: WS2812 DIN 接 GPIO27 (经 RGB_CTRL 电源门控, 运行时常通).
- *   GPIO27 是 strapping 脚, strapping 仅复位时采样, 运行时作 GPIO 输出无碍.
+ * 硬件: DIN 接 GPIO27 (经 RGB_CTRL 门控, 运行时常通).
+ *   GPIO27 是 strapping 脚, 仅复位采样, 运行时作 GPIO 输出无碍.
+ * 驱动: RMT bytes/copy encoder 生成 WS2812 NRZ
+ *   (T0H/T1H = 0.3/0.9us, T0L/T1L = 0.9/0.3us, reset >= 50us).
  *
- * 驱动: RMT TX + 自定义 bytes/copy encoder 实现 WS2812 NRZ 时序
- *   (T0H=0.3us T0L=0.9us T1H=0.9us T1L=0.3us reset>=50us).
+ * 刷新模型: 单一写入者. 调用方只改状态 (s_cur_status / s_flash_*),
+ *   由 rgb_task 独占 RMT 以 50Hz 渲染. 因此 rgb_led_event() 不含
+ *   vTaskDelay, 可安全用于驱动回调与 HTTP 任务上下文.
  *
- * v2 扩展设计: 任务可视化 + 瞬态事件
- *   1) 主状态 (rgb_status_t): 持久显示, 由模块主动切换, 单一事实源 s_cur_status
- *   2) 瞬态事件 (rgb_event_t): 短暂闪一下然后恢复主状态, 用于包级反馈
- *
- * 颜色语义 (主状态).  亮度原则: 背景态 <= 32, 事件 flash <= 80.
- *   +-------------------------+------+----------------------------------------+
- *   | 主状态枚举               | 颜色  | 语义说明                                 |
- *   +-------------------------+------+----------------------------------------+
- *   | RGB_OFF                 | 黑    | 启动早期 / 显式关灯                     |
- *   | RGB_BOOT                | 暗紫  | 初始化中 (NVS/Wi-Fi/DB 未就绪)           |
- *   | RGB_IDLE                | 暗蓝  | REPL 待命, 无后台任务                   |
- *   | RGB_SNIFF_SINGLE        | 深绿  | 单信道 promiscuous 嗅探 (固定信道)       |
- *   | RGB_SNIFF_AUTO          | 黄绿  | 自动信道轮询 (channel_rotate_task 运行)  |
- *   | RGB_INJECT_DEAUTH       | 亮红  | Deauth / Disassoc 帧注入                |
- *   | RGB_INJECT_BEACON       | 洋红  | Beacon Flood (伪造 AP)                   |
- *   | RGB_INJECT_PROBE        | 橙红  | Probe Flood (伪造探测请求)               |
- *   | RGB_HTTP_READY          | 青蓝  | HTTP REST API 已启动 (SoftAP 待机)       |
- *   | RGB_EXPORT              | 金黄  | 正在导出 CSV/JSON                        |
- *   | RGB_DUMP                | 浅紫  | 正在 dump 表到串口                       |
- *   | RGB_WARN                | 橙    | 参数错误 / 边界告警 (非致命)             |
- *   | RGB_ERROR               | 亮红  | 致命错误 (初始化失败 / 任务退出异常)      |
- *   | (兼容别名) RGB_SNIFF    | =SNIFF_SINGLE | 兼容旧 api 调用                  |
- *   | (兼容别名) RGB_INJECT   | =INJECT_DEAUTH  | 兼容旧 api 调用                 |
- *   +-------------------------+------+----------------------------------------+
- *
- * 事件颜色 (瞬态):
- *   RGB_EV_EAPOL_CAPTURED   闪白  抓到 EAPOL M1/M2 握手包 (重要!)
- *   RGB_EV_CHAN_SWITCH      闪蓝  自动信道轮询跳变
- *   RGB_EV_TX_OK            闪同色 当前注入任务包 TX 成功 (低频触发)
- *   RGB_EV_CMD_SUCCESS      闪绿  CLI 命令成功
- *   RGB_EV_CMD_ERROR        闪红  CLI 命令参数/执行错误
- *   RGB_EV_STA_JOIN         闪青  HTTP SoftAP 接有 STA 连接
+ * 视觉语义:
+ *   呼吸  常态. 感知域三角波经 gamma 转 PWM, 全程等速明暗
+ *   闪烁  告警/错误. 硬边方波, 与渐变呼吸一眼可分
+ *   事件  瞬态抢占, 纯色不呼吸, 到点回落主状态
+ * 亮度分档与色相见 rgb_led.c 的 s_style.
  */
 #pragma once
 
@@ -51,7 +27,7 @@ extern "C" {
 #endif
 
 typedef enum {
-    /* ===== 基础状态 (原有 6 个序号保持不变, 兼容 ABI) ===== */
+    /* 基础状态 (原有 6 个序号保持不变, 兼容 ABI) */
     RGB_OFF = 0,
     RGB_BOOT,
     RGB_IDLE,
@@ -59,7 +35,7 @@ typedef enum {
     RGB_INJECT_DEAUTH,         /* 新: Deauth 注入 (亮红) */
     RGB_ERROR,
 
-    /* ===== v2 扩展状态 (序号 6+) ===== */
+    /* v2 扩展状态 (序号 6+) */
     RGB_SNIFF_AUTO,            /* 黄绿: 自动信道轮询 */
     RGB_INJECT_BEACON,         /* 洋红: Beacon Flood */
     RGB_INJECT_PROBE,          /* 橙红: Probe Flood  */
@@ -68,7 +44,6 @@ typedef enum {
     RGB_DUMP,                  /* 浅紫: dump 表输出  */
     RGB_WARN,                  /* 橙:   非致命告警    */
 
-    /* ===== 兼容旧 API 的别名 ===== */
     RGB_SNIFF  = RGB_SNIFF_SINGLE,
     RGB_INJECT = RGB_INJECT_DEAUTH,
 } rgb_status_t;
@@ -81,10 +56,10 @@ typedef enum {
     RGB_EV_CMD_SUCCESS,          /* 绿, 100ms: CLI 成功 */
     RGB_EV_CMD_ERROR,            /* 红, 100ms: CLI 失败 */
     RGB_EV_STA_JOIN,             /* 青, 80ms:  STA 连入 SoftAP */
+    RGB_EV_BLE_CONNECT,          /* 紫, 200ms: BLE 客户端连接 */
     RGB_EV_MAX,
 } rgb_event_t;
 
-/* ===== 公共 API ===== */
 
 /* 初始化 RMT 通道 + encoder, 点亮紫色 (BOOT).
  * 多次调用安全: 仅首次生效. */

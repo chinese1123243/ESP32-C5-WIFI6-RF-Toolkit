@@ -1,190 +1,162 @@
-# rftool — ESP32-C5 Wi-Fi 无线电攻击工具
+# RFTOOL-C5
 
-> ⚠️ **仅用于已授权的安全测试、自有网络、CTF 竞赛与安全研究。** 对未授权网络发起 deauth/beacon flood 等攻击属违法行为。详见 [docs/使用说明.md](docs/使用说明.md#9-伦理与法律)。
+ESP32-C5 双频无线测试工具。固件跑在板子上，通过 BLE 或串口连手机 App、上位机，覆盖侦察、捕获、注入、诱捕、导出。
 
-基于 Waveshare **ESP32-C5-WIFI6-KIT** 开发板的 Wi-Fi 无线电工具（ESP-IDF v5.5.3 + 自研 fgets REPL + argtable3），覆盖 **嗅探 / 注入 / 追踪导出 / HTTP 远程控制 / TUI 交互** 五大类功能。
+> 仅限已授权目标：自有网络、CTF、教学研究。对未授权网络发 Deauth、伪造热点、搭钓鱼门户违反《无线电管理条例》与《网络安全法》。使用者自负法律责任。
 
-## 功能一览
+## 文档
 
-| 类别 | 命令 | 说明 | 示例 |
-|------|------|------|------|
-| **嗅探** | sniff | 802.11 promiscuous 单信道嗅探（PKT+HEX） | sniff 6 -n 50 |
-| **嗅探** | sniff auto | 自动轮询 1-13 信道（--dwell 调驻留时间） | sniff auto --dwell 300 |
-| **注入** | deauth | 双向 Deauth 帧注入（踢设备下线） | deauth -b aa:bb:cc:dd:ee:ff -n 10 |
-| **注入** | eaconflood | 伪造随机 SSID+MAC 的 Beacon 洪水 | eaconflood -p FAKE -n 100 |
-| **注入** | probeflood | 广播 Probe Request 洪水 | probeflood -n 200 |
-| **追踪导出** | dump | 打印 AP / Client / EAPOL 追踪表 | dump aps / dump all |
-| **追踪导出** | xport | 导出为 CSV / JSON（离线分析） | xport csv / xport json |
-| **远程控制** | http | 启动 SoftAP + HTTP REST API 服务器 | http start / http stop |
-| **通用** | status | 查看状态 + 追踪表计数 | status |
-| **通用** | stop | 停止当前嗅探 / 注入 / 自动轮询 | stop |
-| **通用** | help | 命令列表 + <cmd> --help 详情 | help |
+| 文件 | 内容 |
+|---|---|
+| `README.md` | 硬件、构建、烧录、连接、命令速查 |
+| `docs/使用指南.md` | App 导航、各功能操作流程、常见问题 |
 
-板级测试报告（扩展 14/14 全通过）：
-- sniff auto 200ms 轮询 3s → 捕获 13 个不同 AP
-- export json → 合法 JSON，含 bssid/ssid/channel/rssi/encryption/vendor
-- http start → 切换 APSTA，SoftAP 192.168.71.1，HTTP 服务启动
-- dump aps → 13 条 AP 记录（含厂商 / RSSI / WPA2 / PMF / beacon 计数）
+## 硬件
 
-## HTTP REST API
+| 项 | 值 |
+|---|---|
+| 开发板 | Waveshare ESP32-C5-WIFI6-N16R8 |
+| 模组 | ESP32-C5-WROOM-1，RISC-V 240MHz，双频 Wi-Fi 6 |
+| 存储 | 16MB Flash + 8MB PSRAM |
+| 串口 | H2 口经 CH343P 桥 UART0，115200 8N1 |
+| LED | 板载 WS2812，GPIO27 |
 
-启动 http start 后连接 AP **
-ftool-AP**（默认无密码），浏览器访问 http://192.168.71.1 即可远程控制。端点清单：
+用 UART0 而不是原生 USB-CDC：C5 的 USB-Serial/JTAG 在 Windows 下 CDC 端点会写超时卡死，且固件早期 panic 时无人服务 CDC，串口一片空白。走 UART0 至少能看到崩溃现场。
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | / | 交互式 Web 控制页 |
-| GET | /api/status | 状态 + 追踪表计数（JSON） |
-| POST | /api/sniff/start | 启动嗅探 { "channel":6, "count":0 } |
-| POST | /api/sniff/auto | 自动信道轮询 { "dwell_ms":300 } |
-| POST | /api/sniff/stop | 停止嗅探 |
-| POST | /api/deauth/start | Deauth 注入 |
-| POST | /api/beaconflood/start | Beacon 洪水 |
-| POST | /api/probeflood/start | Probe 洪水 |
-| POST | /api/inject/stop | 停止注入 |
-| GET | /api/db/aps | AP 追踪表 JSON |
-| GET | /api/db/clients | Client 追踪表 JSON |
-| GET | /api/db/eapols | EAPOL 握手记录 JSON |
-| GET | /api/export/csv | 三表 CSV（下载） |
-| GET | /api/export/json | 三表 JSON（下载） |
+## 环境
 
-## RGB LED 状态指示
+| 项 | 版本 |
+|---|---|
+| ESP-IDF | v5.5.3（本机 `D:\Espressif\frameworks\esp-idf-v5.5.3`） |
+| Python | 3.10+，需 `pyserial` |
+| Node.js | 18+，构建 App 用 |
+| Android SDK | API 34，构建 APK 用 |
 
-板载 WS2812 (GPIO27) 实时反映固件状态。v2 扩展版提供 **13 种主状态**（持久显示）+ **6 种瞬态事件**（短闪后恢复主状态），无需看屏幕即可判断设备当前行为。
+## 构建
 
-### 主状态（持久）
-
-| 颜色 | 状态枚举 | 含义 |
-|---|---|---|
-| 黑 | OFF | 关灯 / 启动早期 |
-| 暗紫 | BOOT | 初始化中（NVS/Wi-Fi/DB 未就绪） |
-| 暗蓝 | IDLE | REPL 待命，无后台任务 |
-| 深绿 | SNIFF_SINGLE | 单信道 promiscuous 嗅探（固定信道） |
-| 黄绿 | SNIFF_AUTO | 自动信道轮询（channel_rotate 运行中） |
-| 亮红 | INJECT_DEAUTH | Deauth / Disassoc 帧注入 |
-| 洋红 | INJECT_BEACON | Beacon Flood（伪造 AP） |
-| 橙红 | INJECT_PROBE | Probe Flood（伪造探测请求） |
-| 青蓝 | HTTP_READY | HTTP REST API 已启动（SoftAP 待机） |
-| 金黄 | EXPORT | 正在导出 CSV/JSON |
-| 浅紫 | DUMP | 正在 dump 表到串口 |
-| 橙 | WARN | 参数错误 / 边界告警（非致命） |
-| 亮红 | ERROR | 致命错误（初始化失败） |
-
-### 瞬态事件（短闪后恢复主状态）
-
-| 闪色 | 事件 | 触发条件 | 时长 |
-|---|---|---|---|
-| 白 | EV_EAPOL_CAPTURED | 抓到 EAPOL M1/M2 握手包 | 150ms |
-| 蓝 | EV_CHAN_SWITCH | 自动轮询跳变到下一信道 | 40ms |
-| 主色加深 | EV_TX_OK | 注入包 TX 成功（50ms 节流） | 15ms |
-| 绿 | EV_CMD_SUCCESS | CLI 命令执行成功 | 100ms |
-| 红 | EV_CMD_ERROR | CLI 命令参数/执行错误 | 100ms |
-| 青 | EV_STA_JOIN | 有 STA 连入 HTTP SoftAP | 80ms |
-
-## 目录结构
-
-`
-rftool/
-├── main/
-│   ├── main.c             # app_main: 三层任务隔离 (main→init→cli)
-│   ├── cli.c/h            # fgets+dispatch REPL + argtable3 命令
-│   ├── wifi_attack.c/h    # 嗅探 / deauth / beacon / probe / auto rotate
-│   ├── wifi_db.c/h        # AP / Client / EAPOL 哈希追踪 + OUI 厂商识别
-│   ├── http_server.c/h    # SoftAP + HTTP REST API (esp_http_server)
-│   ├── rgb_led.c/h        # WS2812 RMT 驱动 + 状态指示
-│   └── radio_common.c/h   # MAC/hex/pcap 辅助 + 802.11 帧构造器
-├── scripts/
-│   ├── build.ps1          # 编译脚本（支持重试 + 自动 source idf.ps1）
-│   ├── flash.ps1          # 自动探测 CH343P 端口 + 烧录
-│   ├── tui.py             # 交互式终端（命令历史/彩色/pcap/本地命令）
-│   ├── monitor.py         # 串口 → pcap 转换工具
-│   └── test_commands.py   # 自动化板级自检脚本
-├── docs/使用说明.md       # 完整手册 + 8 个实战场景
-├── sdkconfig.defaults
-└── CMakeLists.txt
-`
-
-## 快速开始
-
-`powershell
-# 前置: ESP-IDF v5.5.3 安装于 D:\Espressif ; Python 3.14 @ D:\Python\python.exe
-cd C:\Users\CN112\Desktop\esp32c5\rftool
-
-# 1. 编译 (~2 分钟)
+```powershell
+# 脚本方式（自动定位 IDF、清理构建、竞态重试）
 .\scripts\build.ps1
+.\scripts\build.ps1 -IdfPath D:\Espressif
+```
 
-# 2. 烧录 (CH343P H2 口, 自动探测 COM)
-.\scripts\flash.ps1
+```powershell
+# 手动方式
+$env:IDF_TOOLS_PATH = "D:\Espressif"
+. "D:\Espressif\frameworks\esp-idf-v5.5.3\export.ps1"
+idf.py build
+```
 
-# 3. 连接 (推荐 TUI)
-D:\Python\python.exe .\scripts\tui.py COM4
+编译可能卡住：`riscv32-esp-elf-gcc` 或 `collect2` 挂几分钟 CPU 不动。杀掉重跑 `ninja -C build -j 1` 即可，已编好的目标不会重来。
 
-# 或带 pcap 录包:
-D:\Python\python.exe .\scripts\tui.py COM4 -o capture.pcap
-`
+产物 `build/rftool.bin`，约 1.6MB，OTA 槽 2.5MB，余量 40%。
 
-连接后：
-`
-rftool> help                    # 查看命令
-rftool> sniff auto --dwell 200  # 200ms 轮询 1-13 信道
-rftool> status                  # 查看抓包进度 / DB 计数
-rftool> dump aps                # 打印 AP 列表
-rftool> export json             # 导出 JSON
-rftool> http start              # 启动 HTTP 远程控制
-rftool> stop                    # 停止一切操作
-`
+## 烧录
 
-TUI 本地命令（不需要发给板子）：
-`
-/display db       → 美化展示追踪表
-/display hist     → 展示抓包直方图
-/http open        → 用默认浏览器打开 http://192.168.71.1
-/export <path>    → 导出历史到本地文件
-/help             → TUI 本地命令帮助
-Ctrl+C            → 退出
-`
+```powershell
+.\scripts\flash.ps1 COM4
+# 或
+idf.py --no-ccache -p COM4 -b 921600 flash
+```
 
-## 控制台输出约定 (机器可解析)
+分区表是双 OTA，app 起始偏移 `0x20000`。从 1.5.x 升上来必须整片 `flash`，只烧 app 会落在错误偏移。
 
-`
-META,WIFI,<key>,<value>,...        # 状态/事件/错误
-META,HTTP,<key>,<value>,...        # HTTP 子系统状态
-PKT,WIFI,<type>,<subtype>,<len>,<rssi>,<src>,<dst>,<bssid>,<ssid>
-HEX,<hex bytes space-separated>    # raw 802.11 (无 FCS, 供 host 重组 pcap)
-AP,<bssid>,<ssid>,ch<>,rssi<>,...  # dump aps 行
-CLIENT,<mac>,<bssid>,rssi<>,...    # dump clients 行
-EAPOL,<src>,<dst>,...              # dump eapols 行
-`
+烧完跑板级自检：
 
-TUI / monitor.py 把 PKT + 配对 HEX 组装为 pcap (DLT=105)，可直接用 Wireshark 打开。
+```powershell
+python scripts/selftest_b4.py COM4          # 板级 12 项功能自检
+python scripts/test_inject.py COM4          # 注入引擎 20 项断言 (含 30s 浸泡)
+python scripts/test_sweep.py COM4           # 82 条命令全量扫描, 找会打板/卡死的命令
+python scripts/verify_apk.py                # 校验 APK 内嵌前端与源文件一致
+```
 
-## 架构决策 & 调优
+`test_sweep` 的每条用例带「预期」字段：留空=应当正常执行，`"reject"`=故意喂非法参数或前置条件未满足，固件必须挡回去。挡不住就是测试失败。光看「命令有没有崩」抓不到「非法参数被默默接受」，也抓不到测试预期本身写错了。
 
-1. **fgets REPL 替代 esp_console**：esp_console 内部 linenoise + vfprintf 栈消耗不可控（128KB 栈都溢出）。自研 fgets + argtable3 分发，32KB cli_task 栈足够。
-2. **三层任务栈隔离**：main_task(16KB) → init_task(32KB, Wi-Fi 初始化) → cli_task(32KB, REPL 常驻)，分步加载避免初始化栈叠加。
-3. **注入效率优化**：--interval 0ms（默认）+ 	askYIELD() 主动让出 CPU，Beacon Flood 可达约 **50 fps**。
-4. **PSRAM 哈希数据库**：wifi_db 使用 heap_caps_malloc(MALLOC_CAP_SPIRAM) 在 8MB PSRAM 上分配，支持数百个 AP/Client/EAPOL 追踪。
-5. **安全停止**：promiscuous 回调运行在 Wi-Fi 驱动任务上下文，不直接调 set_promiscuous(false)，用原子计数 + stop_task 异步停止，避免死锁。
-6. **HTTP API + SoftAP**：Wi-Fi 切 APSTA 模式，SoftAP 默认 SSID 
-ftool-AP（IP 192.168.71.1），DHCP 分配 192.168.71.2-10；同时保留 STA 以嗅探/注入。
+错误行在协议里分三类，`test_sweep` 分开统计：致命（崩 / 断言 / 没内存）、入参拒绝（校验挡回，属预期）、未知（新出现的消息，提示去补归类表）。
 
-## 硬件要点
+打包 APK 必须走 package.json 里的流程，不能只跑 gradlew：
 
-- **控制台 UART0 via CH343P (H2 口)**：原生 USB-Serial/JTAG (H1) 在 Windows 下 CDC 端点会卡死，故禁用；波特率 115200 8N1。
-- **WS2812 在 GPIO27**：strapping 脚仅在复位时采样，运行时作 GPIO 输出无碍。
-- **ESP32-C5-WROOM-1**：RISC-V 240MHz，16MB Flash + 8MB PSRAM，全部可用。
+```powershell
+cd app && npm run build:android
+```
 
-## 硬件 & 软件环境
+`app/android/app/src/main/assets/public/` 与 `app/www/` 在 .gitignore 里，不先同步就打，gradle 会判定资源任务 up-to-date，打出来的是上一版前端（实测过一次，app.js 少 3660 字节）。打完用 `scripts/verify_apk.py` 兜一道。
 
-| 项目 | 版本/配置 |
-|------|-----------|
-| 开发板 | Waveshare ESP32-C5-WIFI6-KIT |
-| 模组 | ESP32-C5-WROOM-1（16MB Flash + 8MB PSRAM） |
-| ESP-IDF | v5.5.3 |
-| Python 全局 | 3.14.3 @ D:\Python\python.exe |
-| ESP-IDF Python env | idf5.5_py3.14_env |
-| 桥接芯片 | CH343P（UART0 → COM4，115200 8N1） |
+## 连接
 
-## 许可与免责
+### 手机 App（BLE）
 
-本工具仅供授权安全测试与教育。使用者须确保对目标拥有所有权或书面授权，并遵守当地无线电管理法规。作者不对滥用行为负责。
+广播名 `rftool-c5`，服务 UUID `6e400001-b5a3-f393-e0a9-e50e24dcca9e`（NUS）。App 里点「搜索板子」扫描并连接。
+
+### 串口 REPL
+
+任意串口工具，115200 8N1，回车换行。输入 `help` 看命令。
+
+### 板载 HTTP
+
+```text
+http start --ssid rftool-ap --pass 12345678
+```
+
+手机连该热点后访问 `http://192.168.71.1`。接口要 `api_token`，用 `config get api_token` 查。
+
+## 命令速查
+
+`help` 列出全部 31 条，`<命令> --help` 看参数。
+
+| 类别 | 命令 |
+|---|---|
+| 侦察 | `sniff <ch\|auto> [-n N] [-d ms]`、`dump <aps\|clients\|eapols\|all>`、`blescan`、`export <csv\|json>` |
+| 捕获 | `hs [complete\|clear\|22000\|selftest]`、`cap <start\|stop\|info\|keys\|read\|hdr\|clear>`、`pmkid <watch\|status\|clear>` |
+| 注入 | `deauth -b <bssid> [-s <sta>] [-n N] [-r R] [-i ms]`、`beaconflood -p <prefix>`、`probeflood`、`raw <tx\|deauth\|auth\|assoc\|beacon\|proberesp>` |
+| 诱捕 | `phish <start\|stop\|status\|stations\|creds\|html>`、`eviltwin <clone\|stop>`、`karma`、`downgrade <ssid>` |
+| 测量 | `ftm <bssid\|status>`、`locate <mac> [秒]\|status\|export`、`ble <power>`、`bleadv`、`zbsniff` |
+| 编排 | `scenario <survey\|handshake\|pmf\|stop\|status>`、`events [n]` |
+| 系统 | `config <set\|get\|list\|reset>`、`log`、`health`、`ota <status\|confirm\|rollback\|url\|reboot>`、`http`、`stop`、`version` |
+
+全局开关：`--json` 让 `status`、`health`、`version` 输出 JSON；`--force` 跳过 PMF 拦截；`--yes` 确认危险命令。
+
+`deauth` 默认拒绝两类目标：不在扫描表里的、PMF 必需的。要跳过检查加 `--force`，此时不再校验任何条件。
+
+## 输出协议
+
+命令输出两种行：
+
+- 文本行：给人看，`dump aps` 的表格就是。
+- `META,...` 行：给程序解析，逗号分隔的键值对。
+
+```text
+META,WIFI,STATUS,state,SNIFF,channel,6,auto_ch,1,sniff_total,1024,...
+META,EAPOL,DETECTED,src,aa:bb:cc:dd:ee:ff,dst,11:22:33:44:55:66
+META,SCENARIO,PHASE,phase,handshake,round,2,target,4c:b7:e0:16:28:29
+```
+
+App 用 `META` 行更新界面，不解析文本表格。加新命令时保持这个约定，否则 App 侧解析要跟着改。
+
+## 目录
+
+```
+main/               固件源码
+app/                Android App（index.html + app.js，Capacitor 打包）
+docs/               使用指南
+scripts/            构建、烧录、自检、算法基准
+tools/              离线校验：NUS 帧协议、app.js 与 index.html 一致性
+build/              编译产物（不入库）
+logs/               构建与测试日志（不入库）
+partitions.csv      分区表
+sdkconfig.defaults  编译配置默认值（入库，sdkconfig 不入库）
+```
+
+## 已知限制
+
+- 单射频。嗅探、注入、门户三者互斥，开一个会停另一个。
+- 802.15.4 默认关闭。C5 上它和 BLE 广播抢同一块内部 RAM，同时开启时 BLE 广播会因 `BLE_ERR_MEM_CAPACITY` 起不来。要用 Zigbee/Thread 嗅探，改 `CONFIG_IEEE802154_ENABLED=y` 重编，并接受 BLE 不可用。
+- `ota url` 只支持 `http://`。不带 TLS 是刻意的：mbedtls 的静态缓冲会挤掉 NimBLE 需要的内部 RAM。
+- 未做镜像签名。OTA 只校验镜像结构，防不住换一份合法但非官方的固件。要防这个得启用 Secure Boot v2。
+
+## 合规
+
+- 只对自有或已获书面授权的网络使用。
+- 发射功率、频段须符合当地无线电管理规定。
+- 抓到的握手、凭据、pcap 属敏感数据，用完删除。
+- 本项目不提供任何规避执法或入侵他人网络的用途。

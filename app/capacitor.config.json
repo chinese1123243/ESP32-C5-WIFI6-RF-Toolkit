@@ -1,0 +1,11 @@
+{
+  "appId": "com.rftool.c5",
+  "appName": "RFKitCN112",
+  "webDir": "www",
+  "android": {
+    "backgroundColor": "#050608"
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}

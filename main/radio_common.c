@@ -1,5 +1,5 @@
 /*
- * radio_common.c — 公共辅助实现
+ * radio_common.c: 公共辅助实现
  */
 #include "radio_common.h"
 #include <stdio.h>
@@ -127,18 +127,11 @@ const char *frame_subtype_str(uint8_t type, uint8_t subtype)
     return "?";
 }
 
-/* ===================== 帧构造器 =====================
- * 802.11 帧字节序 (空中传输序, MSB 先发但字节内 bit0 先):
- *   frame[0] = FC byte 0 (protocol 2b | type 2b | subtype 4b, LSB first)
- *   frame[1] = FC byte 1 (flags: ToDS, FromDS, ...)
- *   frame[2..3] = duration (LE)
- *   地址区: addr1 (DA), addr2 (SA), addr3 (BSSID) 各 6 字节
- *   frame[22..23] = seq control (LE)
- *   frame[24..] = frame body
- *
- * 注: 常量宏 FC_DEAUTH=0x00C0 是按"CPU 视角的 16 位值",
- *     空中字节序 = 高字节在后, 故 frame[0]=0xC0, frame[1]=0x00.
- */
+/* 802.11 帧布局 (空中序: 字节内 bit0 先):
+ *   [0] FC b0 (proto 2b | type 2b | subtype 4b, LSB first)   [1] FC b1 (ToDS/FromDS...)
+ *   [2..3] duration LE   [4..9] addr1 DA   [10..15] addr2 SA   [16..21] addr3 BSSID
+ *   [22..23] seq ctrl LE   [24..] body
+ * 宏 FC_DEAUTH=0x00C0 是 CPU 视角的 16 位值, 空中序高字节在后 => [0]=0xC0, [1]=0x00. */
 int mk_deauth_frame(uint8_t *out, const uint8_t bssid[6], const uint8_t sta[6],
                     bool from_ap_to_sta, uint16_t reason)
 {

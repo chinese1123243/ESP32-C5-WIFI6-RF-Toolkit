@@ -1,5 +1,5 @@
 /*
- * radio_common.h — rftool 公共辅助: MAC 格式化 / hex 解析打印 / pcap 头常量 / 状态码
+ * radio_common.h: rftool 公共辅助: MAC 格式化 / hex 解析打印 / pcap 头常量 / 状态码
  *
  * ESP32-C5-WIFI6-KIT, ESP-IDF v5.5.x
  *
@@ -20,7 +20,6 @@
 extern "C" {
 #endif
 
-/* ===================== 配置常量 ===================== */
 /* 板载 RGB LED: WS2812B-0807, DIN 接 GPIO27 (经 RGB_CTRL 电源门控, 运行时 LED 常供电).
  * GPIO27 是 strapping 脚, 但 strapping 仅复位时采样, 运行时作 GPIO 输出无碍
  * (pancake 项目 + Espressif DevKitC-1 均用 GPIO27 作 NeoPixel, 证据一致).
@@ -34,7 +33,6 @@ extern "C" {
 /* pcap DLT: 802.11 (不含 FCS, 与嗅探回调里 sig_len-4 一致) */
 #define RFTOOL_PCAP_LINKTYPE    105   /* DLT_IEEE802_11 */
 
-/* ===================== MAC / hex 辅助 ===================== */
 
 /* 把 6 字节 MAC 写成 "aa:bb:cc:dd:ee:ff" 到 dst (至少 18 字节). 返回 dst. */
 char *mac_to_str(const uint8_t mac[6], char *dst);
@@ -48,7 +46,7 @@ int parse_hex(const char *s, uint8_t *dst, int max_bytes);
 /* 打印一行 "HEX,xx xx xx ..." (len 字节), 供 host 重组 pcap. */
 void print_hex_line(const uint8_t *buf, int len);
 
-/* ===================== 802.11 帧解析辅助 ===================== */
+/* 802.11 帧解析辅助 */
 
 /* IEEE 802.11 Frame Control 字段位定义 (LSB first, 与空中字节序一致) */
 #define FC_TYPE_MGMT      0x00
@@ -70,7 +68,6 @@ static inline uint8_t frame_subtype(const uint8_t *f)  { return (f[0] >> 4) & 0x
 const char *frame_type_str(uint8_t type);
 const char *frame_subtype_str(uint8_t type, uint8_t subtype);
 
-/* ===================== 帧构造器 ===================== */
 
 /* 构造 IEEE 802.11 Deauth (FC=0x00C0) 24 字节帧 + 2 字节 reason = 26 字节.
  *   from_ap_to_sta: src=bssid, dst=sta  (欺骗站: "AP 踢你下线")

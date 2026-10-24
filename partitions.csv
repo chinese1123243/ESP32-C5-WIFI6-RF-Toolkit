@@ -1,0 +1,15 @@
+# RFTOOL-C5 分区表, 微雪 ESP32-C5-WIFI6-N16R8 (16MB flash / 8MB PSRAM)
+# Name,   Type, SubType,  Offset,   Size,       Flags
+#
+# 双 OTA 布局: 应用分 ota_0 / ota_1 两槽, 各 2.5MB, otadata 记录引导器选哪个.
+# 固件约 1.6MB, 每槽余量约 40%.
+# storage 8MB: 前 1MB 存门户 HTML, 之后是 pcap 落盘区 (512KB 一段, 共 14 段).
+# nvs 仍在 0x9000, 从单分区版本升级时配置项不会丢.
+# 破坏性变更: phy_init 与 storage 偏移已变, 旧的 pcap 数据不可见,
+# 首次启动会重做 PHY 校准. 需要整片擦除用 idf.py erase-flash.
+nvs,       data, nvs,      0x9000,   0x6000,
+otadata,   data, ota,      0xf000,   0x2000,
+phy_init,  data, phy,      0x11000,  0x1000,
+ota_0,     app,  ota_0,    0x20000,  0x280000,
+ota_1,     app,  ota_1,    0x2a0000, 0x280000,
+storage,   data, 0x40,     0x520000, 0x800000,

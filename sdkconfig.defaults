@@ -1,6 +1,15 @@
 # ===== Target =====
 CONFIG_IDF_TARGET="esp32c5"
 
+# ===== Flash: N16R8 = 16MB NOR, DIO @80MHz =====
+# 必须显式写: IDF 默认只认 2MB, 而我们的 partitions.csv 需要 ~12MB
+# (factory 4MB + storage 8MB), 不写会直接构建失败:
+#   "Partitions tables occupies 12.1MB of flash which does not fit in 2MB"
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
 # ===== CPU: 240 MHz (max performance, 减少注入抖动) =====
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
@@ -10,9 +19,12 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 # 改用 UART0: 经 H2 口的 CH343P 桥接, 可靠且不依赖 app USB 驱动, 崩溃时 panic 也能打印.
 CONFIG_ESP_CONSOLE_NONE=n
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
-CONFIG_ESP_CONSOLE_UART_DEFAULT_GPIO=y
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
-CONFIG_ESP_LINE_ENDER_CR_LF=y
+# 换行统一 CRLF: 串口/CLI 解析端按行处理, 避免 \r\n 与 \n 混用导致拼接错行
+# (注: 正确符号是 newlib 的 LIBC_STDOUT_LINE_ENDING_CRLF, 旧写的
+#  ESP_LINE_ENDER_CR_LF 在 IDF 里不存在, 会被忽略并报 unknown kconfig symbol)
+CONFIG_LIBC_STDOUT_LINE_ENDING_CRLF=y
+CONFIG_LIBC_STDIN_LINE_ENDING_CR=y
 
 # ===== PSRAM: 8MB Quad, 80 MHz =====
 # 嗅探/pcap 缓冲可以放 PSRAM, 减轻 internal SRAM 压力
@@ -22,7 +34,8 @@ CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+# BLE 控制器要一块 >32KB 的连续内部区; 32KB 是 IDF 默认, 保持即可.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=98304
 
 # ===== mbedtls hardware crypto (可选, 留作后续 PMKID 解析) =====
 CONFIG_MBEDTLS_HARDWARE_AES=y
@@ -37,19 +50,65 @@ CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
 # PSRAM 场景官方推荐 Static (避免 dynamic 抖动)
 CONFIG_ESP_WIFI_STATIC_TX_BUFFER=y
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=n
-CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=24
+# 24 个静态 TX 缓冲 ≈ 24 x 1.6KB ≈ 38KB 内部 RAM, 这是 BLE 起不来的主因之一.
+# 8 个足够 deauth/beacon 这类单帧注入 (注入是逐帧 esp_wifi_80211_tx, 不需要深队列).
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
+# RX 缓冲同步收紧: 嗅探只要不掉帧, 不需要大池
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
 
-# ===== 关闭未用协议栈 (节省 flash/RAM, 避免 2.4G 共存调度) =====
-CONFIG_BT=n
-CONFIG_IEEE802154_ENABLED=n
+# B-6: 802.11mc FTM 精细测距 (RTT). C5 原生支持 FTM Initiator;
+# 默认关闭, 需显式开启 (ENABLE=n 时 INITIATOR 依赖不成立).
+CONFIG_ESP_WIFI_FTM_ENABLE=y
+CONFIG_ESP_WIFI_FTM_INITIATOR_SUPPORT=y
+
+# ===== 蓝牙: NimBLE host (手机 App 直连收发 CLI 命令) =====
+# peripheral + broadcaster: 手机 App 直连控制链 (NUS).
+# observer: 板子自己扫周围第三方 BLE 设备 (blescan 命令) —— 缺这个角色
+#           会让 ble_gap_disc() 直接失败, 表现为「扫不出 BLE」.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+# CONFIG_BT_CONTROLLER_ONLY is not set
+# CONFIG_BT_BLUEDROID_ENABLED is not set
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+# NimBLE 主机缓冲放 PSRAM: 内部 RAM 要留给 Wi-Fi + 控制器
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL=y
+CONFIG_BT_NIMBLE_SM_LEGACY=y
+# ACL 缓冲 16 -> 4: 每条 292B, 省约 3.5KB 内部 RAM.
+# 本机只做 1 条 BLE 连接 (手机 App), 4 条足够.
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=4
+# B-7: 802.15.4 (Zigbee / Thread) 射频 —— C5 内置但默认被显式关掉.
+# 启用后配合 zbsniff 命令可做 802.15.4 混杂嗅探, 让设备覆盖
+# Wi-Fi + BLE + Zigbee/Thread 三协议. 与 Wi-Fi/BLE 分时共存.
+# 802.15.4 驱动常驻会吃掉一块内部 RAM, 而 C5 的 Wi-Fi + BLE + 802.15.4 三栈
+# 同时常驻时 NimBLE 连广播数据都分配不出来 (HCI 0x207 BLE_ERR_MEM_CAPACITY).
+# 默认关闭: zbsniff 命令在编译期就被裁掉, 换来 BLE 可用. 需要 802.15.4 时
+# 把下面这行改 y 重新编译 (两套射频不能同时要).
+# CONFIG_IEEE802154_ENABLED is not set
+# RX 缓冲: 深度适中即可. 注意 802.15.4 驱动 + 缓冲会吃内部 RAM,
+# 而 NimBLE 启动需要一段较大连续块 (实测 16KB 以下会触发
+# HCI BLE_ERR_MEM_CAPACITY), 故不放大.
+CONFIG_IEEE802154_RX_BUFFER_SIZE=16
 
 # ===== esp_console + linenoise (交互 REPL) =====
 # console 组件默认提供 linenoise 编辑 + argtable3 参数解析
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
-# ===== Task Watchdog: 关闭 (REPL 长时间空闲会误触发) =====
-CONFIG_ESP_TASK_WDT_EN=n
-CONFIG_ESP_TASK_WDT=n
+# ===== Task Watchdog: 受控开启 (只监控关键长跑任务, 不监控 idle) =====
+# 旧方案直接全关 (CONFIG_ESP_TASK_WDT_EN=n) → 任何任务卡死只能拔电.
+# 现改为「受控开启」:
+#   1. 开 TWDT, 但 INIT=n —— 不在启动时自动初始化, 由 main.c 显式
+#      esp_task_wdt_init() 配置 idle_core_mask=0 (不监控空闲任务),
+#      从根本上解决 "REPL 长时间空闲误触发" 的老问题.
+#   2. 关键长跑任务 (inject / 信道轮询 / 嗅探进度 / 抓包落盘) 自行
+#      esp_task_wdt_add(NULL) 并在循环里 esp_task_wdt_reset().
+#   3. 超时触发 panic → PRINT_REBOOT → 自动重启, 从"拔电恢复"变"自愈".
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_INIT=n
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
 
 # ===== Power Management: 禁用 (沿用 bench: PM+ldgen 有竞态, 且我们要稳定时序) =====
 # CONFIG_PM_ENABLE=n
@@ -70,5 +129,26 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 # (此前漏配 -> 日志显示 "config nano formatting: disabled", 栈溢出帮凶之一)
 CONFIG_LIBC_NEWLIB_NANO_FORMAT=y
 
-# ===== Partition: single app (简单, 无 OTA 需求) =====
-CONFIG_PARTITION_TABLE_SINGLE_APP=y
+# ===== Partition: 自定义 partitions.csv (ota_0 + ota_1 各 2.5MB + storage 8MB) =====
+# 不能用 SINGLE_APP_LARGE: 那样只有 app 分区, 没有 storage 数据分区,
+# 原始帧落盘 / 钓鱼自定义 HTML 就无处存放.
+# 仓库里 sdkconfig 是被 .gitignore 忽略的 (仅本地生成), 所以这里必须显式
+# 指定 CUSTOM + 文件名, 否则新克隆按默认单分区表构建 -> 功能缺 storage.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ===== OTA (B-1) =====
+# 新固件首次启动处于 PENDING_VERIFY, 45s 内不崩溃才自动确认;
+# 崩溃/看门狗复位 -> 引导器自动回退到旧分区.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_APP_ROLLBACK_ENABLE=y
+# 允许 http:// 拉取 (内网自建 OTA 服务器/手机热点直传, 无需自签证书)
+CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
+CONFIG_OTA_ALLOW_HTTP=y
+# OTA 需要一个能放得下整包的分块缓冲; 4KB 起步, 兼顾 PSRAM 与速度
+CONFIG_ESP_HTTPS_OTA_MAX_HTTP_RECV_SIZE=4096
+
+# ===== BLE 控制器扫描缓冲 (省内部 RAM) =====
+# 100 条广播报告缓冲只在 blescan 时有用, 压到 16 条省约 1KB.
+CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=16
+CONFIG_BT_CTRL_BLE_ADV_REPORT_DISCARD_THRSHOLD=5

@@ -17,6 +17,7 @@ extern "C" {
 #define WIFI_DB_MAX_APS     256
 #define WIFI_DB_MAX_CLIENTS 256
 #define WIFI_DB_MAX_EAPOLS  32
+#define WIFI_DB_RSSI_HIST   16      /* 客户端 RSSI 趋势采样数 */
 
 typedef struct {
     uint8_t  bssid[6];
@@ -25,7 +26,14 @@ typedef struct {
     int8_t   rssi;
     uint8_t  encryption;
     bool     hidden;
-    bool     pmf;
+    bool     pmf;               /* PMF 必需 (MFPR): 为真时伪造 Deauth 基本无效 */
+    bool     pmf_cap;           /* 支持 PMF (MFPC) */
+    uint8_t  akm;               /* CAP_AKM_* 位图 */
+    uint8_t  cipher;            /* CAP_CIPHER_* 位图 */
+    uint8_t  bw;                /* 20/40/80/160 MHz */
+    bool     ht, vht, he;       /* 11n / 11ac / 11ax */
+    bool     wps;               /* 探测到 WPS IE */
+    bool     crackable;         /* 有 PSK 系 AKM: 握手可离线破 */
     uint32_t beacon_count;
     uint32_t data_count;
     uint32_t last_seen_tick;
@@ -39,6 +47,10 @@ typedef struct {
     uint32_t pkt_count;
     uint32_t last_seen_tick;
     char     vendor[16];
+    /* RSSI 趋势: 环形缓冲, 最新一次在 rssi_hist[(rssi_i-1+n)%n] */
+    int8_t   rssi_hist[WIFI_DB_RSSI_HIST];
+    uint8_t  rssi_n;            /* 已采样数 (<= WIFI_DB_RSSI_HIST) */
+    uint8_t  rssi_i;            /* 下一个写入位置 */
 } client_entry_t;
 
 typedef struct {
@@ -74,6 +86,11 @@ const char *oui_lookup(const uint8_t mac[3]);
 const ap_entry_t     *wifi_db_get_aps(int *out_cnt);
 const client_entry_t *wifi_db_get_clients(int *out_cnt);
 const eapol_entry_t  *wifi_db_get_eapols(int *out_cnt);
+
+/* 按 MAC 精确查找 (不创建新条目). 未命中返回 NULL.
+ * // 需要"查目标"而不是"入库", 故单独提供. */
+const ap_entry_t     *wifi_db_find_ap(const uint8_t bssid[6]);
+const client_entry_t *wifi_db_find_client(const uint8_t mac[6]);
 
 #ifdef __cplusplus
 }
