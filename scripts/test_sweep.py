@@ -52,6 +52,8 @@ KNOWN_REJECT = {
     # App 发出命令后等不到任何回应, 也就是"设备无响应". 现在统一走这里.
     "arg_parse_failed",
     # 下面是扫全实际跑出来的, 逐个核过语义后才归类
+    "need_confirm",           # 危险命令缺 --yes: 固件不接受, 调用方要弹窗后重发
+    "unknown_command",        # 固件没有这条命令
     "empty_prefix",           # beaconflood -p "" : 入参校验
     "need_key", "need_key_value", "set_failed", "bad_subcmd",
     "ieee802154_disabled",    # zbsniff: CONFIG_IEEE802154_ENABLED 未开, 属构建配置
@@ -150,6 +152,7 @@ class Dev:
 CASES = [
     ("help",                          None, None, None),
     ("version",                       None, None, None),
+    ("nosuchcmd",                     None, "未知命令: 应当被拒 (unknown_command)", "reject"),
     ("status",                        None, None, None),
     ("health",                        None, None, None),
     ("events 5",                      None, None, None),
@@ -183,9 +186,11 @@ CASES = [
     ("beaconflood -p '' --yes",             None, "单引号不是空前缀(是字面 ''), 见下一条", None),
     ("beaconflood -p \"\" --yes",           None, "空前缀: 应当被拒", "reject"),
     ("beaconflood --yes",                   None, "缺 -p: 应当被拒", "reject"),
-    ("beaconflood -p",                      None, "缺 --yes 则只给警告", None),
+    ("beaconflood -p",                      None, "缺 --yes: 应当被拒 (need_confirm)", "reject"),
     ("probeflood -n 30 -i 20 --yes",        None, None, None),
+    ("probeflood -n 5",                     None, "缺 --yes: 应当被拒 (need_confirm)", "reject"),
     ("deauth -b 00:11:22:33:44:55 -n 5 -i 20 --yes --force", None, None, None),
+    ("deauth -b 00:11:22:33:44:55 -n 5",    None, "缺 --yes: 应当被拒 (need_confirm)", "reject"),
     ("deauth -b 00:11:22:33:44:55 -s 00:00:00:00:00:00 -n 5 -i 20 --yes --force",
                                             None, "广播目标", None),
 
@@ -229,10 +234,10 @@ CASES = [
     ("phish creds",                   None, None, None),
     ("phish html size",               None, None, None),
 
-    ("eviltwin clone 00:11:22:33:44:55", "eviltwin stop", None, None),
+    ("eviltwin clone 00:11:22:33:44:55", None, "缺 --yes: 应当被拒 (need_confirm)", "reject"),
     ("eviltwin stop",                 None, None, None),
 
-    ("downgrade TestSSID",            "stop", None, None),
+    ("downgrade TestSSID",            None, "缺 --yes: 应当被拒 (need_confirm)", "reject"),
 
     ("ftm range 00:11:22:33:44:55 6 2", None, None, None),
 

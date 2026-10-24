@@ -2384,6 +2384,11 @@ $('btnDeauth').addEventListener('click', () => {
     const interval = $('deauthInterval').value;
     let cmd = `deauth -b ${bssid} -n ${cnt} -r ${reason} -i ${interval}`;
     if (sta && sta !== '00:00:00:00:00:00') cmd += ` -s ${sta}`;
+    /* 固件对危险命令强制要 --yes, 缺了只回一条 META 拒绝而不执行。
+     * 不用 window.confirm: Capacitor 的 WebView 没实现 onJsConfirm,
+     * confirm() 恒返回 false, 按钮会全死。专用页面点按钮即为明确意图。 */
+    cmd += ' --yes';
+    log('发送破坏性命令: ' + cmd, 'warn');
     deauthTarget = bssid;          /* 供 DONE 后转入握手等待时比对 */
     expectConfirm('Deauth', 8000);
     sendCmd(cmd);
@@ -2400,14 +2405,14 @@ $('btnBeacon').addEventListener('click', () => {
     const cnt = $('beaconCount').value;
     const interval = $('beaconInterval').value;
     expectConfirm('Beacon', 8000);
-    sendCmd(`beaconflood -p "${prefix}" -n ${cnt} -i ${interval}`);
+    sendCmd(`beaconflood -p "${prefix}" -n ${cnt} -i ${interval} --yes`);
 });
 
 $('btnProbe').addEventListener('click', () => {
     const cnt = $('probeCount').value;
     const interval = $('probeInterval').value;
     expectConfirm('Probe', 8000);
-    sendCmd(`probeflood -n ${cnt} -i ${interval}`);
+    sendCmd(`probeflood -n ${cnt} -i ${interval} --yes`);
 });
 
 $('btnDowngrade').addEventListener('click', () => {
@@ -2416,6 +2421,7 @@ $('btnDowngrade').addEventListener('click', () => {
     const pass = $('downgradePass').value.trim();
     let cmd = `downgrade "${ssid}"`;
     if (pass) cmd += ` --pass "${pass}"`;
+    cmd += ' --yes';
     expectConfirm('降级', 8000);
     sendCmd(cmd);
 });
@@ -3013,7 +3019,7 @@ function bleScanStop(silent){
 
 function evilTwin(push){
     if (!selectedAp){ toast('请先在嗅探页选一个目标 AP', 'warn'); return; }
-    sendCmd('eviltwin clone ' + selectedAp.bssid.replace(/:/g, '') + (push ? ' push' : ''));
+    sendCmd('eviltwin clone ' + selectedAp.bssid.replace(/:/g, '') + (push ? ' push' : '') + ' --yes');
 }
 
 function rawPreset(kind){

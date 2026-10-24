@@ -66,17 +66,17 @@ static bool g_yes   = false;   /* --yes / -y: 危险命令确认（由 CLI 层�
  * 见 cli_exec_line() 里的说明. */
 static uint32_t s_stream_id = 0;
 
-/* 危险命令二次确认. 检查 argv 中是否含 --yes / --force.
- * 不含则打印警告并返回 false (命令中止). */
+/* 危险命令二次确认. 确认开关已由 cli_exec_line 统一剥离到 g_yes.
+ * 早期版本在这里扫 argv 找 --yes, 但 argtable 会先把 --yes 判成未知参数,
+ * 导致危险命令永远无法确认（实测 deauth --yes 报 invalid option）。 */
 static bool confirm_dangerous(int argc, char **argv, const char *desc)
 {
-    (void)argc; (void)argv;
-    /* 确认开关已由 cli_exec_line 统一剥离到 g_yes。
-     * 早期版本在这里扫 argv 找 --yes, 但 argtable 会先把 --yes 判成未知参数,
-     * 导致危险命令永远无法确认（实测 deauth --yes 报 invalid option）。 */
+    (void)argc;
     if (g_yes) return true;
-    printf("WARN: '%s' is a destructive operation.\n"
-           "      Add --yes to confirm.  Example: %s %s --yes\n",
+    /* 必须走 META: 以前打的是裸 WARN 文本, 调用方一行都收不到,
+     * App 侧表现就是"设备无响应"。msg,need_confirm 让调用方自己决定
+     * 是弹窗确认后再发一次, 还是直接放弃。 */
+    printf("META,CLI,ERR,cmd,%s,msg,need_confirm,detail,add --yes: %s %s --yes\n",
            argv[0], argv[0], desc ? desc : "");
     fflush(stdout);
     return false;
@@ -1348,7 +1348,7 @@ static int cmd_health(int argc, char **argv)
 
     /* 简单判定: 内部 RAM < 32KB 告警 (NimBLE 需要连续块) */
     if (int_largest < 32768) {
-        printf("WARN: internal largest block < 32KB — BLE may fail to (re)start\n");
+        printf("WARN: internal largest block < 32KB, BLE may fail to (re)start\n");
     } else {
         printf("OK: internal RAM sufficient\n");
     }
@@ -1611,7 +1611,11 @@ int cli_exec_line(char *line)
 
     const cli_cmd_t *c = find_cmd(argv[0]);
     if (!c) {
-        printf("Unknown command: %s  (type 'help')\n", argv[0]);
+        /* 同理, 裸文本调用方收不到。逗号会破坏 CSV 分隔, 先压成空格 */
+        char nm[24];
+        snprintf(nm, sizeof(nm), "%s", argv[0]);
+        for (char *p = nm; *p; p++) if (*p == ',' || *p == '\r' || *p == '\n') *p = ' ';
+        printf("META,CLI,ERR,cmd,%s,msg,unknown_command\n", nm);
         fflush(stdout);
         return 1;
     }
