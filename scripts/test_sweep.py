@@ -45,7 +45,7 @@ REJECT_MSG = re.compile(r"META,[A-Za-z0-9_]+(?:,[A-Za-z0-9_]+)*,ERR[^\n]*?,msg,(
 # 提示去补表, 而不是默默当它不存在.
 KNOWN_REJECT = {
     "nothing_running", "not_running", "bad_channel", "bad_option", "bad_bssid",
-    "bad_mac", "bad_station", "bad_target", "bad_format", "bad_subcmd",
+    "bad_mac", "bad_station", "bad_target", "bad_format", "bad_subcmd", "bad_type",
     "bad_html_subcmd", "need_ssid", "no_ssid", "need_hex", "need_target",
     "need_bssid", "need_url", "need_off_len", "need_size", "need_html_subcmd",
     "ssid_hidden", "ap_not_found", "ap_not_in_db", "target_not_in_db",
@@ -208,6 +208,22 @@ CASES = [
     ("deauth -b 00:11:22:33:44:55 -n 5",    None, "缺 --yes: 应当被拒 (need_confirm)", "reject"),
     ("deauth -b 00:11:22:33:44:55 -s 00:00:00:00:00:00 -n 5 -i 20 --yes --force",
                                             None, "广播目标", None),
+
+    # flood: 对目标 AP 持续打指定类型管理帧. auth 不受 PMF 约束 (每帧随机源 MAC
+    # 逼 AP 反复分配关联态, 是真正能压垮脆弱 AP 的向量), deauth/disassoc 对 PMF AP
+    # 无效, 沿用与 deauth 相同的 PMF 感知 (MFPR=1 拦截, 除非 --force).
+    ("flood -b 00:11:22:33:44:55 -t auth -n 30 -i 10 --yes",
+                                            None, "auth 不受 PMF 约束, 直接发", None),
+    ("flood -b 00:11:22:33:44:55 -t deauth -n 30 -i 10 --yes --force",
+                                            None, "deauth 需 --force 绕过 PMF", None),
+    ("flood -b 00:11:22:33:44:55 -t disassoc -n 30 -i 10 --yes --force",
+                                            None, "disassoc 同上", None),
+    ("flood -b 00:11:22:33:44:55 -t auth -n 30 -i 10",
+                                            None, "缺 --yes: 应当被拒 (need_confirm)", "reject"),
+    ("flood -t auth -n 30 -i 10 --yes",
+                                            None, "缺 -b: 应当被拒 (arg_parse_failed)", "reject"),
+    ("flood -b 00:11:22:33:44:55 -t bogus -n 30 -i 10 --yes",
+                                            None, "非法类型: 应当被拒 (bad_type)", "reject"),
 
     ("raw beacon TESTSW 6",      None, "单帧构造", None),
     ("raw csa 00:11:22:33:44:55 1", None, "缺 --yes: 应当被拒", "reject"),

@@ -869,6 +869,9 @@ button.mi{ width:100%; background:none; border:0; text-align:left; font:inherit;
             <div class="list-body" id="bledevList">
               <div class="list-empty">点击「开始扫描」发现附近 BLE 设备</div>
             </div>
+            <div class="selbar">已选设备：<code id="bleSelAddr">未选择</code>
+              <button class="btn-mini" id="btnBleCopySel">复制</button>
+            </div>
           </div>
           <h3 style="margin-top:14px">GATT 枚举<span class="h3-sub">Central</span></h3>
           <div class="note">对上面列表里的设备逐个走 服务 → 特征 → 描述符 → 读值。会占用 BLE 连接，控制链（NUS）不受影响。</div>
@@ -981,14 +984,60 @@ button.mi{ width:100%; background:none; border:0; text-align:left; font:inherit;
               <div class="field"><label>STA 可选</label><input id="deauthSta" type="text" placeholder="广播" list="dlSta" /></div>
             </div>
             <div class="row3">
-              <div class="field"><label>次数</label><input id="deauthCount" type="number" value="10" min="1" /></div>
+              <div class="field"><label>次数</label><input id="deauthCount" type="number" value="0" min="0" /></div>
               <div class="field"><label>Reason</label><input id="deauthReason" type="number" value="7" min="1" max="66" /></div>
-              <div class="field"><label>间隔 ms</label><input id="deauthInterval" type="number" value="100" min="0" /></div>
+              <div class="field"><label>间隔 ms</label><input id="deauthInterval" type="number" value="0" min="0" /></div>
+            </div>
+            <div class="row1">
+              <label class="chk"><input type="checkbox" id="deauthFlood" /> 持续洪泛（次数=0 不间断，直到点停止）</label>
             </div>
           </div>
           <div class="actions">
             <button class="btn danger" id="btnDeauth">发送 Deauth</button>
+            <button class="btn" id="btnDeauthStop">停止</button>
           </div>
+          <div class="kv kv-3">
+            <span>已发</span><code id="deauthSent">0</code>
+            <span>失败</span><code id="deauthErr">0</code>
+            <span>状态</span><code id="deauthRun">空闲</code>
+          </div>
+          <div class="note" id="deauthNote">PMF 开启的 AP 会丢弃伪造的 deauth，广播踢人无效；先在该 AP 的嗅探结果里确认 MFPR=0。改用 Flood 面板可换 deauth/disassoc/auth 帧型，auth 不惧 PMF。</div>
+        </div>
+      </section>
+
+      <!-- ===== 02b Flood 洪泛 ===== -->
+      <section class="panel" id="pan-flood">
+        <div class="blk">
+          <span class="idx">02b — Flood</span>
+          <h3>洪泛攻击<span class="h3-sub">DoS / 压垮 AP</span></h3>
+          <div class="note">对目标 AP 持续灌管理帧。auth 帧不是被保护管理帧，PMF 也照收，且每帧换随机源 MAC 逼 AP 反复分配关联态，是真正能压垮脆弱路由器的向量；deauth/disassoc 对 PMF AP 无效。次数=0 表示持续直到点停止。</div>
+          <div class="fields">
+            <div class="row2">
+              <div class="field"><label>帧类型</label>
+                <select id="floodType">
+                  <option value="auth">auth（压垮关联表）</option>
+                  <option value="deauth">deauth（踢客户端）</option>
+                  <option value="disassoc">disassoc（断关联）</option>
+                </select>
+              </div>
+              <div class="field"><label>BSSID</label><input id="floodBssid" type="text" placeholder="AA:BB:CC:DD:EE:FF" list="dlAp" /></div>
+            </div>
+            <div class="row3">
+              <div class="field"><label>STA 可选</label><input id="floodSta" type="text" placeholder="广播" list="dlSta" /></div>
+              <div class="field"><label>次数</label><input id="floodCount" type="number" value="0" min="0" /></div>
+              <div class="field"><label>间隔 ms</label><input id="floodInterval" type="number" value="0" min="0" /></div>
+            </div>
+          </div>
+          <div class="actions">
+            <button class="btn danger" id="btnFlood">开始洪泛</button>
+            <button class="btn" id="btnFloodStop">停止</button>
+          </div>
+          <div class="kv kv-3">
+            <span>已发</span><code id="floodSent">0</code>
+            <span>失败</span><code id="floodErr">0</code>
+            <span>状态</span><code id="floodRun">空闲</code>
+          </div>
+          <div class="note" id="floodNote">auth 洪泛对 PMF 无感；若想定向踢某客户端，选 deauth/disassoc 并填 STA，但 PMF AP 会丢弃。</div>
         </div>
       </section>
 
@@ -1479,6 +1528,7 @@ button.mi{ width:100%; background:none; border:0; text-align:left; font:inherit;
       <div class="tab" data-tab="scan">扫描</div>
       <div class="tab" data-tab="sniff">嗅探</div>
       <div class="tab" data-tab="deauth">Deauth</div>
+      <div class="tab" data-tab="flood">Flood</div>
       <div class="tab" data-tab="beacon">Beacon</div>
       <div class="tab" data-tab="probe">Probe</div>
       <div class="tab" data-tab="downgrade">降级</div>

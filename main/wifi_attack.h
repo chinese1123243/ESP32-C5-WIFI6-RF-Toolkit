@@ -43,6 +43,21 @@ esp_err_t wifi_attack_sniff_stop(void);
 esp_err_t wifi_attack_deauth_start(const uint8_t bssid[6], const uint8_t sta[6],
                                    uint32_t count, uint16_t reason, uint32_t interval_ms);
 
+/* 洪泛帧类型 (与 CLI `flood -t` 对应) */
+typedef enum {
+    WIFI_FLOOD_DEAUTH = 0,
+    WIFI_FLOOD_DISASSOC = 1,
+    WIFI_FLOOD_AUTH = 2,
+} wifi_flood_type_t;
+
+/* 通用洪泛: 对目标 AP 持续发送指定类型管理帧.
+ * ftype: WIFI_FLOOD_DEAUTH / WIFI_FLOOD_DISASSOC / WIFI_FLOOD_AUTH.
+ *   auth 不是被保护管理帧, PMF 也照收, 且每帧随机源 MAC 逼迫 AP 反复分配关联态,
+ *   是真正能压垮脆弱 AP 的向量; deauth/disassoc 对 PMF AP 无效.
+ * sta: 定向目标 (可全 0 = 广播); auth 模式下忽略 (源 MAC 恒随机). count=0 持续. */
+esp_err_t wifi_attack_flood_start(const uint8_t bssid[6], const uint8_t sta[6],
+                                 int ftype, uint32_t count, uint32_t interval_ms);
+
 /* 启动 beacon flood 任务. prefix: SSID 前缀 (实际 SSID = prefix+随机N).
  * count=0 持续. interval_ms 每发间隔. */
 esp_err_t wifi_attack_beacon_flood_start(const char *prefix, uint32_t count,

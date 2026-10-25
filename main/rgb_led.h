@@ -39,6 +39,8 @@ typedef enum {
     RGB_SNIFF_AUTO,            /* 黄绿: 自动信道轮询 */
     RGB_INJECT_BEACON,         /* 洋红: Beacon Flood */
     RGB_INJECT_PROBE,          /* 橙红: Probe Flood  */
+    RGB_INJECT_DISASSOC,       /* 紫红: Disassoc Flood */
+    RGB_INJECT_AUTH,           /* 深红: Auth Flood (压垮 AP) */
     RGB_HTTP_READY,            /* 青蓝: HTTP 服务器在线 */
     RGB_EXPORT,                /* 金黄: 导出 CSV/JSON */
     RGB_DUMP,                  /* 浅紫: dump 表输出  */

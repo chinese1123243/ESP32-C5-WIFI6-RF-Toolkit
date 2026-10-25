@@ -4,7 +4,7 @@
  */
 
 /* 版本 */
-const APP_VERSION  = '2.4.0';
+const APP_VERSION  = '2.4.1';
 const APP_BUILD    = '2026.09';
 const APP_AUTHOR      = 'CN112';
 const APP_AUTHOR_FULL = 'CN1123243';
@@ -2139,6 +2139,7 @@ function parseOutputLine(line){
             phishOn = false; updatePhishUI();
             phishStas = []; renderPhishSta();
             radar('credRadar', false);
+            clearPendingAction();
             log('[门户] 已停止', 'warn');
         } else if (kind === 'STATUS'){
             phishOn = kv.on === '1';
@@ -2304,6 +2305,16 @@ function parseOutputLine(line){
             for (let i=4; i<p.length-1; i+=2) kvDone[p[i]] = p[i+1];
             const cut = kvDone.stopped === '1';
             const sent = parseInt(kvDone.sent || '0') || 0;
+            const errs = parseInt(kvDone.err || '0') || 0;
+            const elSent = $('deauthSent'), elErr = $('deauthErr'), elRun = $('deauthRun');
+            if (elSent) elSent.textContent = sent;
+            if (elErr) elErr.textContent = errs;
+            if (elRun) elRun.textContent = cut ? '已停止' : '完成';
+            /* Flood 面板共用注入任务, 同一份 DONE 也刷新它的统计 */
+            const fSent = $('floodSent'), fErr = $('floodErr'), fRun = $('floodRun');
+            if (fSent) fSent.textContent = sent;
+            if (fErr) fErr.textContent = errs;
+            if (fRun) fRun.textContent = cut ? '已停止' : '完成';
             clearPendingAction();
             setJobActive(false);
             /* deauth(mode=0) 发完帧不算成功: 对面强制 PMF 时帧一样出得去,
@@ -2315,10 +2326,12 @@ function parseOutputLine(line){
                 expectHandshake(deauthTarget, sent);
             } else {
                 log('[注入] ' + (cut ? '被中止' : '完成') + ' sent=' + sent +
-                    (kvDone.err && kvDone.err !== '0' ? ' err=' + kvDone.err : ''), cut ? 'err' : 'warn');
+                    (errs ? ' err=' + errs : ''), cut ? 'err' : 'warn');
             }
         } else if (kind === 'INJECT' && p[3] === 'ERR'){
             const name = p[7] || p[5] || '';
+            const elErr = $('deauthErr'), elRun = $('deauthRun');
+            if (elRun) elRun.textContent = '错误';
             log('[注入] 错误 ' + name, 'err');
             clearPendingAction();
         } else if (kind === 'DEAUTH' && p[3] === 'DETECTED'){
@@ -2829,9 +2842,11 @@ $('btnDeauth').addEventListener('click', () => {
     const bssid = $('deauthBssid').value.trim();
     if (!bssid){ toast('请选择目标 BSSID', 'err'); return; }
     const sta = $('deauthSta').value.trim();
-    const cnt = $('deauthCount').value;
-    const reason = $('deauthReason').value;
-    const interval = $('deauthInterval').value;
+    /* 持续洪泛模式强制次数=0 (固件 0=不间断); 否则用输入框的次数 */
+    const flood = $('deauthFlood') && $('deauthFlood').checked;
+    const cnt = flood ? 0 : ($('deauthCount').value || '0');
+    const reason = $('deauthReason').value || '7';
+    const interval = $('deauthInterval').value || '0';
     let cmd = `deauth -b ${bssid} -n ${cnt} -r ${reason} -i ${interval}`;
     if (sta && sta !== '00:00:00:00:00:00') cmd += ` -s ${sta}`;
     /* 固件对危险命令强制要 --yes, 缺了只回一条 META 拒绝而不执行。
@@ -2841,8 +2856,44 @@ $('btnDeauth').addEventListener('click', () => {
     log('发送破坏性命令: ' + cmd, 'warn');
     deauthTarget = bssid;          /* 供 DONE 后转入握手等待时比对 */
     clearHandshake();              /* 上一轮没结束的等待作废, 否则旧计时器会在中途报超时 */
+    $('deauthSent').textContent = '0';
+    $('deauthErr').textContent = '0';
+    $('deauthRun').textContent = flood ? '洪泛中' : '发送中';
     expectConfirm('Deauth', 8000);
     sendCmd(cmd);
+});
+$('btnDeauthStop').addEventListener('click', () => {
+    if (!connected){ toast('请先连接设备', 'err'); return; }
+    $('deauthRun').textContent = '停止中';
+    /* 统一停所有注入 (deauth/beacon/flood 都走注入任务) */
+    sendCmd('stop');
+    log('停止注入', 'warn');
+});
+
+/* Flood 洪泛: 复用固件注入任务, 帧类型由 -t 选. auth 不惧 PMF. */
+$('btnFlood').addEventListener('click', () => {
+    if (!connected){ toast('请先连接设备', 'err'); return; }
+    const bssid = $('floodBssid').value.trim();
+    if (!bssid){ toast('请选择目标 BSSID', 'err'); return; }
+    const type = $('floodType') ? $('floodType').value : 'auth';
+    const sta = $('floodSta').value.trim();
+    const cnt = $('floodCount').value || '0';
+    const interval = $('floodInterval').value || '0';
+    let cmd = `flood -b ${bssid} -t ${type} -n ${cnt} -i ${interval}`;
+    if (sta && sta !== '00:00:00:00:00:00') cmd += ` -s ${sta}`;
+    cmd += ' --yes';
+    log('发送破坏性命令: ' + cmd, 'warn');
+    $('floodSent').textContent = '0';
+    $('floodErr').textContent = '0';
+    $('floodRun').textContent = (cnt === '0' ? '洪泛中' : '发送中');
+    expectConfirm('Flood', 8000);
+    sendCmd(cmd);
+});
+$('btnFloodStop').addEventListener('click', () => {
+    if (!connected){ toast('请先连接设备', 'err'); return; }
+    $('floodRun').textContent = '停止中';
+    sendCmd('stop');
+    log('停止洪泛', 'warn');
 });
 /* BSSID 格式即时校验: 非法时输入框变红, 但不阻断已有流程 */
 $('deauthBssid').addEventListener('input', () => {
@@ -3699,6 +3750,7 @@ function renderBleDev(){
         box.innerHTML = '<div class="list-empty">' +
             (bleScanning ? '扫描中… 暂时没发现设备' : '暂无 · 点「开始扫描」') + '</div>';
         if (cntEl) cntEl.textContent = bleScanning ? '扫描中…' : '0 个设备';
+        if ($('bleSelAddr')) $('bleSelAddr').textContent = '未选择';
         return;
     }
     const sorted = [...bleDevList].sort((a, b) => b.rssi - a.rssi);
@@ -3707,8 +3759,9 @@ function renderBleDev(){
         const d = sorted[i];
         const rssiIcon = d.rssi > -60 ? '▰' : d.rssi > -80 ? '▱' : '▯';
         const item = document.createElement('div');
-        item.className = 'list-item';
+        item.className = 'list-item' + (d.addr === bleSelAddr ? ' sel' : '');
         item.style.animationDelay = (i * 20) + 'ms';
+        item.dataset.addr = d.addr;
         item.innerHTML =
             `<div class="ic">${rssiIcon}</div>` +
             `<div class="nm">` +
@@ -3716,17 +3769,28 @@ function renderBleDev(){
               `<div class="meta"><span>${d.addr}</span></div>` +
             `</div>` +
             `<div class="rssi">${d.rssi} dBm</div>`;
-        item.dataset.addr = d.addr;
-        if (d.addr === bleSelAddr) item.classList.add('sel');
-        /* 点选而非复制: GATT 枚举要用这一台的地址, 复制反而没地方粘贴 */
-        item.addEventListener('click', () => {
-            bleSelAddr = (bleSelAddr === d.addr) ? '' : d.addr;
-            renderBleDev();
-        });
         box.appendChild(item);
     }
     if (cntEl) cntEl.textContent = bleDevList.length + ' 个设备' + (bleScanning ? ' · 扫描中' : '');
+    if ($('bleSelAddr')) $('bleSelAddr').textContent = bleSelAddr || '未选择';
 }
+
+/* 事件委托: 扫描期间列表每收到一条 BLEDEV 就整体重写 innerHTML,
+ * 逐项目挂的 click 监听会被一起销毁, 表现就是「点不中」。改为在容器上
+ * 挂一次监听, 重写 innerHTML 不影响它, 点选永远生效。 */
+(function bindBleDevClicks(){
+    const box = $('bledevList');
+    if (!box || box._bleDelegated) return;
+    box._bleDelegated = true;
+    box.addEventListener('click', (e) => {
+        const item = e.target.closest('.list-item');
+        if (!item || !item.dataset.addr) return;
+        const addr = item.dataset.addr;
+        /* 再点一次取消选择 */
+        bleSelAddr = (bleSelAddr === addr) ? '' : addr;
+        renderBleDev();
+    });
+})();
 
 /* BLE 扫描是设备端持续进行的, App 侧定期轮询 blescan 拉最新列表即可实时刷新 */
 function startBlePoll(){
@@ -3815,6 +3879,16 @@ $('btnBleScanClear').addEventListener('click', () => {
     renderBleDev();
     bleScanState('已清空（设备端同步清除）');
     sendCmd('blescan clear');
+});
+$('btnBleCopySel').addEventListener('click', () => {
+    if (!bleSelAddr){ toast('先在设备列表里点选一台', 'warn'); return; }
+    if (navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(bleSelAddr).then(
+            () => toast('已复制 ' + bleSelAddr, 'ok'),
+            () => toast('复制失败', 'err'));
+    } else {
+        toast(bleSelAddr, 'ok');
+    }
 });
 
 /* GATT 枚举: 用设备列表里当前选中那一台的地址 */

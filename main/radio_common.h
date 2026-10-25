@@ -77,6 +77,16 @@ const char *frame_subtype_str(uint8_t type, uint8_t subtype);
 int mk_deauth_frame(uint8_t *out, const uint8_t bssid[6], const uint8_t sta[6],
                     bool from_ap_to_sta, uint16_t reason);
 
+/* 构造 Disassociation 帧 (FC=0x00A0). 同 mk_deauth_frame 布局, 仅 subtype 不同.
+ * 返回帧长度 (26). */
+int mk_disassoc_frame(uint8_t *out, const uint8_t bssid[6], const uint8_t sta[6],
+                      bool from_ap_to_sta, uint16_t reason);
+
+/* 构造 Open System Authentication request (FC=0x00B0). 用于 auth flood:
+ * addr1=AP, addr2=伪装 STA (洪泛时每帧随机), addr3=BSSID. 帧体 6 字节
+ * (算法=0, 序列号=1, 状态码=0). 返回帧长度 (30). */
+int mk_auth_frame(uint8_t *out, const uint8_t bssid[6], const uint8_t sta[6]);
+
 /* 构造最小 Beacon 帧 (FC=0x0080).
  *   da=ff:ff:ff:ff:ff:ff (广播), sa/bssid=src (随机或指定)
  *   tsf: 8 字节时间戳, 可 0
