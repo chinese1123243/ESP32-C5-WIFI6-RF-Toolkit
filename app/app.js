@@ -1416,6 +1416,18 @@ function parseOutputLine(line){
         reportRefusal(kv.msg, kv.detail, kv.cmd);
         return;
     }
+    if (line.startsWith('META,CSI,')){
+        /* SAMPLE 每秒好几条, 只把动作事件报出来, 其余吞掉 */
+        if (line.indexOf(',motion,1') > 0) log('[CSI] 检测到动作', 'warn');
+        else if (line.startsWith('META,CSI,SELFTEST,')){
+            const kv = kvOf(line.split(','), 3);
+            log('[CSI] 自检 ' + kv.result + ' · peak ' + kv.peak, kv.result === 'pass' ? 'ok' : 'err');
+        } else if (line.startsWith('META,CSI,ERR,')){
+            log('[CSI] 失败: ' + line.slice(14), 'err');
+        }
+        return;
+    }
+
     if (line.startsWith('META,WIFI6,')){
         /* AP 明细太多, 只把冲突与汇总放进日志 */
         if (line.startsWith('META,WIFI6,CONFLICT,')){
@@ -2795,6 +2807,7 @@ const CLI_REF = [
         { c:'sniff auto --dwell 300',      d:'全信道轮询, 按各信道发现数排序; --policy wrl 用旧的帧率加权' },
         { c:'airtime --band 2g',           d:'逐信道测空口占用, 给注入挑一条真闲的信道' },
         { c:'wifi6',                       d:'看 BSS Color 冲突、TWT 与 6GHz 邻居' },
+        { c:'csi start 6',                d:'CSI 动作感知; csi selftest 验判定链路', danger:true },
         { c:'downgrade list',              d:'列出可降级的 WPA3 过渡模式目标' },
         { c:'stop',                        d:'停嗅探 / 注入 / 降级' },
         { c:'dump aps',                    d:'读设备端 AP 表; clients / eapols / all / clear' },

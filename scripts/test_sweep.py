@@ -248,6 +248,10 @@ CASES = [
 
     ("downgrade list",                None, "只读查询: 不需要 --yes", None),
     ("wifi6",                         None, "BSS Color / TWT / RNR 一览", None),
+    ("csi start 6",                    "csi stop", "CSI 采样", None),
+    ("csi stats",                      None, None, None),
+    ("csi selftest",                   None, "合成序列自检", None),
+    ("csi stop",                       None, "重复停止: 应当被拒", "reject"),
     ("downgrade TestSSID",            None, "缺 --yes: 应当被拒 (need_confirm)", "reject"),
 
     ("ftm range 00:11:22:33:44:55 6 2", None, None, None),

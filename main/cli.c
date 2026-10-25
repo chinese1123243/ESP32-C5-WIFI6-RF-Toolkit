@@ -15,6 +15,7 @@
  */
 #include "cli.h"
 #include "wifi_attack.h"
+#include "csi.h"
 #include "radio_common.h"
 #include "rgb_led.h"
 #include "wifi_db.h"
@@ -1845,6 +1846,53 @@ static int cmd_wifi6(int argc, char **argv)
     return 0;
 }
 
+/* csi: Wi-Fi CSI 采样与动作检测 */
+static int cmd_csi(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("usage:\n"
+               "  csi start [ch]   start CSI sampling on a fixed channel (default 6)\n"
+               "  csi stop         stop\n"
+               "  csi stats        counters (frames / rate / subcarriers)\n"
+               "  csi raw <n>      dump next n frames as hex\n"
+               "  csi selftest     synthetic sequence check\n");
+        fflush(stdout);
+        return 1;
+    }
+    const char *sub = argv[1];
+
+    if (strcmp(sub, "start") == 0) {
+        uint8_t ch = (argc >= 3) ? (uint8_t)atoi(argv[2]) : 6;
+        esp_err_t e = csi_start(ch);
+        if (e != ESP_OK) {
+            printf("META,CSI,ERR,msg,start_failed,code,%d\n", (int)e);
+            fflush(stdout);
+            return 1;
+        }
+        printf("META,CSI,START,ok,1,ch,%u\n", (unsigned)ch);
+        fflush(stdout);
+        return 0;
+    }
+    if (strcmp(sub, "stop") == 0) {
+        esp_err_t e = csi_stop();
+        if (e != ESP_OK) {
+            printf("META,CSI,ERR,msg,not_running\n"); fflush(stdout); return 1;
+        }
+        printf("META,CSI,STOP,ok,1\n"); fflush(stdout); return 0;
+    }
+    if (strcmp(sub, "stats") == 0) { csi_stats(); return 0; }
+    if (strcmp(sub, "selftest") == 0) { csi_selftest(); return 0; }
+    if (strcmp(sub, "raw") == 0) {
+        int n = (argc >= 3) ? atoi(argv[2]) : 4;
+        csi_raw(n);
+        printf("META,CSI,RAWC,ok,1,n,%d\n", n);
+        fflush(stdout);
+        return 0;
+    }
+    printf("META,CSI,ERR,msg,bad_subcmd\n"); fflush(stdout);
+    return 1;
+}
+
 /* events (事件快照) */
 static int cmd_events(int argc, char **argv)
 {
@@ -1870,6 +1918,7 @@ static const cli_cmd_t g_cmds[] = {
     { "stop",        "Stop sniff/inject",    NULL,                   cmd_stop,        NULL },
     { "airtime",     "Per-channel airtime census", "[--dwell ms] [--band 2g|5g|all] [--ch N]", cmd_airtime, NULL },
     { "wifi6",       "Wi-Fi 6 structure: BSS color / TWT / RNR", NULL, cmd_wifi6, NULL },
+    { "csi",         "Wi-Fi CSI sensing (motion)", "start [ch]|stop|stats|raw <n>|selftest", cmd_csi, NULL },
     { "deauth",      "Deauth inject",        "-b <bssid> [opts]",    cmd_deauth,      deauth_arg_reset },
     { "beaconflood", "Beacon flood",         "-p <prefix> [opts]",   cmd_beaconflood, beacon_arg_reset },
     { "probeflood",  "Probe req flood",      "[opts]",               cmd_probeflood,  probe_arg_reset },
