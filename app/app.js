@@ -642,6 +642,22 @@ function getCapBle(){
     const Cap = window.Capacitor;
     return (Cap && Cap.Plugins && Cap.Plugins.BluetoothLe) || null;
 }
+function getGeo(){
+    const Cap = window.Capacitor;
+    return (Cap && Cap.Plugins && Cap.Plugins.Geolocation) || null;
+}
+/* 固件 enc_str 值 -> WiGLE AuthMode 记法 */
+function encToWigle(enc){
+    switch(enc){
+        case 'OPEN':   return '[OPEN]';
+        case 'WEP':    return '[WEP]';
+        case 'WPA':    return '[WPA-PSK]';
+        case 'WPA2':   return '[WPA2-PSK]';
+        case 'WPA3':   return '[WPA3-SAE]';
+        case 'WPA/W2': return '[WPA-PSK]';
+        default:       return '';
+    }
+}
 /* 将字节数组转为 Capacitor 原生插件需要的空格分隔十六进制字符串 */
 function bytesToHexStr(bytes){
     return Array.from(bytes).map(b => b.toString(16).padStart(2,'0')).join(' ');
@@ -2374,6 +2390,13 @@ function parseOutputLine(line){
             if (existing) Object.assign(existing, rec);
             else apList.push(rec);
             renderApList();
+            /* Wardriving: dump aps 拉回来的这批 AP 挂到当前定位点 */
+            if (wardOn && wardCur){
+                const wap = wardCur.aps.find(a => a.bssid === bssid);
+                if (wap) Object.assign(wap, { channel:ch, rssi, enc });
+                else wardCur.aps.push({ bssid, ssid, channel:ch, rssi, enc });
+                updateWardUI();
+            }
             /* 头部声明了条数就以它为准收尾, 不再靠猜时间 */
             if (apExpect >= 0 && apList.length >= apExpect) finishApScan();
         }
@@ -2457,6 +2480,11 @@ let gattTree   = [];
 let gattAddr   = '';
 let gattRssi  = '';
 let bleSelAddr = '';   /* 设备列表里当前选中的地址, GATT 枚举用它 */
+/* Wardriving: 手机 GPS 打点 + 板子扫 AP, 导出 WiGLE CSV */
+let wardOn     = false;
+let wardTimer  = null;
+let wardPts    = [];      /* [{lat,lon,acc,ts,aps:[{bssid,ssid,channel,rssi,enc}]}] */
+let wardCur    = null;    /* 当前批次正在累积的定位点 */
 
 function apScanState(txt){ const el = $('apScanState'); if (el) el.textContent = txt; }
 function cliScanState(txt){ const el = $('cliScanState'); if (el) el.textContent = txt; }
@@ -3091,6 +3119,126 @@ $('btnExportJson').addEventListener('click', () => {
     if (!connected){ toast('请先连接设备', 'err'); return; }
     toast('正在导出 JSON...', 'warn');
     sendCmd('export json');
+});
+
+function wardState(txt){ const el = $('wardState'); if (el) el.textContent = txt; }
+function wardMsg(txt){ const el = $('wardMsg'); if (el) el.textContent = txt; }
+
+function updateWardUI(){
+    let nAp = 0;
+    for (const p of wardPts) nAp += p.aps.length;
+    const pe = $('wardPoints'); if (pe) pe.textContent = wardPts.length;
+    const ae = $('wardAps');    if (ae) ae.textContent = nAp;
+    const fe = $('wardFix');
+    if (fe && wardCur) fe.textContent = wardCur.lat.toFixed(6) + ',' + wardCur.lon.toFixed(6) +
+        ' ±' + Math.round(wardCur.acc || 0) + 'm';
+}
+
+async function wardTick(){
+    if (!wardOn) return;
+    const geo = getGeo();
+    if (!geo){
+        wardState('无定位插件');
+        stopWardriving();
+        return;
+    }
+    /* 1) 定位. 高精度 GPS 首次可能要几秒, 给 10s 超时 */
+    let pos;
+    try {
+        pos = await geo.getCurrentPosition({ enableHighAccuracy: true, timeout: 10000 });
+    } catch(e){
+        wardState('定位失败');
+        wardMsg('定位失败: ' + (e && e.message) + '; 检查定位权限与开关');
+        return;   /* 不攒空点位, 下个 tick 再试 */
+    }
+    const c = pos.coords || {};
+    if (c.latitude == null || c.longitude == null){
+        wardMsg('定位返回空坐标');
+        return;
+    }
+    wardCur = { lat: c.latitude, lon: c.longitude, acc: c.accuracy || 0,
+                ts: Date.now(), aps: [] };
+    wardPts.push(wardCur);
+    updateWardUI();
+    /* 2) 让板子扫一批 AP, AP 行到达时挂到 wardCur 上 */
+    if (connected) sendCmd('dump aps');
+    else wardMsg('未连接板子, 只有 GPS 点位, 没有 AP');
+}
+
+async function startWardriving(){
+    if (wardOn){ toast('已在打点中', 'warn'); return; }
+    const geo = getGeo();
+    if (!geo){ toast('定位插件不可用, 需重新打包 APK', 'err'); return; }
+    /* 先申请权限 (Android 6+/iOS) */
+    try {
+        const st = await geo.requestPermissions ? await geo.requestPermissions() : { location: 'granted' };
+        if (st && st.location && st.location !== 'granted' && st.location !== 'prompt'){
+            toast('定位权限被拒', 'err');
+            wardMsg('定位权限被拒, 去系统设置里给 App 开定位');
+            return;
+        }
+    } catch(e){ /* 桌面浏览器可能没有 requestPermissions */ }
+    wardOn = true;
+    wardState('打点中');
+    wardMsg('按 ' + ($('wardSec').value || 5) + 's 间隔采样, 请保持屏幕常亮并移动');
+    wardTick();   /* 立即采第一个点 */
+    const sec = clampInt($('wardSec').value, 2, 60, 5);
+    wardTimer = setInterval(wardTick, sec * 1000);
+    toast('开始 Wardriving', 'ok');
+}
+
+function stopWardriving(){
+    if (!wardOn) return;
+    wardOn = false;
+    if (wardTimer){ clearInterval(wardTimer); wardTimer = null; }
+    wardState('已停止');
+    let nAp = 0; for (const p of wardPts) nAp += p.aps.length;
+    wardMsg('共 ' + wardPts.length + ' 点位 / ' + nAp + ' 条 AP, 点「导出」生成 CSV');
+    toast('已停止', 'warn');
+}
+
+function buildWigleCsv(){
+    const lines = [];
+    lines.push('WigleWifi-1.4,appRelease=' + APP_VERSION +
+               ',model=rftool-c5,release=rftool,device=ESP32-C5,' +
+               'display=RFTOOL-C5,brand=Espressif,board=esp32c5');
+    lines.push('MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,' +
+               'CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type');
+    for (const pt of wardPts){
+        const firstSeen = new Date(pt.ts).toISOString();
+        const lat = pt.lat.toFixed(6);
+        const lon = pt.lon.toFixed(6);
+        const acc = Math.round(pt.acc || 0);
+        for (const ap of pt.aps){
+            /* CSV 字段内逗号要转义, SSID 里常见 */
+            const ssid = '"' + String(ap.ssid || '').replace(/"/g, '""') + '"';
+            lines.push([
+                ap.bssid.toUpperCase(), ssid, encToWigle(ap.enc), firstSeen,
+                ap.channel, ap.rssi, lat, lon, '', acc, 'WIFI'
+            ].join(','));
+        }
+    }
+    return lines.join('\n');
+}
+
+$('btnWardStart').addEventListener('click', startWardriving);
+$('btnWardStop').addEventListener('click', stopWardriving);
+$('btnWardClear').addEventListener('click', () => {
+    wardPts = []; wardCur = null;
+    updateWardUI();
+    wardMsg('已清空点位');
+});
+$('btnWardExport').addEventListener('click', async () => {
+    let nAp = 0; for (const p of wardPts) nAp += p.aps.length;
+    if (!wardPts.length){
+        toast('还没有点位, 先开始打点', 'err');
+        return;
+    }
+    const csv = buildWigleCsv();
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const name = 'wigle-' + ts + '.csv';
+    await saveFile(name, csv, 'text/csv');
+    wardMsg('导出 ' + wardPts.length + ' 点位 / ' + nAp + ' 条 AP 到 ' + name);
 });
 
 $('btnHttpStart').addEventListener('click', () => {

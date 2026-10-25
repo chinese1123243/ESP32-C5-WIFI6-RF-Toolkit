@@ -69,6 +69,8 @@ function dumpClients(){}
 function renderClientList(){}
 function finishCliScan(){}
 const apList = [], clientList = [];
+let wardOn = false, wardCur = null, wardPts = [];
+function updateWardUI(){}
 let apExpect = -1, cliExpect = -1, apScanning = false, cliScanning = false;
 const els = {};
 const document = { getElementById: id => (els[id] = els[id] || { textContent: '' }) };

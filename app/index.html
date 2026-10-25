@@ -1281,6 +1281,25 @@ button.mi{ width:100%; background:none; border:0; text-align:left; font:inherit;
             <button class="btn" id="btnLocStop">停止</button>
           </div>
         </div>
+        <!-- Wardriving: 手机 GPS 打点 + 板子扫 AP, 导出 WiGLE CSV -->
+        <div class="blk">
+          <h3>Wardriving<span class="h3-sub">GPS 打点 · WiGLE CSV</span></h3>
+          <div class="note">边走边采: 用手机 GPS 定位, 同步让板子扫周围 AP, 每批 AP 挂到当前位置, 最后导出 WiGLE 格式 CSV 上传。</div>
+          <div class="actions">
+            <button class="btn primary" id="btnWardStart">开始打点</button>
+            <button class="btn danger" id="btnWardStop">停止</button>
+            <button class="btn" id="btnWardExport">导出 WiGLE CSV</button>
+            <button class="btn" id="btnWardClear">清空</button>
+          </div>
+          <div class="field"><label>采样间隔 (秒)</label><input id="wardSec" type="number" value="5" min="2" max="60" /></div>
+          <div class="kv kv-2">
+            <span>状态</span><code id="wardState">空闲</code>
+            <span>点位</span><code id="wardPoints">0</code>
+            <span>AP 记录</span><code id="wardAps">0</code>
+            <span>最近定位</span><code id="wardFix">--</code>
+          </div>
+          <div class="note" id="wardMsg">需要定位权限; WiGLE CSV 导出后可直接上传 wigle.net。</div>
+        </div>
         <!-- A3: 802.15.4 / Zigbee / Thread 嗅探 -->
         <div class="blk">
           <h3>802.15.4 嗅探<span class="h3-sub">zbsniff · Zigbee / Thread</span></h3>
