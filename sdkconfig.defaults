@@ -85,9 +85,10 @@ CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=4
 # Wi-Fi + BLE + Zigbee/Thread 三协议. 与 Wi-Fi/BLE 分时共存.
 # 802.15.4 驱动常驻会吃掉一块内部 RAM, 而 C5 的 Wi-Fi + BLE + 802.15.4 三栈
 # 同时常驻时 NimBLE 连广播数据都分配不出来 (HCI 0x207 BLE_ERR_MEM_CAPACITY).
-# 默认关闭: zbsniff 命令在编译期就被裁掉, 换来 BLE 可用. 需要 802.15.4 时
-# 把下面这行改 y 重新编译 (两套射频不能同时要).
-# CONFIG_IEEE802154_ENABLED is not set
+# 打开: zbsniff / zbtx 需要真 802.15.4 驱动. 代价是 NimBLE 起不来的那类
+# 内部 RAM 紧张, 所以 zbsniff/zbtx 启动时 CLI 会先停 BLE, 见 cmd_zbsniff.
+# 实测 (2026-10-25): 打开后 BLE 单独跑仍正常, 两栈同时常驻才炸.
+CONFIG_IEEE802154_ENABLED=y
 # RX 缓冲: 深度适中即可. 注意 802.15.4 驱动 + 缓冲会吃内部 RAM,
 # 而 NimBLE 启动需要一段较大连续块 (实测 16KB 以下会触发
 # HCI BLE_ERR_MEM_CAPACITY), 故不放大.

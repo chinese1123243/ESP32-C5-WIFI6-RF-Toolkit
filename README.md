@@ -102,7 +102,7 @@ http start --ssid rftool-ap --pass 12345678
 
 ## 命令速查
 
-`help` 列出全部 31 条，`<命令> --help` 看参数。
+`help` 列出全部命令，`<命令> --help` 看参数。
 
 | 类别 | 命令 |
 |---|---|
@@ -110,7 +110,8 @@ http start --ssid rftool-ap --pass 12345678
 | 捕获 | `hs [complete\|clear\|22000\|selftest]`、`cap <start\|stop\|info\|keys\|read\|hdr\|clear>`、`pmkid <watch\|status\|clear>` |
 | 注入 | `deauth -b <bssid> [-s <sta>] [-n N] [-r R] [-i ms]`、`beaconflood -p <prefix>`、`probeflood`、`raw <tx\|deauth\|auth\|assoc\|beacon\|proberesp>` |
 | 诱捕 | `phish <start\|stop\|status\|stations\|creds\|html>`、`eviltwin <clone\|stop>`、`karma`、`downgrade <ssid>` |
-| 测量 | `ftm <bssid\|status>`、`locate <mac> [秒]\|status\|export`、`ble <power>`、`bleadv`、`zbsniff` |
+| 测量 | `ftm <bssid\|status>`、`locate <mac> [秒]\|status\|export`、`ble <power>`、`bleadv`、`airtime`、`wifi6`、`csi <start\|stop\|stats\|raw\|selftest>` |
+| 跨射频 | `zbsniff <ch 11-26>\|stop\|status\|dump\|clear`、`zbtx <beacon\|beaconreq\|data\|raw\|replay\|flood\|stop\|stats>` |
 | 编排 | `scenario <survey\|handshake\|pmf\|stop\|status>`、`events [n]` |
 | 系统 | `config <set\|get\|list\|reset>`、`log`、`health`、`ota <status\|confirm\|rollback\|url\|reboot>`、`http`、`stop`、`version` |
 

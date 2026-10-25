@@ -29,6 +29,7 @@
 #include "ble_cli.h"
 #include "ble_adv.h"
 #include "zbsniff.h"
+#include "zbtx.h"
 #include "ftm.h"
 #include "config.h"     /* NVS 配置持久化 */
 #include "logring.h"    /* 日志环形缓冲 */
@@ -1205,7 +1206,10 @@ static int cmd_zbsniff(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], "stop") == 0) {
         esp_err_t e = zbsniff_stop();
-        printf("META,ZB,STOP,err,%d\n", (int)e);
+        /* 失败走 ERR Tag. 以前 STOP Tag 配 err,259, 按 Tag 判断的调用方
+         * 会把它读成一次成功的停止. */
+        if (e != ESP_OK) printf("META,ZB,ERR,msg,not_running\n");
+        else            printf("META,ZB,STOP,err,0\n");
         fflush(stdout);
         return e == ESP_OK ? 0 : 1;
     }
@@ -1237,6 +1241,9 @@ static int cmd_zbsniff(int argc, char **argv)
         }
         /* 802.15.4 与 Wi-Fi 分时共存同一射频: 先停掉所有 Wi-Fi 作业 */
         wifi_attack_stop_all();
+        /* 换信道: 原实现在跑时直接回 INVALID_STATE, 扫全信道时必须先 stop.
+         * 这里自动停掉再开, 与 sniff <ch> 的行为一致. */
+        if (zbsniff_is_on()) zbsniff_stop();
         esp_err_t e = zbsniff_start((uint8_t)ch);
         if (e != ESP_OK) {
             printf("META,ZB,ERR,code,%d,msg,start_failed\n", (int)e); fflush(stdout); return 1;
@@ -1247,6 +1254,269 @@ static int cmd_zbsniff(int argc, char **argv)
     printf("usage: zbsniff <ch 11-26> | stop | status | dump | clear\n");
     fflush(stdout);
     return 1;
+}
+
+/* 802.15.4 hex 解析: 允许空格/冒号/连写, 与 fb_tx_hex 同口径 */
+static int zbtx_parse_hex(const char *hex, uint8_t *out, int cap)
+{
+    int n = 0;
+    int hi = -1;
+    for (const char *p = hex; *p; p++) {
+        char c = *p;
+        int v;
+        if (c >= '0' && c <= '9')      v = c - '0';
+        else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+        else continue;                      /* 跳过分隔符 */
+        if (hi < 0) hi = v;
+        else {
+            if (n >= cap) return -1;
+            out[n++] = (uint8_t)((hi << 4) | v);
+            hi = -1;
+        }
+    }
+    if (hi >= 0) return -1;                 /* 半个字节 */
+    return n;
+}
+
+/* zbtx: 802.15.4 发送 (beacon / beacon request / 重放 / 洪泛) */
+static int cmd_zbtx(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("usage:\n"
+               "  zbtx beacon <ch> [pan] [n]      Zigbee 协调器 beacon (默认 1 个)\n"
+               "  zbtx beaconreq <ch> [pan] [ms]  Beacon Request 后监听回应\n"
+               "  zbtx data <ch> <dst_pan> <dst> <src> <hex>  单播数据帧\n"
+               "  zbtx raw <hex> [n]              原样发送 (帧自带长度前缀)\n"
+               "  zbtx replay <i> [n]             重放 zbsniff 表里第 i 条\n"
+               "  zbtx flood <ch> [pan] [n]       beacon 洪泛 (默认 100)\n"
+               "  [--dry 只组帧] [--noca 跳过 CCA] [--n N]\n"
+               "  zbtx stop | stats\n");
+        fflush(stdout);
+        return 1;
+    }
+    const char *sub = argv[1];
+
+    if (strcmp(sub, "stop") == 0) {
+        if (zbtx_flood_on()) zbtx_flood_stop();
+        esp_err_t e = zbtx_stop();
+        /* 同 zbsniff: 失败走 ERR Tag, 不用 STOP 配 err 码 */
+        if (e != ESP_OK) printf("META,ZB,TX,ERR,msg,not_running\n");
+        else            printf("META,ZB,TX,STOP,err,0\n");
+        fflush(stdout);
+        return e == ESP_OK ? 0 : 1;
+    }
+    if (strcmp(sub, "stats") == 0) { zbtx_status(); return 0; }
+
+    bool dry = false, yes = g_yes, noca = false;
+    int rep = 1;
+    /* 扫 --dry / --yes / --noca / --n N */
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--dry") == 0) dry = true;
+        else if (strcmp(argv[i], "--yes") == 0) yes = true;
+        /* CCA 是能量检测, 802.15.4 ch11-26 与 Wi-Fi ch1-13 频率重叠,
+         * 现场有 23 台 AP 时几乎每个窗口都是忙的, 实测 10 帧只有 1 帧发出去.
+         * --noca 跳过空闲评估直接发. */
+        else if (strcmp(argv[i], "--noca") == 0) noca = true;
+        else if (strcmp(argv[i], "--n") == 0 && i + 1 < argc) rep = atoi(argv[++i]);
+    }
+
+    uint8_t frame[ZBTX_FRAME_MAX + 2];
+    int n = 0;
+
+    if (strcmp(sub, "beacon") == 0) {
+        if (argc < 3) { printf("META,ZB,TX,ERR,msg,need_channel\n"); fflush(stdout); return 1; }
+        int ch = atoi(argv[2]);
+        if (ch < ZB_CH_MIN || ch > ZB_CH_MAX) {
+            printf("META,ZB,TX,ERR,msg,bad_channel (11-26)\n"); fflush(stdout); return 1;
+        }
+        uint16_t pan = (argc >= 4) ? (uint16_t)strtol(argv[3], NULL, 0) : 0;
+        if (argc >= 5 && rep == 1) rep = atoi(argv[4]);
+        if (rep < 1) rep = 1;
+        if (rep > 500) rep = 500;
+        n = zbtx_build_beacon(frame, sizeof(frame), pan, (uint8_t)ch, 0x2a);
+    } else if (strcmp(sub, "beaconreq") == 0) {
+        if (argc < 3) { printf("META,ZB,TX,ERR,msg,need_channel\n"); fflush(stdout); return 1; }
+        int ch = atoi(argv[2]);
+        if (ch < ZB_CH_MIN || ch > ZB_CH_MAX) {
+            printf("META,ZB,TX,ERR,msg,bad_channel (11-26)\n"); fflush(stdout); return 1;
+        }
+        n = zbtx_build_beacon_req(frame, sizeof(frame), 0, 0x5c);
+    } else if (strcmp(sub, "data") == 0) {
+        if (argc < 7) {
+            printf("usage: zbtx data <ch> <dst_pan> <dst> <src> <hex>\n");
+            fflush(stdout); return 1;
+        }
+        int ch = atoi(argv[2]);
+        if (ch < ZB_CH_MIN || ch > ZB_CH_MAX) {
+            printf("META,ZB,TX,ERR,msg,bad_channel (11-26)\n"); fflush(stdout); return 1;
+        }
+        uint16_t dp = (uint16_t)strtol(argv[3], NULL, 0);
+        uint16_t d  = (uint16_t)strtol(argv[4], NULL, 0);
+        uint16_t s  = (uint16_t)strtol(argv[5], NULL, 0);
+        uint8_t pay[ZBTX_FRAME_MAX];
+        int pl = zbtx_parse_hex(argv[6], pay, sizeof(pay));
+        if (pl < 0) { printf("META,ZB,TX,ERR,msg,bad_payload_hex\n"); fflush(stdout); return 1; }
+        n = zbtx_build_data(frame, sizeof(frame), dp, d, dp, s, pay, pl, 0x7e);
+    } else if (strcmp(sub, "raw") == 0) {
+        if (argc < 3) { printf("META,ZB,TX,ERR,msg,need_hex\n"); fflush(stdout); return 1; }
+        /* 只拼 hex 段. 后面的 --dry / --yes / --n 必须排除: 'd' 本身是合法
+         * hex 数字, 拼进去会多出半个字节, 整帧被判成长度不符. */
+        char hex[1200] = {0};
+        for (int i = 2; i < argc; i++) {
+            if (argv[i][0] == '-' && argv[i][1] == '-') break;
+            if (hex[0]) strncat(hex, " ", sizeof(hex) - strlen(hex) - 1);
+            strncat(hex, argv[i], sizeof(hex) - strlen(hex) - 1);
+        }
+        if (!hex[0]) { printf("META,ZB,TX,ERR,msg,need_hex\n"); fflush(stdout); return 1; }
+        n = zbtx_parse_hex(hex, frame, sizeof(frame));
+        if (n <= 0 || frame[0] == 0 || frame[0] >= n) {
+            printf("META,ZB,TX,ERR,msg,bad_frame (首字节须为 MHR+payload 长度)\n");
+            fflush(stdout); return 1;
+        }
+    } else if (strcmp(sub, "replay") == 0) {
+        if (argc < 3) { printf("META,ZB,TX,ERR,msg,need_index\n"); fflush(stdout); return 1; }
+        int idx = atoi(argv[2]);
+        int8_t rssi; uint8_t lqi, ch; uint64_t ts;
+        n = zbsniff_get(idx, frame, sizeof(frame), &rssi, &lqi, &ch, &ts);
+        if (n <= 0) { printf("META,ZB,TX,ERR,msg,no_such_entry\n"); fflush(stdout); return 1; }
+    } else if (strcmp(sub, "flood") == 0) {
+        if (argc < 3) { printf("META,ZB,TX,ERR,msg,need_channel\n"); fflush(stdout); return 1; }
+        int ch = atoi(argv[2]);
+        if (ch < ZB_CH_MIN || ch > ZB_CH_MAX) {
+            printf("META,ZB,TX,ERR,msg,bad_channel (11-26)\n"); fflush(stdout); return 1;
+        }
+        uint16_t pan = (argc >= 4) ? (uint16_t)strtol(argv[3], NULL, 0) : 0;
+        int cnt = (argc >= 5 && rep == 1) ? atoi(argv[4]) : 100;
+        if (cnt < 1) cnt = 1;
+        if (cnt > 100000) cnt = 100000;
+        if (dry) {
+            n = zbtx_build_beacon(frame, sizeof(frame), pan, (uint8_t)ch, 0x2a);
+        } else {
+            if (!yes && !confirm_dangerous(argc, argv, "<ch> [pan] [n]")) return 1;
+            wifi_attack_stop_all();
+            esp_err_t e = zbtx_flood_start((uint8_t)ch, pan, cnt, !noca);
+            if (e != ESP_OK) {
+                printf("META,ZB,TX,ERR,code,%d,msg,flood_start_failed\n", (int)e);
+                fflush(stdout); return 1;
+            }
+            printf("META,ZB,TX,FLOOD,ch,%d,pan,%u,n,%d\n", ch, (unsigned)pan, cnt);
+            fflush(stdout);
+            return 0;
+        }
+    } else {
+        printf("META,ZB,TX,ERR,msg,bad_subcmd (beacon|beaconreq|data|raw|replay|flood|stop|stats)\n");
+        fflush(stdout);
+        return 1;
+    }
+
+    if (n <= 0) {
+        printf("META,ZB,TX,ERR,msg,build_failed\n");
+        fflush(stdout);
+        return 1;
+    }
+
+    if (dry) {
+        printf("META,ZB,TX,DRY,len,%d,data,", n);
+        for (int i = 0; i < n; i++) printf("%02x", frame[i]);
+        printf("\n");
+        fflush(stdout);
+        return 0;
+    }
+
+    if (!yes && !confirm_dangerous(argc, argv, "<args>")) return 1;
+
+    wifi_attack_stop_all();
+    if (!zbtx_is_on()) {
+        int ch = 11;
+        if (argc >= 3 && strcmp(sub, "raw") != 0 && strcmp(sub, "replay") != 0) {
+            ch = atoi(argv[2]);
+        } else if (strcmp(sub, "replay") == 0) {
+            int8_t rssi; uint8_t lqi, c2; uint64_t ts;
+            uint8_t tmp[ZB_FRAME_MAX + 1];
+            if (zbsniff_get(atoi(argv[2]), tmp, sizeof(tmp), &rssi, &lqi, &c2, &ts) > 0) ch = c2;
+        }
+        esp_err_t e = zbtx_start((uint8_t)ch);
+        if (e != ESP_OK) {
+            printf("META,ZB,TX,ERR,code,%d,msg,tx_start_failed\n", (int)e);
+            fflush(stdout); return 1;
+        }
+        printf("META,ZB,TX,START,ch,%d\n", ch);
+        fflush(stdout);
+    }
+
+    /* beaconreq: 发完留在信道上听回应 (协调器收到会回 beacon) */
+    bool discover = (strcmp(sub, "beaconreq") == 0);
+    int dwell_ms = 2000;
+    if (discover && argc >= 4) {
+        int v = atoi(argv[3]);
+        if (v >= 200 && v <= 20000) dwell_ms = v;
+    }
+    bool started_sniff = false;
+    if (discover) {
+        if (!zbsniff_is_on()) {
+            esp_err_t e = zbsniff_start(zbtx_channel());
+            if (e == ESP_OK) started_sniff = true;
+        }
+        zbsniff_clear();
+    }
+
+    int ok = 0, bad = 0, cca_busy = 0;
+    for (int i = 0; i < rep; i++) {
+        esp_err_t e = ESP_FAIL;
+        /* CCA busy 就退避重试: 802.15.4 与 Wi-Fi 同频段, 现场 AP 多时
+         * 单次尝试大概率抢不到窗口. --noca 跳过 CCA. */
+        for (int t = 0; t < (noca ? 1 : 4); t++) {
+            e = zbtx_send(frame, n, 500, !noca);
+            if (e == ESP_OK) break;
+            if (zbtx_last_error() == 1) cca_busy++;   /* TX_ERR_CCA_BUSY */
+            vTaskDelay(pdMS_TO_TICKS(12));
+        }
+        if (e == ESP_OK) ok++;
+        else bad++;
+    }
+
+    if (discover) {
+        /* 轮询抓包表: 只统计 beacon 帧, 汇总不同 PAN */
+        int seen = 0;
+        uint16_t pans[24]; int pan_n = 0;
+        uint32_t t0 = xTaskGetTickCount();
+        while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(dwell_ms)) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            int cnt = zbsniff_count();
+            for (; seen < cnt; seen++) {
+                uint8_t b[ZB_FRAME_MAX + 1];
+                int8_t rssi; uint8_t lqi, ch; uint64_t ts;
+                int len = zbsniff_get(seen, b, sizeof(b), &rssi, &lqi, &ch, &ts);
+                if (len < 5) continue;
+                if ((b[1] & 0x07) != 0) continue;          /* 只看 beacon */
+                if ((b[1] & 0xC0) != 0x80) continue;       /* src 须为短地址 */
+                uint16_t pan = (uint16_t)(b[3] | (b[4] << 8));
+                bool dup = false;
+                for (int k = 0; k < pan_n; k++) if (pans[k] == pan) dup = true;
+                if (!dup && pan_n < 24) {
+                    pans[pan_n++] = pan;
+                    printf("META,ZB,PAN,pan,0x%04x,src,0x%04x,rssi,%d,lqi,%u,ch,%u\n",
+                           (unsigned)pan, (unsigned)(b[5] | (b[6] << 8)),
+                           (int)rssi, (unsigned)lqi, (unsigned)ch);
+                }
+            }
+        }
+        printf("META,ZB,TX,DONE,sub,beaconreq,tx_ok,%d,tx_bad,%d,pans,%d,dwell_ms,%d\n",
+               ok, bad, pan_n, dwell_ms);
+        fflush(stdout);
+        if (started_sniff) {
+            zbsniff_stop();
+            printf("META,ZB,TX,NOTE,sniff_stopped (本命令自动开的嗅探已关)\n");
+            fflush(stdout);
+        }
+        return 0;
+    }
+
+    printf("META,ZB,TX,DONE,sub,%s,ok,%d,bad,%d,cca_busy,%d,lasterr,%d\n",
+           sub, ok, bad, cca_busy, zbtx_last_error());
+    fflush(stdout);
+    return bad ? 1 : 0;
 }
 
 /* ftm: 802.11mc FTM 测距 */
@@ -1934,6 +2204,7 @@ static const cli_cmd_t g_cmds[] = {
     { "ble",         "BLE TX power control (+20dBm)", "power [<0-15>]", cmd_ble, NULL },
     { "bleadv",      "BLE beacon spoof (iBeacon/Eddystone)", "ibeacon <uuid> <maj> <min> [s]|eddystone <url> [s]|stop|status", cmd_bleadv, NULL },
     { "zbsniff",     "802.15.4 (Zigbee/Thread) sniff", "<ch 11-26>|stop|status|dump|clear", cmd_zbsniff, NULL },
+    { "zbtx",        "802.15.4 (Zigbee/Thread) TX", "beacon|beaconreq|data|raw|replay|flood|stop|stats", cmd_zbtx, NULL },
     { "ftm",         "802.11mc FTM ranging (RTT->distance)", "range <bssid> [ch] [count]", cmd_ftm, NULL },
     { "config",      "NVS config persistence",  "set <k> <v>|get <k>|list|reset", cmd_config, NULL },
     { "log",         "Show/capture log ring buffer", "[clear]", cmd_log, NULL },

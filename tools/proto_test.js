@@ -247,5 +247,27 @@ M.feed('META,CSA,TX,ok,1,bssid,20:87:ec:0f:4e:82,from,6,to,1,sent,3,fail,0,clone
 check('CSA 回执清等待', M.pending() === null);
 check('CSA 结果进日志', /CSA/.test(JSON.stringify(M.logs())), JSON.stringify(M.logs()));
 
+M.reset(); M.expectConfirm('Zbtx', 8000);
+M.feed('META,ZB,TX,START,ch,15');
+M.feed('META,ZB,TX,DONE,sub,beacon,ok,10,bad,0,cca_busy,3,lasterr,0');
+check('zbtx 回执清等待', M.pending() === null);
+check('CCA busy 提示 --noca', /--noca/.test(JSON.stringify(M.logs())), JSON.stringify(M.logs()));
+
+M.reset(); M.expectConfirm('Zbtx', 8000);
+M.feed('META,ZB,TX,DONE,sub,beaconreq,tx_ok,1,tx_bad,0,pans,2,dwell_ms,3000');
+check('PAN 发现计数进日志', /2 个 PAN/.test(JSON.stringify(M.logs())), JSON.stringify(M.logs()));
+
+M.reset();
+M.feed('META,ZB,PAN,pan,0x1a2b,src,0x0,rssi,-70,lqi,80,ch,15');
+check('PAN 行翻成可读', /0x1a2b/.test(JSON.stringify(M.logs())), JSON.stringify(M.logs()));
+
+M.reset();
+M.feed('META,ZB,TX,DRY,len,26,data,1a802a2b1a0000ffcf0000001205101112131415161700000000');
+check('dry 只报组帧不报发送', /未发送/.test(JSON.stringify(M.logs())), JSON.stringify(M.logs()));
+
+M.reset();
+M.feed('META,ZB,TX,ERR,msg,bad_channel (11-26)');
+check('zbtx 参数错误进日志', /bad_channel/.test(JSON.stringify(M.logs())), JSON.stringify(M.logs()));
+
 console.log('\n=== 结果: ' + pass + ' passed, ' + fail + ' failed ===');
 process.exit(fail ? 1 : 0);

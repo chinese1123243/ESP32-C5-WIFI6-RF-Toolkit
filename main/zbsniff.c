@@ -158,6 +158,39 @@ static void zb_task(void *pv)
     vTaskDelete(NULL);
 }
 
+/* 射频引用计数, zbsniff 与 zbtx 共用 */
+static _Atomic int s_radio_refs = 0;
+
+esp_err_t zb_radio_acquire(void)
+{
+    if (atomic_fetch_add(&s_radio_refs, 1) > 0) return ESP_OK;   /* 别人已经开过 */
+
+    esp_err_t e = esp_ieee802154_enable();
+    if (e != ESP_OK) {
+        atomic_fetch_sub(&s_radio_refs, 1);
+        return e;
+    }
+    esp_ieee802154_set_promiscuous(true);
+    esp_ieee802154_set_rx_when_idle(true);
+    return ESP_OK;
+}
+
+void zb_radio_release(void)
+{
+    int left = atomic_fetch_sub(&s_radio_refs, 1) - 1;
+    if (left > 0) return;                    /* 还有使用者, 射频不能关 */
+
+    if (left < 0) {                          /* 防御: 多 release 会把 refs 压成负数 */
+        atomic_store(&s_radio_refs, 0);
+        return;
+    }
+    esp_ieee802154_set_rx_when_idle(false);
+    esp_ieee802154_set_promiscuous(false);
+    esp_ieee802154_disable();
+}
+
+int zb_radio_refs(void) { return atomic_load(&s_radio_refs); }
+
 esp_err_t zbsniff_start(uint8_t channel)
 {
     if (channel < ZB_CH_MIN || channel > ZB_CH_MAX) return ESP_ERR_INVALID_ARG;
@@ -173,9 +206,9 @@ esp_err_t zbsniff_start(uint8_t channel)
         }
     }
 
-    esp_err_t e = esp_ieee802154_enable();
+    esp_err_t e = zb_radio_acquire();
     if (e != ESP_OK) {
-        ESP_LOGE(TAG, "ieee802154_enable failed: %s", esp_err_to_name(e));
+        ESP_LOGE(TAG, "radio acquire failed: %s", esp_err_to_name(e));
         return e;
     }
 
@@ -217,12 +250,24 @@ esp_err_t zbsniff_stop(void)
     atomic_store(&s_on, false);
     atomic_store(&s_task_run, false);
 
-    esp_ieee802154_set_rx_when_idle(false);
-    esp_ieee802154_set_promiscuous(false);
-    esp_ieee802154_disable();   /* 释放射频, 交回 Wi-Fi / BLE 共存仲裁 */
+    /* 引用计数归零时才真关; zbtx 可能还在用同一射频 */
+    zb_radio_release();
 
     ESP_LOGI(TAG, "stopped (total=%u drops=%u)",
              (unsigned)atomic_load(&s_total), (unsigned)atomic_load(&s_drops));
+
+    /* PSRAM 表 (512 * 141B ≈ 72KB) 停就还回去. 留着复用能省一次分配,
+     * 但 health 看到的堆水位会一直低着, 排查内存问题时先得知道它在谁手上. */
+    if (s_tab) {
+        free(s_tab);
+        s_tab = NULL;
+    }
+    atomic_store(&s_st_head, 0);
+    atomic_store(&s_st_tail, 0);
+    atomic_store(&s_written, 0);
+    atomic_store(&s_total, 0);
+    atomic_store(&s_drops, 0);
+
     return ESP_OK;
 }
 

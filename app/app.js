@@ -1839,6 +1839,51 @@ function parseOutputLine(line){
             zbSt.on = false; stopZbPoll(); radar('zbRadar', false); updateZbUI();
             log('[802.15.4] 错误: ' + msg, 'err');
             toast('802.15.4: ' + msg, 'err');
+        } else if (kind === 'TX'){
+            /* zbtx: p = [META, ZB, TX, <子类>, k, v, ...] */
+            const sub = p[3];
+            const kv2 = {};
+            for (let i = 4; i < p.length - 1; i += 2) kv2[p[i]] = p[i+1];
+            /* 任何一条 TX 回执都是这条命令的终点: 先清等待, 再报内容.
+             * 不清的话 App 会一直转圈, 用户看到的是"设备无响应". */
+            if (sub !== 'DRY') clearPendingAction();
+            if (sub === 'START'){
+                log('[802.15.4] 发送通路就绪 · CH' + (kv2.ch || '?'), 'ok');
+            } else if (sub === 'DONE'){
+                /* beaconreq 的子类在 sub 里换成 beaconreq, 字段名也不同 */
+                if (kv2.pans !== undefined){
+                    log('[802.15.4] PAN 发现: 发出 ' + kv2.tx_ok + ' 帧, ' +
+                        kv2.dwell_ms + 'ms 内 ' + kv2.pans + ' 个 PAN',
+                        kv2.pans > 0 ? 'ok' : 'warn');
+                } else {
+                    const cca = parseInt(kv2.cca_busy || '0') || 0;
+                    log('[802.15.4] 发送完成: ok ' + kv2.ok + ' / bad ' + kv2.bad +
+                        (cca ? ' (CCA busy ' + cca + ' 次, 可加 --noca)' : ''),
+                        kv2.bad > 0 ? 'warn' : 'ok');
+                }
+            } else if (sub === 'FLOOD'){
+                log('[802.15.4] 洪泛中 · CH' + kv2.ch + ' · PAN 0x' +
+                    (parseInt(kv2.pan || '0') || 0).toString(16) + ' · ' + kv2.n + ' 帧', 'warn');
+            } else if (sub === 'DRY'){
+                log('[802.15.4] 组帧 (' + kv2.len + ' 字节, 未发送)', 'meta');
+            } else if (sub === 'STATS'){
+                log('[802.15.4] 发送统计: sent ' + kv2.sent + ' / failed ' + kv2.failed +
+                    ' · CH' + kv2.ch, 'meta');
+            } else if (sub === 'NOTE'){
+                log('[802.15.4] ' + (p.slice(4).join(',')), 'meta');
+            } else if (sub === 'STOP'){
+                const e = parseInt(kv2.err || '0') || 0;
+                log('[802.15.4] 发送已停止' + (e ? ' (err=' + e + ')' : ''), e ? 'err' : 'warn');
+            } else if (sub === 'ERR'){
+                log('[802.15.4] 发送失败: ' + (kv2.msg || p.slice(4).join(',')), 'err');
+            } else {
+                log(line, 'meta');
+            }
+        } else if (kind === 'PAN'){
+            /* META,ZB,PAN,pan,0x1a2b,src,0x0,rssi,-70,lqi,80,ch,11 */
+            log('[802.15.4] 发现 PAN 0x' + (parseInt(kv.pan || '0') || 0).toString(16) +
+                ' · src 0x' + (parseInt(kv.src || '0') || 0).toString(16) +
+                ' · rssi ' + kv.rssi + ' · lqi ' + kv.lqi + ' · CH' + kv.ch, 'ok');
         } else {
             log(line, 'meta');
         }
@@ -2839,6 +2884,8 @@ const CLI_REF = [
         { c:'ble power 15',                d:'BLE 发射功率 0-15 (15=+20dBm)' },
         { c:'bleadv eddystone https://a.b', d:'BLE 广播伪造; ibeacon UUID major minor / stop / status' },
         { c:'zbsniff 15',                  d:'802.15.4 嗅探 (11-26); status / dump / clear' },
+        { c:'zbtx beaconreq 15 3000',      d:'Beacon Request 找 Zigbee PAN; 实发要 --yes', danger:true },
+        { c:'zbtx beacon 15 0x1a2b 1',     d:'伪造协调器 beacon; --dry 只组帧, --noca 跳过 CCA', danger:true },
         { c:'ftm range AA:BB:CC:DD:EE:FF 6 8', d:'FTM 测距; 第 2 参数是信道, 目标不在表里时必须给' },
     ]},
     { g:'编排与系统', items:[

@@ -23,6 +23,16 @@
 extern "C" {
 #endif
 
+/* 802.15.4 射频的共享引用计数.
+ * esp_ieee802154_enable() 的 mac_init 不幂等 (重复调用 intr_alloc 报
+ * "No free interrupt inputs for ZB_MAC"); esp_ieee802154_disable() 也不
+ * 幂等 (modem clock refs 减到负数直接断言重启). zbsniff 与 zbtx 会同时开着
+ * (beaconreq 就是先开后发), 所以必须由最后一个使用者负责关.
+ * acquire 返回首个使用者的 enable 结果; release 在计数归零时 disable. */
+esp_err_t zb_radio_acquire(void);
+void     zb_radio_release(void);
+int      zb_radio_refs(void);
+
 /* 802.15.4 2.4 GHz 信道 11..26 (对应 2405..2480 MHz) */
 #define ZB_CH_MIN   11
 #define ZB_CH_MAX   26

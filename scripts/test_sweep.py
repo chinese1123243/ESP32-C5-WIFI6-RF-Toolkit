@@ -36,8 +36,10 @@ FATAL = re.compile(
     r"META,[A-Za-z0-9_]+,ERR[^\n]*no_mem"
     r"|abort\(\)|assert failed|Guru Meditation"
 )
-REJECT = re.compile(r"META,[A-Za-z0-9_]+,ERR[^\n]*")
-REJECT_MSG = re.compile(r"META,[A-Za-z0-9_]+,ERR[^\n]*?,msg,([a-z_0-9]+)")
+# 模块名可以是多段: META,ZB,TX,ERR 与 META,WIFI,ERR 都是合法格式,
+# 单段正则会把前者整个漏掉, 表现为"非法参数被接受了".
+REJECT = re.compile(r"META,[A-Za-z0-9_]+(?:,[A-Za-z0-9_]+)*,ERR[^\n]*")
+REJECT_MSG = re.compile(r"META,[A-Za-z0-9_]+(?:,[A-Za-z0-9_]+)*,ERR[^\n]*?,msg,([a-z_0-9]+)")
 
 # 固件里目前存在的入参校验消息. 不在表里的消息会被当成"未知"单独报出来,
 # 提示去补表, 而不是默默当它不存在.
@@ -56,9 +58,11 @@ KNOWN_REJECT = {
     "unknown_command",        # 固件没有这条命令
     "empty_prefix",           # beaconflood -p "" : 入参校验
     "need_key", "need_key_value", "set_failed", "bad_subcmd",
-    "ieee802154_disabled",    # zbsniff: CONFIG_IEEE802154_ENABLED 未开, 属构建配置
     "start_failed",           # 起不来: 多为前置/配置不满足, 不是崩溃
     "no_ssid", "target_not_in_db", "need_html_subcmd", "bad_subcmd",
+    # zbtx (802.15.4 发送)
+    "need_channel", "bad_frame", "no_such_entry", "bad_payload_hex",
+    "build_failed", "tx_start_failed", "flood_start_failed",
 }
 
 
@@ -256,9 +260,23 @@ CASES = [
 
     ("ftm range 00:11:22:33:44:55 6 2", None, None, None),
 
-    ("zbsniff 11",                    "zbsniff stop", "config: 802.15.4 未启用", "reject"),
-    ("zbsniff status",                None, "config: 802.15.4 未启用", "reject"),
+    ("zbsniff 11",                    "zbsniff stop", None, None),
+    ("zbsniff status",                None, None, None),
     ("zbsniff clear",                 None, None, None),
+    ("zbsniff 30",                    None, "非法信道: 应当被拒", "reject"),
+    ("zbsniff stop",                  None, "重复停止: 应当被拒", "reject"),
+
+    # zbtx: 全部走 --dry, 不在扫全里真的往空口打 802.15.4 帧
+    ("zbtx beacon 11 0x1a2b --dry",   None, None, None),
+    ("zbtx beaconreq 11 --dry",       None, None, None),
+    ("zbtx data 11 0x1234 0x0001 0x0002 deadbeef --dry", None, None, None),
+    ("zbtx beacon 30 --dry",          None, "非法信道: 应当被拒", "reject"),
+    ("zbtx raw 01 --dry",             None, "长度不符: 应当被拒", "reject"),
+    ("zbtx raw 0a88435cffffffff341207 --dry", None, None, None),
+    ("zbtx replay 0 --dry",           None, "空表: 应当被拒", "reject"),
+    ("zbtx stats",                    None, None, None),
+    ("zbtx stop",                     None, "未启动: 应当被拒", "reject"),
+    ("zbtx beacon 11",                None, "缺 --yes: 应当被拒 (need_confirm)", "reject"),
 
     ("scenario survey 2",             None, None, None),
     ("scenario status",               None, None, None),
