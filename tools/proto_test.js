@@ -62,6 +62,7 @@ function setJobActive(){}
 function bandOf(c){ return (+c) >= 36 ? '5G' : '2.4G'; }
 function updateConnInfo(){}
 function renderApList(){}
+function renderGattTree(){}
 function finishApScan(){}
 function dumpAps(){}
 function dumpClients(){}
@@ -268,6 +269,25 @@ check('dry 只报组帧不报发送', /未发送/.test(JSON.stringify(M.logs()))
 M.reset();
 M.feed('META,ZB,TX,ERR,msg,bad_channel (11-26)');
 check('zbtx 参数错误进日志', /bad_channel/.test(JSON.stringify(M.logs())), JSON.stringify(M.logs()));
+
+M.reset(); M.expectConfirm('GATT', 30000);
+M.feed('META,BTGATT,START,mac,e4:1b:43:2c:22:c4,timeout,25000');
+M.feed('META,BTGATT,CONN,addr,e4:1b:43:2c:22:c4,rssi,-83');
+M.feed('META,BTGATT,SVC,uuid,0x1800,hstart,5,hend,13');
+M.feed('META,BTGATT,CHR,uuid,0x2a00,hstart,6,hend,7,val,7,props,R');
+M.feed('META,BTGATT,DSC,uuid,0x2902,handle,4,chr,0');
+M.feed('META,BTGATT,VAL,handle,7,len,22,hex,4d696a6961');
+M.feed('META,BTGATT,DONE,svcs,4,chrs,16,dscs,3,reads,6,ms,14371,result,ok');
+check('GATT 回执清等待', M.pending() === null);
+check('GATT 汇总进日志', /服务 4/.test(JSON.stringify(M.logs())), JSON.stringify(M.logs()));
+
+M.reset();
+M.feed('META,BTGATT,ERR,msg,bad_mac');
+check('GATT 参数错误进日志', /bad_mac/.test(JSON.stringify(M.logs())), JSON.stringify(M.logs()));
+
+M.reset();
+M.feed('META,BTGATT,DONE,svcs,1,chrs,2,dscs,0,reads,0,ms,3000,result,FAIL');
+check('GATT 失败也报出来', /被跳过|有步骤/.test(JSON.stringify(M.logs())), JSON.stringify(M.logs()));
 
 console.log('\n=== 结果: ' + pass + ' passed, ' + fail + ' failed ===');
 process.exit(fail ? 1 : 0);

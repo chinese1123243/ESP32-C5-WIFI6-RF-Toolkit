@@ -16,6 +16,7 @@
 #include "cli.h"
 #include "wifi_attack.h"
 #include "csi.h"
+#include "ble_gatt.h"
 #include "radio_common.h"
 #include "rgb_led.h"
 #include "wifi_db.h"
@@ -1519,6 +1520,51 @@ static int cmd_zbtx(int argc, char **argv)
     return bad ? 1 : 0;
 }
 
+/* gatt: BLE GATT 枚举 (central 角色连第三方设备).
+ * MAC 是人类习惯顺序, 内部转成 NimBLE 小端. */
+static int cmd_gatt(int argc, char **argv)
+{
+    if (argc >= 2 && strcmp(argv[1], "stop") == 0) {
+        esp_err_t e = gatt_stop();
+        if (e != ESP_OK) printf("META,BTGATT,ERR,msg,not_running\n");
+        else            printf("META,BTGATT,STOP,ok,1\n");
+        fflush(stdout);
+        return e == ESP_OK ? 0 : 1;
+    }
+    if (argc >= 2 && strcmp(argv[1], "status") == 0) { gatt_status(); return 0; }
+
+    if (argc < 2) {
+        printf("usage: gatt <mac> [--timeout ms] | stop | status\n");
+        fflush(stdout);
+        return 1;
+    }
+    uint8_t human[6];
+    if (!parse_mac(argv[1], human)) {
+        printf("META,BTGATT,ERR,msg,bad_mac\n"); fflush(stdout); return 1;
+    }
+    uint32_t timeout = 10000;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
+            int v = atoi(argv[++i]);
+            if (v >= 1000 && v <= 60000) timeout = (uint32_t)v;
+        }
+    }
+    /* parse_mac 给的是人类顺序, NimBLE 的 addr.val 是小端, 要反过来 */
+    uint8_t le[6];
+    for (int i = 0; i < 6; i++) le[i] = human[5 - i];
+
+    esp_err_t e = gatt_start(le, timeout);
+    if (e != ESP_OK) {
+        printf("META,BTGATT,ERR,code,%d,msg,start_failed\n", (int)e);
+        fflush(stdout); return 1;
+    }
+    printf("META,BTGATT,START,mac,%02x:%02x:%02x:%02x:%02x:%02x,timeout,%u\n",
+           human[0], human[1], human[2], human[3], human[4], human[5],
+           (unsigned)timeout);
+    fflush(stdout);
+    return 0;
+}
+
 /* ftm: 802.11mc FTM 测距 */
 static int cmd_ftm(int argc, char **argv)
 {
@@ -2201,6 +2247,7 @@ static const cli_cmd_t g_cmds[] = {
     { "karma",       "Probe-request SSID harvester", "clear|follow <n>", cmd_karma, NULL },
     { "eviltwin",    "Clone target AP (SSID+BSSID+channel)", "clone <bssid> [push]|stop", cmd_eviltwin, NULL },
     { "blescan",     "BLE neighbor scan (board-side)", "start|stop|clear", cmd_blescan, NULL },
+    { "gatt",        "BLE GATT enumeration (central)", "<mac> [--timeout ms]|stop|status", cmd_gatt, NULL },
     { "ble",         "BLE TX power control (+20dBm)", "power [<0-15>]", cmd_ble, NULL },
     { "bleadv",      "BLE beacon spoof (iBeacon/Eddystone)", "ibeacon <uuid> <maj> <min> [s]|eddystone <url> [s]|stop|status", cmd_bleadv, NULL },
     { "zbsniff",     "802.15.4 (Zigbee/Thread) sniff", "<ch 11-26>|stop|status|dump|clear", cmd_zbsniff, NULL },

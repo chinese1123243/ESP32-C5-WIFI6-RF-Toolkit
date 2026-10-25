@@ -1660,6 +1660,55 @@ function parseOutputLine(line){
         return;
     }
 
+    /* BLE GATT 枚举 (META,BTGATT,<KIND>,...).
+     * 这里把属性清单渲染成一个可折叠的文本块, 不做成表格: 一个设备的属性
+     * 动辄几十条, 表格在小屏上要横滚, 反而看不出服务分组. */
+    if (line.startsWith('META,BTGATT,')){
+        const p = line.split(',');
+        const kind = p[2];
+        if (kind === 'SVC'){
+            gattTree.push({ t:'svc', uuid: p[4] || '', a: p[6] || '', b: p[8] || '' });
+        } else if (kind === 'CHR'){
+            gattTree.push({ t:'chr', uuid: p[4] || '', val: p[10] || '',
+                            props: p[12] || '', a: p[6] || '', b: p[8] || '' });
+        } else if (kind === 'DSC'){
+            gattTree.push({ t:'dsc', uuid: p[4] || '', h: p[6] || '' });
+        } else if (kind === 'VAL'){
+            /* VAL,handle,<h>,len,<n>,hex,<可能很长的一段> */
+            gattTree.push({ t:'val', h: p[4] || '', len: p[6] || '',
+                            hex: p.slice(8).join(',') });
+        } else if (kind === 'CONN'){
+            clearPendingAction();
+            gattAddr = p[4] || '';
+            gattRssi = p[6] || '';
+            gattTree = [];
+            log('[GATT] 已连接 ' + gattAddr + (gattRssi ? ' · rssi ' + gattRssi : ''), 'ok');
+        } else if (kind === 'START'){
+            gattTree = [];
+            log('[GATT] 开始枚举 ' + (p[4] || ''), 'meta');
+        } else if (kind === 'DONE'){
+            const kv = {};
+            for (let i = 3; i < p.length - 1; i += 2) kv[p[i]] = p[i+1];
+            renderGattTree(kv);
+            const ok = kv.result === 'ok';
+            log('[GATT] 完成 · 服务 ' + (kv.svcs||0) + ' · 特征 ' + (kv.chrs||0) +
+                ' · 描述符 ' + (kv.dscs||0) + ' · 读到 ' + (kv.reads||0) +
+                ' · ' + (kv.ms||0) + 'ms' + (ok ? '' : ' · 有步骤被跳过'),
+                ok ? 'ok' : 'warn');
+        } else if (kind === 'STATUS'){
+            const kv = {};
+            for (let i = 3; i < p.length - 1; i += 2) kv[p[i]] = p[i+1];
+            log('[GATT] 状态 ' + (kv.on === '1' ? ('进行中 · ' + kv.step) : '空闲') +
+                ' · 服务 ' + kv.svcs + ' · 特征 ' + kv.chrs, 'meta');
+        } else if (kind === 'ERR'){
+            clearPendingAction();
+            log('[GATT] 失败: ' + p.slice(3).join(','), 'err');
+        } else if (kind === 'STOP'){
+            log('[GATT] 已停止', 'warn');
+        }
+        return;
+    }
+
     /* 工具台: BLE 广播伪造 (META,BLE,ADV,<KIND>,k,v,...)
      * 注意协议里 ADV 后面紧跟的才是子命令 (START/STOP/STATUS/ERR),
      * 因此 kv 从 p[4] 开始取, 未知字段一律忽略. */
@@ -2402,6 +2451,11 @@ let cliScanLeft  = 0;
 let cliDumpFallback = null;
 let bleScanning   = false;
 let blePollTimer  = null;
+/* GATT 枚举结果: 按到达顺序存, 渲染时再分组 */
+let gattTree   = [];
+let gattAddr   = '';
+let gattRssi  = '';
+let bleSelAddr = '';   /* 设备列表里当前选中的地址, GATT 枚举用它 */
 
 function apScanState(txt){ const el = $('apScanState'); if (el) el.textContent = txt; }
 function cliScanState(txt){ const el = $('cliScanState'); if (el) el.textContent = txt; }
@@ -2884,6 +2938,7 @@ const CLI_REF = [
         { c:'ble power 15',                d:'BLE 发射功率 0-15 (15=+20dBm)' },
         { c:'bleadv eddystone https://a.b', d:'BLE 广播伪造; ibeacon UUID major minor / stop / status' },
         { c:'zbsniff 15',                  d:'802.15.4 嗅探 (11-26); status / dump / clear' },
+        { c:'gatt <mac> --timeout 25000', d:'BLE GATT 枚举: 服务/特征/描述符/读值', danger:true },
         { c:'zbtx beaconreq 15 3000',      d:'Beacon Request 找 Zigbee PAN; 实发要 --yes', danger:true },
         { c:'zbtx beacon 15 0x1a2b 1',     d:'伪造协调器 beacon; --dry 只组帧, --noca 跳过 CCA', danger:true },
         { c:'ftm range AA:BB:CC:DD:EE:FF 6 8', d:'FTM 测距; 第 2 参数是信道, 目标不在表里时必须给' },
@@ -3431,6 +3486,62 @@ function renderKarma(){
 }
 
 /* BLE 近邻设备列表 (按信号降序) */
+/* GATT 枚举结果渲染.
+ * 输出按服务分段, 特征列句柄与权限位, 读到的值把 hex 转成可打印文本附在后面.
+ * 不做表格: 属性动辄几十条, 小屏上表格要横滚, 看不出服务分组. */
+function renderGattTree(kv){
+    const box = $('gattTree');
+    if (!box) return;
+    const head = document.createElement('div');
+    head.className = 'gatt-head';
+    head.textContent = (gattAddr || '设备') + ' · ' + (kv.svcs || 0) + ' 服务 / ' +
+        (kv.chrs || 0) + ' 特征 / ' + (kv.reads || 0) + ' 个值' +
+        (kv.result === 'ok' ? '' : ' · 有步骤被看门狗跳过');
+    box.appendChild(head);
+
+    let curSvc = null;
+    let svcEl = null;
+    const lines = [];
+    for (const it of gattTree){
+        if (it.t === 'svc'){
+            curSvc = it;
+            svcEl = document.createElement('div');
+            svcEl.className = 'gatt-svc';
+            svcEl.textContent = '服务 ' + it.uuid + '  [' + it.a + '..' + it.b + ']';
+            box.appendChild(svcEl);
+            lines.length = 0;
+        } else if (it.t === 'chr' && svcEl){
+            const d = document.createElement('div');
+            d.className = 'gatt-chr';
+            d.textContent = '  特征 ' + it.uuid + '  val=' + it.val +
+                            '  ' + (it.props || '-');
+            svcEl.appendChild(d);
+        } else if (it.t === 'dsc' && svcEl){
+            const d = document.createElement('div');
+            d.className = 'gatt-dsc';
+            d.textContent = '    描述符 ' + it.uuid + ' @' + it.h;
+            svcEl.appendChild(d);
+        } else if (it.t === 'val' && svcEl){
+            const d = document.createElement('div');
+            d.className = 'gatt-val';
+            /* 长度大于 0 才尝试转文本, 空值是正常的 (设备返回 0 字节) */
+            let txt = '';
+            const n = parseInt(it.len || '0', 10) || 0;
+            if (n > 0 && it.hex){
+                const bytes = [];
+                for (let i = 0; i + 1 < it.hex.length; i += 2){
+                    bytes.push(parseInt(it.hex.substr(i, 2), 16));
+                }
+                txt = ' = ' + JSON.parse('"' +
+                    bytes.map(b => b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : '.').join('') + '"');
+            }
+            d.textContent = '    值 @' + it.h + ' (' + it.len + 'B)' + txt;
+            svcEl.appendChild(d);
+        }
+    }
+    gattTree = [];
+}
+
 function renderBleDev(){
     const box = $('bledevList');
     if (!box) return;
@@ -3456,7 +3567,13 @@ function renderBleDev(){
               `<div class="meta"><span>${d.addr}</span></div>` +
             `</div>` +
             `<div class="rssi">${d.rssi} dBm</div>`;
-        item.addEventListener('click', () => copyText(d.addr));
+        item.dataset.addr = d.addr;
+        if (d.addr === bleSelAddr) item.classList.add('sel');
+        /* 点选而非复制: GATT 枚举要用这一台的地址, 复制反而没地方粘贴 */
+        item.addEventListener('click', () => {
+            bleSelAddr = (bleSelAddr === d.addr) ? '' : d.addr;
+            renderBleDev();
+        });
         box.appendChild(item);
     }
     if (cntEl) cntEl.textContent = bleDevList.length + ' 个设备' + (bleScanning ? ' · 扫描中' : '');
@@ -3549,6 +3666,36 @@ $('btnBleScanClear').addEventListener('click', () => {
     renderBleDev();
     bleScanState('已清空（设备端同步清除）');
     sendCmd('blescan clear');
+});
+
+/* GATT 枚举: 用设备列表里当前选中那一台的地址 */
+function gattSelected(){
+    if (!bleSelAddr){
+        toast('先在设备列表里点选一台', 'err');
+        return null;
+    }
+    return bleSelAddr;
+}
+$('btnGattEnum').addEventListener('click', () => {
+    if (!connected){ toast('请先连接设备', 'err'); return; }
+    const addr = gattSelected();
+    if (!addr) return;
+    const box = $('gattTree');
+    if (box) box.innerHTML = '<div class="list-empty">枚举中…</div>';
+    gattTree = [];
+    gattAddr = addr;
+    $('gattState').textContent = '枚举 ' + addr + ' 中…';
+    /* 一台设备的属性可能上百条, 每条一行, 给足超时 */
+    expectConfirm('GATT', 30000);
+    sendCmd('gatt ' + addr + ' --timeout 25000');
+});
+$('btnGattRefresh').addEventListener('click', () => {
+    if (!connected){ toast('请先连接设备', 'err'); return; }
+    sendCmd('gatt status');
+});
+$('btnGattStop').addEventListener('click', () => {
+    if (!connected){ toast('请先连接设备', 'err'); return; }
+    sendCmd('gatt stop');
 });
 
 renderBleDev();

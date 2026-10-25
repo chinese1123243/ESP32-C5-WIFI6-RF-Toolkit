@@ -276,6 +276,13 @@ CASES = [
     ("zbtx replay 0 --dry",           None, "空表: 应当被拒", "reject"),
     ("zbtx stats",                    None, None, None),
     ("zbtx stop",                     None, "未启动: 应当被拒", "reject"),
+
+    ("gatt",                         None, "缺 MAC: 只打 usage 不崩", None),
+    ("gatt zz",                      None, "坏 MAC: 应当被拒", "reject"),
+    ("gatt 00:11:22:33:44:55",        None, "枚举不存在的设备: 超时后自行收尾", None),
+    ("gatt status",                  None, None, None),
+    # 枚举还在 10s 超时窗口内, stop 成功是正确行为, 不算"应当被拒"
+    ("gatt stop",                    None, "中止在跑的枚举", None),
     ("zbtx beacon 11",                None, "缺 --yes: 应当被拒 (need_confirm)", "reject"),
 
     ("scenario survey 2",             None, None, None),

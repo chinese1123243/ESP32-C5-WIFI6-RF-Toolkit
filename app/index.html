@@ -870,6 +870,23 @@ button.mi{ width:100%; background:none; border:0; text-align:left; font:inherit;
               <div class="list-empty">点击「开始扫描」发现附近 BLE 设备</div>
             </div>
           </div>
+          <h3 style="margin-top:14px">GATT 枚举<span class="h3-sub">Central</span></h3>
+          <div class="note">对上面列表里的设备逐个走 服务 → 特征 → 描述符 → 读值。会占用 BLE 连接，控制链（NUS）不受影响。</div>
+          <div class="actions">
+            <button class="btn primary" id="btnGattEnum">枚举选中设备</button>
+            <button class="btn" id="btnGattRefresh">刷新状态</button>
+            <button class="btn danger" id="btnGattStop">停止</button>
+          </div>
+          <div class="note" id="gattState">就绪</div>
+          <div class="list-panel open" id="gattPanel">
+            <div class="list-head">
+              <span>GATT 属性树</span>
+              <span class="ht" id="gattCount">0</span>
+            </div>
+            <div class="list-body" id="gattTree">
+              <div class="list-empty">在设备列表里选中一台，点「枚举选中设备」</div>
+            </div>
+          </div>
         </div>
       </section>
 
