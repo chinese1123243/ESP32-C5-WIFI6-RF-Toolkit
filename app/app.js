@@ -617,7 +617,8 @@ const CTRL_IDS = ['btnSniff','btnStop','btnScanApFast','btnScanApDeep','btnScanA
     'btnRawTx','btnRawDeauth','btnRawBeacon','btnRawProbeResp','btnRawAuth',
     'btnBleScanStart','btnBleScanStop','btnBleScanRefresh','btnBleScanClear',
     /* 工具台 (Tools) */
-    'advTypeI','advTypeE','advUuid','advMajor','advMinor','advUrl','advSec',
+    'advTypeI','advTypeE','advTypeP','advUuid','advMajor','advMinor','advUrl','advSec',
+    'advPopFP','advPopSP','advPopCT','advPopupModel',
     'advStart','advStop','advStatus',
     'ftmApSelect','ftmBssid','ftmCh','ftmCount','ftmRun',
     'zbCh','zbStart','zbStop','zbRefresh','zbDump','zbClear',
@@ -3777,7 +3778,9 @@ function clampInt(v, lo, hi, def){
 
 /* A1: BLE 广播伪造 (bleadv) */
 function advTypeZh(t){
-    return t === 'ibeacon' ? 'iBeacon' : t === 'eddystone' ? 'Eddystone' : '未运行';
+    return t === 'ibeacon' ? 'iBeacon' : t === 'eddystone' ? 'Eddystone' :
+           t === 'fastpair' ? 'Fast Pair' : t === 'swiftpair' ? 'SwiftPair' :
+           t === 'continuity' ? 'Continuity' : '未运行';
 }
 function startAdvTick(){
     if (advTick) clearInterval(advTick);
@@ -3816,9 +3819,21 @@ document.querySelectorAll('#advSeg [data-adv]').forEach(b => {
     b.addEventListener('click', () => {
         advMode = b.dataset.adv;
         document.querySelectorAll('#advSeg [data-adv]').forEach(x => x.classList.toggle('on', x === b));
-        const ib = $('advIbeacon'), ed = $('advEddystone');
+        const ib = $('advIbeacon'), ed = $('advEddystone'), pp = $('advPopup');
         if (ib) ib.classList.toggle('hidden', advMode !== 'ibeacon');
         if (ed) ed.classList.toggle('hidden', advMode !== 'eddystone');
+        if (pp) pp.classList.toggle('hidden', advMode !== 'popup');
+    });
+});
+/* 弹窗子类型三选一 */
+let advPopupKind = 'fastpair';
+document.querySelectorAll('#advPopupSeg [data-pop]').forEach(b => {
+    b.addEventListener('click', () => {
+        advPopupKind = b.dataset.pop;
+        document.querySelectorAll('#advPopupSeg [data-pop]').forEach(x => x.classList.toggle('on', x === b));
+        /* Model ID 只在 Fast Pair 下有意义 */
+        const mf = $('advPopupModelField');
+        if (mf) mf.classList.toggle('hidden', advPopupKind !== 'fastpair');
     });
 });
 $('advStart').addEventListener('click', () => {
@@ -3838,6 +3853,13 @@ $('advStart').addEventListener('click', () => {
         const minor = clampInt($('advMinor').value, 0, 65535, 0);
         $('advMajor').value = major; $('advMinor').value = minor;
         cmd = 'bleadv ibeacon ' + uuid + ' ' + major + ' ' + minor + ' ' + sec;
+    } else if (advMode === 'popup'){
+        if (advPopupKind === 'fastpair'){
+            const model = ($('advPopupModel').value || '').trim();
+            cmd = 'bleadv popup fastpair' + (model ? ' ' + model : '') + ' ' + sec;
+        } else {
+            cmd = 'bleadv popup ' + advPopupKind + ' ' + sec;
+        }
     } else {
         const url = ($('advUrl').value || '').trim();
         if (!url){ markValid('advUrl', false); toast('请输入 Eddystone URL', 'err'); return; }

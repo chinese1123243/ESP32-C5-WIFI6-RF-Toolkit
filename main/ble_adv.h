@@ -25,6 +25,9 @@ typedef enum {
     BLEADV_NONE = 0,
     BLEADV_IBEACON,
     BLEADV_EDDYSTONE,
+    BLEADV_FASTPAIR,
+    BLEADV_SWIFTPAIR,
+    BLEADV_CONTINUITY,
 } bleadv_type_t;
 
 /* 启动 iBeacon 广播.
@@ -37,6 +40,17 @@ int bleadv_ibeacon(const char *uuid, uint16_t major, uint16_t minor, int sec);
  * url: 完整 URL (http(s)://...).
  * sec: 持续秒数, 0 = 无限. */
 int bleadv_eddystone(const char *url, int sec);
+
+/* 弹窗模板 (研究用途, 触发取决于目标设备系统与厂商反滥用机制):
+ *   fastpair:   Google Fast Pair, Service Data 0xFE2C. model_id 3 字节, 须是
+ *               Google 注册过的真实 ID 才可能弹, 0 = 占位不弹.
+ *   swiftpair:  Microsoft SwiftPair, Manufacturer Data 0x0006.
+ *   continuity: Apple Continuity 邻近配对, Manufacturer Data 0x004C type 0x07.
+ *               载荷加密且 iOS 校验, 伪造帧绝大多数被静默丢弃.
+ * sec: 持续秒数, 0 = 无限. */
+int bleadv_fastpair(uint32_t model_id, int sec);
+int bleadv_swiftpair(int sec);
+int bleadv_continuity(int sec);
 
 /* 停止当前伪造广播并恢复 NUS. */
 int bleadv_stop(void);

@@ -63,6 +63,8 @@ KNOWN_REJECT = {
     # zbtx (802.15.4 发送)
     "need_channel", "bad_frame", "no_such_entry", "bad_payload_hex",
     "build_failed", "tx_start_failed", "flood_start_failed",
+    # bleadv popup
+    "bad_popup_type",
 }
 
 
@@ -176,6 +178,11 @@ CASES = [
     ("bleadv eddystone",              "bleadv stop", None, None),
     ("bleadv ibeacon 426C7565-4368-6172-6D42-6561636F6E00 1 1 3",
                                       None, None, None),
+    ("bleadv popup",                  None, "缺类型: 只打 usage 不崩", None),
+    ("bleadv popup bogus",            None, "坏类型: 应当被拒", "reject"),
+    ("bleadv popup fastpair 1",       "bleadv stop", None, None),
+    ("bleadv popup swiftpair 1",      "bleadv stop", None, None),
+    ("bleadv popup continuity 1",     "bleadv stop", None, None),
 
     ("sniff 6",                       "stop", "2.4G 定信道", None),
     ("sniff auto",                    "stop", "自动跳信道", None),

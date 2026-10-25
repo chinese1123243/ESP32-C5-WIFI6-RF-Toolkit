@@ -1679,7 +1679,36 @@ static int cmd_bleadv(int argc, char **argv)
         bleadv_eddystone(argv[2], sec);
         return 0;
     }
-    printf("usage: bleadv <ibeacon <uuid> <major> <minor> [sec]|eddystone <url> [sec]|stop|status>\n");
+    if (argc >= 2 && strcmp(argv[1], "popup") == 0) {
+        if (argc < 3) {
+            printf("usage: bleadv popup <fastpair [modelid]|swiftpair|continuity> [sec]\n");
+            fflush(stdout);
+            return 1;
+        }
+        int sec = 0;
+        if (strcmp(argv[2], "fastpair") == 0) {
+            /* fastpair [modelid] [sec]: modelid 是 3 字节 hex (0x 前缀或纯 hex).
+             * 缺省 0 = 占位, Google 服务端查不到, 不会弹. */
+            uint32_t model = 0;
+            int arg = 3;
+            if (argc > arg && argv[arg][0] != '-' ) {
+                model = (uint32_t)strtoul(argv[arg], NULL, 0);
+                arg++;
+            }
+            if (argc > arg) sec = atoi(argv[arg]);
+            if (model > 0xFFFFFF) model = 0xFFFFFF;
+            bleadv_fastpair(model, sec);
+            return 0;
+        }
+        if (argc > 3) sec = atoi(argv[3]);
+        if (sec < 0) sec = 0;
+        if (strcmp(argv[2], "swiftpair") == 0) { bleadv_swiftpair(sec); return 0; }
+        if (strcmp(argv[2], "continuity") == 0) { bleadv_continuity(sec); return 0; }
+        printf("META,BLE,ADV,ERR,msg,bad_popup_type (fastpair|swiftpair|continuity)\n");
+        fflush(stdout);
+        return 1;
+    }
+    printf("usage: bleadv <ibeacon|eddystone|popup|stop|status>\n");
     fflush(stdout);
     return 1;
 }
