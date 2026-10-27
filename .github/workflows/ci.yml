@@ -1,0 +1,65 @@
+name: 离线校验
+
+# 不插板能跑的检查都在这里。
+#
+# 需要硬件的不进 CI：selftest_b4 / test_inject / test_sweep 都要串口，
+# 靠本地跑，见 CONTRIBUTING.md。
+#
+# APK 也不在这里构建：Capacitor 的 Android 产物要 JDK 加 Android SDK，
+# 跑一次十几分钟，收益配不上。前端正确性由下面三个 node 校验覆盖。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  protocol:
+    name: 协议与前端校验
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: NUS 二进制帧协议
+        run: node tools/nus_test.js
+
+      - name: META 输出协议
+        run: node tools/proto_test.js
+
+      - name: 固件与前端一致性
+        run: node tools/ui_check.js
+
+  scripts:
+    name: 脚本可编译
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装 pyserial
+        run: pip install pyserial
+
+      - name: 编译全部脚本
+        run: python -m compileall -q scripts tools
+
+  slop:
+    name: 注释质量扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 只报告不拦，退出码恒为 0。看输出里的命中数即可。
+      - name: 扫描 AI 味注释
+        run: python scripts/check_slop.py
