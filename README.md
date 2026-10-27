@@ -209,7 +209,9 @@ sdkconfig.defaults  编译配置默认值（入库，sdkconfig 不入库）
 
 ## 路线图
 
-见 [ROADMAP.md](ROADMAP.md)。当前主线是架构治理：射频仲裁器、HAL 化与 CI、Job 户籍账本，之后是可观测性与目标设备画像。
+见 [ROADMAP.md](ROADMAP.md)。当前阶段是 S1 治理地基：LICENSE、射频仲裁器、判例库、HAL 化与 CI。之后是可观测性、契约治理与设备画像。
+
+阶段用 S1 到 S5 标记，不绑定版本号。多数阶段是内部重构，版本号按 semver 走，全部做完预计停在 2.6 到 2.8。
 
 规划讨论进 [Issues](../../issues)，带 `roadmap` 标签。
 
