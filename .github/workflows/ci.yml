@@ -44,8 +44,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 安装 pyserial
-        run: pip install pyserial
+      - name: 安装脚本依赖
+        run: pip install -r scripts/requirements.txt
 
       - name: 编译全部脚本
         run: python -m compileall -q scripts tools
