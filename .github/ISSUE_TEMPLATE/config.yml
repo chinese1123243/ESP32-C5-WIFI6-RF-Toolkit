@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 路线图
+    url: https://github.com/chinese1123243/ESP32-C5-WIFI6-RF-Toolkit/blob/main/ROADMAP.md
+    about: 先看规划里有没有。
+  - name: 使用问题
+    url: https://github.com/chinese1123243/ESP32-C5-WIFI6-RF-Toolkit/blob/main/docs/%E4%BD%BF%E7%94%A8%E6%8C%87%E5%8D%97.md
+    about: 操作流程与常见问题见使用指南。
+  - name: 安全漏洞
+    url: https://github.com/chinese1123243/ESP32-C5-WIFI6-RF-Toolkit/security/advisories
+    about: 别在公开 issue 里发漏洞细节，走 Security Advisories。
