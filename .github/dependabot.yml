@@ -1,0 +1,34 @@
+version: 2
+updates:
+  # App 前端依赖（Capacitor / TypeScript）
+  - package-ecosystem: npm
+    directory: "/app"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+      include: scope
+    labels:
+      - dependencies
+    groups:
+      # Capacitor 各插件版本互相牵制，一起升
+      capacitor:
+        patterns:
+          - "@capacitor/*"
+          - "@capacitor-community/*"
+      typescript:
+        patterns:
+          - "typescript"
+
+  # GitHub Actions（目前没有 workflow，先占位，加了就自动接管）
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
