@@ -1,34 +1,119 @@
 version: 2
+
+# 说明见 docs 与 CONTRIBUTING.md。要点：
+#   · Capacitor 的 major 升级一律忽略，人工迁移（理由见下方 ignore）
+#   · cooldown 只作用于版本更新，安全更新永远立即开 PR，不受这些设置影响
+
 updates:
-  # App 前端依赖（Capacitor / TypeScript）
-  - package-ecosystem: npm
+  # ---------- App 前端 ----------
+  - package-ecosystem: "npm"
     directory: "/app"
     schedule:
-      interval: weekly
-      day: monday
+      interval: "weekly"
+      day: "monday"
+      time: "04:00"
+      timezone: "Asia/Shanghai"
     open-pull-requests-limit: 5
+    versioning-strategy: "increase"
+    rebase-strategy: "auto"
+
+    # 新版本先放一放再提。major 放满 30 天，让别人先踩坑。
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 7
+      semver-patch-days: 3
+
     commit-message:
       prefix: "deps"
-      include: scope
+      prefix-development: "deps-dev"
+      include: "scope"
     labels:
-      - dependencies
-    groups:
-      # Capacitor 各插件版本互相牵制，一起升
-      capacitor:
-        patterns:
-          - "@capacitor/*"
-          - "@capacitor-community/*"
-      typescript:
-        patterns:
-          - "typescript"
+      - "dependencies"
+      - "npm"
+    reviewers:
+      - "chinese1123243"
+    assignees:
+      - "chinese1123243"
 
-  # GitHub Actions（目前没有 workflow，先占位，加了就自动接管）
-  - package-ecosystem: github-actions
+    # 组按顺序匹配，先命中的生效。capacitor-dev 要排在 capacitor-plugins
+    # 前面，否则 @capacitor/cli 会被 "@capacitor/*" 先抓走。
+    groups:
+      capacitor-core:
+        patterns:
+          - "@capacitor/core"
+          - "@capacitor/android"
+      capacitor-dev:
+        patterns:
+          - "@capacitor/cli"
+          - "typescript"
+      capacitor-plugins:
+        patterns:
+          - "@capacitor-community/*"
+          - "@capacitor/*"
+      npm-others:
+        patterns:
+          - "*"
+
+    # Capacitor 跨 major 不是改版本号的事：Android SDK 要求、插件 API、
+    # 权限模型都会变，bluetooth-le 尤其。这类升级人工做，开一个 issue 单独跟。
+    # 6.x 内部的 minor / patch 照常自动提。
+    ignore:
+      - dependency-name: "@capacitor/core"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@capacitor/android"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@capacitor/cli"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@capacitor/*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@capacitor-community/*"
+        update-types: ["version-update:semver-major"]
+
+  # ---------- 上位机脚本 ----------
+  - package-ecosystem: "pip"
+    directory: "/scripts"
+    schedule:
+      interval: "monthly"
+      day: "monday"
+      time: "04:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 3
+    versioning-strategy: "increase"
+    cooldown:
+      default-days: 7
+    # pip 在解析 setup.py 时会执行代码，这里显式拒绝。
+    insecure-external-code-execution: "deny"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "python"
+    reviewers:
+      - "chinese1123243"
+
+  # ---------- GitHub Actions ----------
+  - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: monthly
-    open-pull-requests-limit: 5
+      interval: "monthly"
+      day: "monday"
+      time: "04:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 3
+    # actions 的 semver-* 冷却支持不统一，只用 default-days。
+    cooldown:
+      default-days: 7
     commit-message:
-      prefix: "deps"
+      prefix: "deps-ci"
     labels:
-      - dependencies
+      - "dependencies"
+      - "ci"
+    reviewers:
+      - "chinese1123243"
+    # 三个 action 合成一个 PR，不要一条一个。
+    groups:
+      actions:
+        patterns:
+          - "*"
