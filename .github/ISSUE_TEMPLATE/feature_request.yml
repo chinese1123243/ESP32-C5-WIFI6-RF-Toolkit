@@ -1,0 +1,61 @@
+name: 功能请求
+description: 新增命令、新增能力、现有能力增强
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决什么
+      description: 现在做不了或做得很别扭的地方
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 具体做法
+      description: 命令形态、参数、META 输出字段名（新增的话）
+    validations:
+      required: true
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: 涉及层
+      options:
+        - 侦察
+        - 捕获
+        - 注入
+        - 诱捕
+        - 测量
+        - 跨射频（802.15.4）
+        - 编排
+        - 系统 / 协议
+        - App 前端
+        - 不确定
+    validations:
+      required: true
+
+  - type: textarea
+    id: radio
+    attributes:
+      label: 射频占用
+      description: 需要 RX 混杂、TX 注入、SoftAP、802.15.4 还是 BLE Central？单射频，会跟现有功能互斥。
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 考虑过的其他做法
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 确认
+      options:
+        - label: 搜过现有 issue，没有重复
+          required: true
+        - label: 符合项目使用边界（自有或已授权网络）
+          required: true
