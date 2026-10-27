@@ -1,0 +1,12 @@
+# 上位机脚本依赖。固件编译走 ESP-IDF，不在这里。
+#
+# 只有需要串口或绘图的脚本用到：
+#   selftest_b4 / test_inject / test_sweep / monitor / tui  -> pyserial
+#   algo_bench（算法基准，可选）                            -> numpy, matplotlib
+# 其余脚本只用标准库。
+
+pyserial>=3.5
+
+# algo_bench.py 绘图用，不跑算法基准就不用装。
+numpy>=1.24
+matplotlib>=3.7
