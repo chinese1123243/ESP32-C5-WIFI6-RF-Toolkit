@@ -1,0 +1,82 @@
+name: Bug 报告
+description: 功能不符合预期、崩溃、卡死
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: 提交前先跑 `python scripts/test_sweep.py COM4`，确认不是已知问题。
+
+  - type: input
+    id: firmware
+    attributes:
+      label: 固件版本
+      description: `version` 命令的输出
+      placeholder: "2.4.1"
+    validations:
+      required: true
+
+  - type: input
+    id: board
+    attributes:
+      label: 硬件
+      placeholder: "Waveshare ESP32-C5-WIFI6-N16R8"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: channel
+    attributes:
+      label: 控制通道
+      options:
+        - 串口 REPL
+        - 手机 App（BLE）
+        - 板载 HTTP
+        - 都复现
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 输入的具体命令序列，含参数
+      placeholder: |
+        1. sniff 6
+        2. deauth -b aa:bb:cc:dd:ee:ff -n 100
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际
+      description: 串口输出、META 行、崩溃现场（有的话）
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: 串口完整输出，或 `log` 命令内容
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 确认
+      options:
+        - label: 已在自有或已授权网络上测试
+          required: true
+        - label: 跑过 test_sweep.py
+          required: false
