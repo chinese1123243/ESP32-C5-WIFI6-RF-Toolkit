@@ -9,4 +9,4 @@ pyserial>=3.5
 
 # algo_bench.py 绘图用，不跑算法基准就不用装。
 numpy>=1.24
-matplotlib>=3.7
+matplotlib>=3.11.2
