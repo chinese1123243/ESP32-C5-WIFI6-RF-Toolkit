@@ -61,7 +61,7 @@ typedef struct {
 void ie_parse_ap(const uint8_t *frame, int len, ap_caps_t *out);
 void ie_parse_ies(const uint8_t *ies, int len, ap_caps_t *out);
 
-/* "11ax" / "11ac" / "11n" / "11a" */
+/* "11ax" / "11ac" / "11n" / "11a/g" */
 const char *caps_std_str(const ap_caps_t *c);
 /* AKM 位图 -> "PSK/SAE" 之类的短串 */
 void caps_akm_str(const ap_caps_t *c, char *out, size_t out_sz);

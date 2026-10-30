@@ -5,7 +5,7 @@
  *   (ie[off] | ie[off+1]<<8) 再与 0x0008 比较. 但套件是 4 字节:
  *   OUI(00 0F AC) + type, 前两字节恒为 00 0F → 比较永远失败,
  *   于是 SAE (WPA3) 全部被误判成 WPA2, 而 WPA3 的握手是破不了的.
- *   同时 caps & 0x0080 是 MFPR (PMF 必需), 被笼统当成 "支持 PMF".
+ *   同时 RSN Capabilities 的 B6/B7 (MFPR/MFPC) 被当成一件事, 见 parse_rsn_ie.
  */
 #include "ie_parse.h"
 
@@ -72,12 +72,13 @@ static void parse_rsn_ie(const uint8_t *ie, int n, ap_caps_t *c)
     }
     if (off + 2 <= n) {                           /* RSN Capabilities */
         uint16_t rc = (uint16_t)(ie[off] | (ie[off + 1] << 8));
-        /* B6 = MFPC (支持 PMF), B7 = MFPR (强制 PMF).
-         * 实测有 AP 只发 MFPR 不发 MFPC (抓到 0x008C: B2 PeerKey | B3 JMB | B7 MFPR),
-         * 规范上 MFPR 隐含 MFPC, 所以这里做归一化, 免得 UI 上出现
-         * 「必需=1 但支持=0」这种自相矛盾的展示. */
-        if (rc & 0x0040) c->pmf |= CAP_PMF_CAPABLE;
-        if (rc & 0x0080) c->pmf |= CAP_PMF_CAPABLE | CAP_PMF_REQUIRED;
+        /* 802.11 RSN Capabilities: B6 = MFPR (强制 PMF), B7 = MFPC (支持 PMF).
+         * 这两位的含义原先写反了, 后果不是显示错, 是判断错:
+         *   只置 MFPC 的过渡模式 AP (实测抓到 0x008C = B2|B3|B7) 被判成"强制 PMF",
+         *   固件于是自己把 deauth 挡掉; 真正强制 PMF 的 AP (0x0040) 反倒放行.
+         * 规范上 MFPR 隐含 MFPC, 置了 MFPR 就把 CAPABLE 一并补上. */
+        if (rc & 0x0080) c->pmf |= CAP_PMF_CAPABLE;
+        if (rc & 0x0040) c->pmf |= CAP_PMF_CAPABLE | CAP_PMF_REQUIRED;
     }
 }
 
