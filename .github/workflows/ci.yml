@@ -50,6 +50,21 @@ jobs:
       - name: 编译全部脚本
         run: python -m compileall -q scripts tools
 
+  arch:
+    name: 架构红线
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 棘轮闸门: 命令名唯一性必须为 0; 行数 / META 处数 / 反向依赖不许变差.
+      # 每还掉一笔欠账, 就把 scripts/arch_check.py 里的基线数字下调.
+      - name: 架构红线
+        run: python scripts/arch_check.py
+
   slop:
     name: 注释质量扫描
     runs-on: ubuntu-latest
