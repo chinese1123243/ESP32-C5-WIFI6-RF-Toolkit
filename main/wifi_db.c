@@ -6,6 +6,7 @@
  */
 #include "wifi_db.h"
 #include "ie_parse.h"
+#include "wifi_names.h"
 #include "radio_common.h"
 
 #include <stdio.h>
@@ -80,18 +81,7 @@ const char *oui_lookup(const uint8_t mac[3])
     return "Unknown";
 }
 
-const char *enc_str(uint8_t enc)
-{
-    switch (enc) {
-    case 0: return "OPEN";
-    case 1: return "WEP";
-    case 2: return "WPA";
-    case 3: return "WPA2";
-    case 4: return "WPA3";
-    case 5: return "WPA/W2";
-    default: return "?";
-    }
-}
+const char *enc_str(uint8_t enc) { return wifi_enc_str(enc); }
 
 /* Storage (PSRAM) */
 static ap_entry_t     *s_aps     = NULL;
@@ -396,21 +386,10 @@ bool wifi_db_check_eapol(const uint8_t *frame, int len, int8_t rssi)
 /* 由 ap_entry_t 还原出 ap_caps_t, 好复用 ie_parse 的字符串化函数 */
 static void caps_from_entry(const ap_entry_t *e, ap_caps_t *c)
 {
-    memset(c, 0, sizeof(*c));
-    c->akm    = e->akm;
-    c->cipher = e->cipher;
-    c->ht = e->ht; c->vht = e->vht; c->he = e->he;
-    c->bw  = e->bw;
-    c->pmf = (e->pmf_cap ? CAP_PMF_CAPABLE : 0) | (e->pmf ? CAP_PMF_REQUIRED : 0);
+    wifi_caps_from_entry(e, c);
 }
 
-static const char *cipher_str(uint8_t m)
-{
-    if (m & CAP_CIPHER_GCMP) return "GCMP";
-    if (m & CAP_CIPHER_CCMP) return "CCMP";
-    if (m & CAP_CIPHER_TKIP) return "TKIP";
-    return "-";
-}
+static const char *cipher_str(uint8_t m) { return wifi_cipher_str(m); }
 
 void wifi_db_dump_aps(void)
 {
@@ -441,7 +420,7 @@ static void print_rssi_hist(const client_entry_t *c)
 {
     int n = c->rssi_n;
     if (n <= 0) { printf("-"); return; }
-    int start = (c->rssi_i - n + WIFI_DB_RSSI_HIST * 2) % WIFI_DB_RSSI_HIST;
+    int start = wifi_hist_start(c->rssi_i, (uint8_t)n);
     for (int k = 0; k < n; k++) {
         printf("%s%d", k ? "|" : "", c->rssi_hist[(start + k) % WIFI_DB_RSSI_HIST]);
     }
@@ -556,7 +535,7 @@ void wifi_db_export_json(void)
                "\"vendor\":\"%s\",\"rssi_hist\":[",
                mac, bssid, c->rssi, (unsigned)c->pkt_count, c->vendor);
         int n = c->rssi_n;
-        int start = (c->rssi_i - n + WIFI_DB_RSSI_HIST * 2) % WIFI_DB_RSSI_HIST;
+        int start = wifi_hist_start(c->rssi_i, (uint8_t)n);
         for (int k = 0; k < n; k++) {
             printf("%s%d", k ? "," : "", c->rssi_hist[(start + k) % WIFI_DB_RSSI_HIST]);
         }
