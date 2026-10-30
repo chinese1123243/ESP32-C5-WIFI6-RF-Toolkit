@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <stdbool.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -28,6 +29,10 @@ esp_err_t cli_start(void);
  * line 会被修改 (split_args 加 \0), 调用方传入可写缓冲区.
  * 返回 0 = 成功, 非 0 = 失败. */
 int cli_exec_line(char *line);
+
+/* 当前这条命令是否带 --json. 每条命令入口会重置, 所以只能在命令执行期间读.
+ * 给拆出去的命令实现 (如 health.c) 用, 免得它们自己再解析一遍参数. */
+bool cli_json_mode(void);
 
 #ifdef __cplusplus
 }

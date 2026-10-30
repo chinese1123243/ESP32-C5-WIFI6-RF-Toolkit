@@ -45,6 +45,15 @@ int  event_snapshot_json(char *buf, size_t cap, int limit);
 unsigned event_total(void);
 int      event_buffered(void);
 
+/* 计量口径:
+ *   event_published  调用次数, 含被丢的; event_total 只数真进环的, 两者不等
+ *   event_dropped    拿不到环形锁而整条丢弃 (环形缓冲与订阅者都没看到)
+ * 都是单字读写, 任意任务上下文可读, 不加锁.
+ * 到达率不在本模块: 真正压满链路的是 out_raw 的每包一行调用者, 见
+ * out_stream.h 的 out_rate_x10(). */
+unsigned event_published(void);
+unsigned event_dropped(void);
+
 #ifdef __cplusplus
 }
 #endif

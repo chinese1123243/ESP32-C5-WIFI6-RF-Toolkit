@@ -7,6 +7,7 @@
 输出: 控制台 + logs/test_sweep.txt
 """
 
+import json
 import re
 import sys
 import time
@@ -143,6 +144,23 @@ class Dev:
             return None
         mm = re.search(r'"internal_free":(\d+)', m.group(0))
         return int(mm.group(1)) if mm else None
+
+    def health_fields(self):
+        """health --json 的原始字典 (None 表示没回可解析的 JSON).
+
+        字段缺失不会让固件报错, 只会让客户端拿到 undefined, 界面上表现为
+        "永远 0" 或空白. 所以必须在这里按名单查一遍.
+        """
+        self.buf = ""
+        self.s.write(b"health --json\r\n")
+        self.s.flush()
+        m = self.wait_re(re.compile(r'\{"ok":true[^\n]*\}'), 4)
+        if not m:
+            return None
+        try:
+            return json.loads(m.group(0))
+        except ValueError:
+            return None
 
     def send(self, line, settle=0.4):
         self.s.write((line + "\r\n").encode())
@@ -341,6 +359,26 @@ def main():
     fatal_total = 0
     reject_total = 0
     unknown = set()
+
+    # health 字段名单. 少一个就等于客户端静默读 0, 扫全后面全绿也没意义,
+    # 所以先查这一条, 缺字段直接算失败.
+    REQUIRED_HEALTH = (
+        "heap_total", "internal_free", "internal_largest", "psram_free",
+        "tasks", "events", "ev_pub", "ev_dropped", "ev_ble_drop",
+        "out_rate_x10", "ev_rho_pct", "cli_stack_min", "init_stack_min",
+        "boot_count",
+    )
+    probe = d.health_fields()
+    if probe is None:
+        print("BAD health --json           没有回可解析的 JSON, 后续判定都不可信")
+        failures = [("health --json", "无 JSON")]
+    else:
+        miss = [k for k in REQUIRED_HEALTH if k not in probe]
+        if miss:
+            print(f"BAD health --json           缺字段 {miss}")
+            failures = [("health --json", f"缺字段 {miss}")]
+        else:
+            print(f"OK  health --json           {len(REQUIRED_HEALTH)} 个字段齐全")
 
     start = d.health_snapshot()
 

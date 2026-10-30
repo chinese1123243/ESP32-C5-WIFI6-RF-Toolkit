@@ -387,6 +387,7 @@ static void nus_send_msg(const char *data, int len, uint8_t type)
 
 static QueueHandle_t s_evt_q    = NULL;
 static TaskHandle_t  s_evt_task = NULL;
+static volatile uint32_t s_evt_drop;   /* 队列满挤掉最旧一条的次数 */
 
 bool ble_event_post(const char *line)
 {
@@ -402,8 +403,15 @@ bool ble_event_post(const char *line)
         char drop[EVT_LINE_MAX];
         xQueueReceive(s_evt_q, drop, 0);      /* 丢最旧的一条, 保证不阻塞调用方 */
         xQueueSend(s_evt_q, buf, 0);
+        s_evt_drop++;
     }
     return true;
+}
+
+static void ble_stats_cb(out_stats_t *out)
+{
+    out->capacity_per_s = 1000 / EVT_MIN_GAP_MS;
+    out->dropped = (unsigned)s_evt_drop;
 }
 
 static void ble_evt_task(void *pv)
@@ -727,6 +735,7 @@ esp_err_t ble_cli_start(void)
     out_sink_add(ble_out_sink, NULL);
     out_adv_gate_set(ble_adv_gate_cb);
     out_link_set(ble_link_cb);
+    out_stats_set(ble_stats_cb);
     esp_err_t err;
 
     /* NVS (NimBLE 可能需要) */
@@ -743,6 +752,7 @@ esp_err_t ble_cli_start(void)
 
     s_evt_q = xQueueCreate(EVT_Q_LEN, EVT_LINE_MAX);
     if (!s_evt_q) return ESP_ERR_NO_MEM;
+    s_evt_drop = 0;
 
     /* 初始化 NimBLE controller + host */
     err = nimble_port_init();

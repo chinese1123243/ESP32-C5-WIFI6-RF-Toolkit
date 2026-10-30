@@ -35,6 +35,14 @@ static uint32_t          s_seq   = 0;
 static SemaphoreHandle_t s_mtx   = NULL;
 static sub_t             s_subs[EVENT_SUBS_MAX];
 
+/* 计量. 发布路径跑在 Wi-Fi 驱动任务里, 所以只做单字读写, 不加锁:
+ *   s_ev_pub   累计调用次数 (含被丢的)
+ *   s_ev_drop  拿不到环形锁而整条丢弃的次数, 环形缓冲与订阅者都没看到
+ * 到达率不在这里量: 会压满链路的 sniff/cap/hs 不经过本模块, 量出来永远是 0.
+ * 那个数在 out_stream 的 out_rate_x10(). */
+static volatile uint32_t s_ev_pub;
+static volatile uint32_t s_ev_drop;
+
 esp_err_t event_bus_init(void)
 {
     if (!s_mtx) s_mtx = xSemaphoreCreateMutex();
@@ -47,6 +55,7 @@ esp_err_t event_bus_init(void)
     memset(s_ring, 0, EVENT_RING_LEN * sizeof(ev_rec_t));
     memset(s_subs, 0, sizeof(s_subs));
     s_head = s_count = 0; s_seq = 0;
+    s_ev_pub = s_ev_drop = 0;
     ESP_LOGI(TAG, "event bus ready (ring=%d, subs=%d)", EVENT_RING_LEN, EVENT_SUBS_MAX);
     return ESP_OK;
 }
@@ -62,6 +71,7 @@ void event_publish(const char *topic, const char *fmt, ...)
 {
     if (!topic || !*topic) return;
 
+    s_ev_pub++;
     char msg[EVENT_TEXT_LEN];
     va_list ap;
     va_start(ap, fmt);
@@ -78,6 +88,8 @@ void event_publish(const char *topic, const char *fmt, ...)
         s_head = (s_head + 1) % EVENT_RING_LEN;
         if (s_count < EVENT_RING_LEN) s_count++;
         xSemaphoreGive(s_mtx);
+    } else {
+        s_ev_drop++;
     }
 
     /* 2) 订阅者分发 */
@@ -151,3 +163,8 @@ int event_snapshot_json(char *buf, size_t cap, int limit)
 
 unsigned event_total(void)    { return (unsigned)s_seq; }
 int      event_buffered(void) { return s_count; }
+
+/* s_seq 只在环形锁内自增, 被丢的那些不进 s_seq, 所以它对不上 event_published */
+unsigned event_published(void) { return (unsigned)s_ev_pub; }
+unsigned event_dropped(void)   { return (unsigned)s_ev_drop; }
+
