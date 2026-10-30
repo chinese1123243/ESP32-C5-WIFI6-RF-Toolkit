@@ -1,6 +1,6 @@
 /* event_bus.c: 统一事件总线实现 */
 #include "event_bus.h"
-#include "ble_cli.h"
+#include "out_stream.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -90,7 +90,7 @@ void event_publish(const char *topic, const char *fmt, ...)
     /* 3) BLE 通道 (排队, 自带限速) */
     char line[EVENT_TOPIC_LEN + EVENT_TEXT_LEN + 2];
     snprintf(line, sizeof(line), "%s,%s", topic, msg);
-    ble_event_post(line);
+    out_raw(line);
 }
 
 int event_subscribe(const char *prefix, event_cb_t cb, void *ctx)

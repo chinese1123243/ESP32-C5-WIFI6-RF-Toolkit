@@ -19,7 +19,7 @@
 #include "eapol_core.h"
 #include "radio_common.h"
 #include "wifi_db.h"
-#include "ble_cli.h"
+#include "out_stream.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -130,7 +130,7 @@ static void notify(const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    ble_event_post(buf);
+    out_raw(buf);
 }
 
 /* 投喂 (WiFi 驱动任务上下文) */

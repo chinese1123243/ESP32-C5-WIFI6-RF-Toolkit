@@ -19,7 +19,7 @@
 #include "rgb_led.h"
 #include "wifi_db.h"
 #include "http_server.h"
-#include "ble_cli.h"
+#include "out_stream.h"
 #include "cap.h"
 #include "hs.h"
 #include "karma.h"
@@ -96,7 +96,7 @@ static void raw_out(const char *fmt, ...)
         for (int i = 0; i < n; i++) {
             esp_rom_output_tx_one_char(buf[i]);
         }
-        ble_event_post(buf);
+        out_raw(buf);
     }
 }
 
@@ -497,7 +497,7 @@ static void sniff_progress_task(void *pv)
                      (unsigned)total,
                      (unsigned)atomic_load(&s_sniff_channel),
                      wifi_db_ap_count(), wifi_db_client_count());
-            ble_event_post(evt);
+            out_raw(evt);
         }
     }
     s_progress_task = NULL;
@@ -1422,6 +1422,8 @@ void wifi_attack_status(void)
                          (st == WIFI_ATK_DOWNGRADE)  ? "DOWNGRADE" :
                          (st == WIFI_ATK_PMKID)      ? "PMKID"     : "IDLE";
     bool auto_ch = atomic_load(&s_channel_rotate);
+    out_link_t lk;
+    out_link(&lk);
     uint8_t mac[6] = {0};
     char macs[18] = "-";
     if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK) mac_to_str(mac, macs);
@@ -1439,8 +1441,8 @@ void wifi_attack_status(void)
            (unsigned)wifi_db_ap_count(),
            (unsigned)wifi_db_client_count(),
            (unsigned)wifi_db_eapol_count(),
-           (unsigned)ble_cli_mtu(), ble_cli_connected() ? 1u : 0u,
-           (unsigned)ble_cli_phy(),
+           (unsigned)lk.mtu, lk.connected ? 1u : 0u,
+           (unsigned)lk.phy,
            (unsigned)uxTaskGetNumberOfTasks(), macs);
     if (auto_ch) wifi_attack_auto_dump();
     fflush(stdout);

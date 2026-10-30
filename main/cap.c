@@ -14,7 +14,7 @@
  */
 #include "cap.h"
 #include "radio_common.h"
-#include "ble_cli.h"
+#include "out_stream.h"
 #include "config.h"   /* 记录当前段号 */
 
 #include <string.h>
@@ -314,7 +314,7 @@ static void push_key_event(const key_ent_t *k)
              (unsigned)k->kind, (unsigned)k->rec_off,
              (unsigned)k->rec_len, (unsigned)k->ts_ms,
              (unsigned)k->chan, (int)k->rssi);
-    ble_event_post(buf);
+    out_raw(buf);
 }
 
 static void index_key(const stage_hdr_t *h, uint32_t rec_off, uint32_t rec_len)

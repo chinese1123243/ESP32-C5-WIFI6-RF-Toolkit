@@ -25,16 +25,18 @@ MAIN = ROOT / "main"
 BASELINE = {
     "cli_c_lines": 2592,
     "meta_printf": 318,
-    "reverse_deps": 8,
+    "reverse_deps": 4,
     "max_file_lines": 2592,
 }
 
 # 已知的反向依赖: 领域层直接 include 传输层的文件.
 # 这张表只能变短, 不许变长. 修好一条就删一行并把 BASELINE 减 1.
 KNOWN_REVERSE = {
-    # 7 个领域文件直接 include 传输层的 ble_cli.h (为了 raw_out 往手机回传)
-    "ble_adv.c", "cap.c", "event_bus.c", "hs.c",
-    "phish.c", "wifi_attack.c", "zbsniff.c",
+    # BLE 广播闸门: 枚举 GATT 前要暂停广播, 属 BLE 角色耦合, 不是输出耦合
+    "ble_adv.c",
+    # 门户与降级 AP 要自己起停 HTTP 服务, 属控制面耦合; 解法是给传输层加
+    # "服务开关"槽位, 与输出汇点不是同一件事, 留待单独处理
+    "phish.c", "wifi_attack.c",
     # 文档点名的第 3 条: 传输层反向依赖门户的数据上传槽
     "ble_cli.c",
 }

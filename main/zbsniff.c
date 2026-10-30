@@ -25,7 +25,7 @@
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
-#include "ble_cli.h"
+#include "out_stream.h"
 
 /* WDT 辅助 (与 wifi_attack.c / cap.c 同款) */
 #if CONFIG_ESP_TASK_WDT_EN
@@ -149,7 +149,7 @@ static void zb_task(void *pv)
                          "META,ZB,PROGRESS,total,%u,frames,%d,drops,%u,channel,%u",
                          (unsigned)tt, zbsniff_count(),
                          (unsigned)atomic_load(&s_drops), (unsigned)atomic_load(&s_ch));
-                ble_event_post(evt);
+                out_raw(evt);
             }
         }
     }

@@ -9,6 +9,7 @@
  *   5. 执行完毕, 关闭 capture, 将缓冲内容通过 TX_CHAR notify 分帧回传
  */
 #include "ble_cli.h"
+#include "out_stream.h"
 #include "cli.h"
 #include "rgb_led.h"
 #include "phish.h"
@@ -700,8 +701,32 @@ static void on_reset(int reason)
 }
 
 
+/* 传输层把自己注册成输出汇点. 领域层从此不用 include 本头文件就能往手机回传. */
+static void ble_out_sink(const char *line, void *ctx)
+{
+    (void)ctx;
+    ble_event_post(line);
+}
+
+static void ble_link_cb(out_link_t *out)
+{
+    out->mtu = ble_cli_mtu();
+    out->connected = ble_cli_connected();
+    out->phy = ble_cli_phy();
+}
+
+static void ble_adv_gate_cb(bool hold)
+{
+    if (hold) ble_cli_adv_suspend();
+    else      ble_cli_adv_resume();
+}
+
 esp_err_t ble_cli_start(void)
 {
+    out_stream_init();
+    out_sink_add(ble_out_sink, NULL);
+    out_adv_gate_set(ble_adv_gate_cb);
+    out_link_set(ble_link_cb);
     esp_err_t err;
 
     /* NVS (NimBLE 可能需要) */
