@@ -8,6 +8,9 @@
 /* 三张表的派生层: 编号到字符串的映射, 以及从表项反推 ap_caps_t.
  * 不碰 printf, 不碰硬件, 主机可编. 布局(CSV/JSON 行)仍留在 wifi_db.c. */
 
+/* MAC -> "aa:bb:cc:dd:ee:ff" (小写). 归到这里是为了让导出层不依赖 radio_common. */
+void wifi_mac_str(const uint8_t mac[6], char out[18]);
+
 const char *wifi_enc_str(uint8_t enc);
 const char *wifi_cipher_str(uint8_t mask);
 

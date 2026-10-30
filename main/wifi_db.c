@@ -7,6 +7,7 @@
 #include "wifi_db.h"
 #include "ie_parse.h"
 #include "wifi_names.h"
+#include "wifi_export.h"
 #include "radio_common.h"
 
 #include <stdio.h>
@@ -458,42 +459,23 @@ void wifi_db_dump_eapols(void)
 
 void wifi_db_export_csv(void)
 {
+    char line[WIFI_EXPORT_LINE_MAX];
     printf("META,WIFI,EXPORT,csv,start\n");
     printf("type,bssid_or_mac,ssid,channel,rssi,encryption,hidden,pmf,beacon_count,"
            "data_count,vendor,akm,cipher,bw,std,wps,pmf_cap,crackable\n");
     for (int i = 0; i < s_ap_cnt; i++) {
-        ap_entry_t *e = &s_aps[i];
-        char bssid[18], akm[32];
-        ap_caps_t cc;
-        caps_from_entry(e, &cc);
-        caps_akm_str(&cc, akm, sizeof(akm));
-        mac_to_str(e->bssid, bssid);
-        printf("AP,%s,\"%s\",%d,%d,%s,%s,%d,%u,%u,%s,%s,%s,%u,%s,%d,%d,%d\n",
-               bssid, e->ssid, e->channel, e->rssi,
-               enc_str(e->encryption), e->hidden ? "Y" : "N",
-               e->pmf ? 1 : 0, (unsigned)e->beacon_count, (unsigned)e->data_count,
-               e->vendor, akm, cipher_str(e->cipher), (unsigned)e->bw,
-               caps_std_str(&cc), e->wps ? 1 : 0, e->pmf_cap ? 1 : 0,
-               e->crackable ? 1 : 0);
+        wifi_export_csv_ap(&s_aps[i], line, sizeof(line));
+        printf("%s\n", line);
     }
     printf("\ntype,mac,bssid,rssi,pkt_count,vendor,rssi_hist\n");
     for (int i = 0; i < s_cli_cnt; i++) {
-        client_entry_t *c = &s_clients[i];
-        char mac[18], bssid[18];
-        mac_to_str(c->mac, mac);
-        mac_to_str(c->bssid, bssid);
-        printf("CLIENT,%s,%s,%d,%u,%s,\"", mac, bssid, c->rssi,
-               (unsigned)c->pkt_count, c->vendor);
-        print_rssi_hist(c);
-        printf("\"\n");
+        wifi_export_csv_client(&s_clients[i], line, sizeof(line));
+        printf("%s\n", line);
     }
     printf("\ntype,src,dst,eapol_type,handshake_step\n");
     for (int i = 0; i < s_eap_cnt; i++) {
-        eapol_entry_t *e = &s_eapols[i];
-        char src[18], dst[18];
-        mac_to_str(e->src, src);
-        mac_to_str(e->dst, dst);
-        printf("EAPOL,%s,%s,%d,%d\n", src, dst, e->eapol_type, e->handshake_step);
+        wifi_export_csv_eapol(&s_eapols[i], line, sizeof(line));
+        printf("%s\n", line);
     }
     printf("META,WIFI,EXPORT,csv,done,aps,%d,clients,%d,eapols,%d\n",
            s_ap_cnt, s_cli_cnt, s_eap_cnt);
@@ -502,54 +484,25 @@ void wifi_db_export_csv(void)
 
 void wifi_db_export_json(void)
 {
+    char line[WIFI_EXPORT_LINE_MAX];
     printf("META,WIFI,EXPORT,json,start\n");
     printf("{\"aps\":[");
     for (int i = 0; i < s_ap_cnt; i++) {
-        ap_entry_t *e = &s_aps[i];
-        char bssid[18], akm[32];
-        ap_caps_t cc;
-        caps_from_entry(e, &cc);
-        caps_akm_str(&cc, akm, sizeof(akm));
-        mac_to_str(e->bssid, bssid);
         if (i > 0) printf(",");
-        printf("{\"bssid\":\"%s\",\"ssid\":\"%s\",\"channel\":%d,\"rssi\":%d,"
-               "\"encryption\":\"%s\",\"hidden\":%s,\"pmf\":%d,"
-               "\"beacons\":%u,\"data\":%u,\"vendor\":\"%s\","
-               "\"akm\":\"%s\",\"cipher\":\"%s\",\"bw\":%u,\"std\":\"%s\","
-               "\"wps\":%s,\"pmf_cap\":%s,\"crackable\":%s}",
-               bssid, e->ssid, e->channel, e->rssi,
-               enc_str(e->encryption), e->hidden ? "true" : "false",
-               e->pmf ? 1 : 0, (unsigned)e->beacon_count, (unsigned)e->data_count, e->vendor,
-               akm, cipher_str(e->cipher), (unsigned)e->bw, caps_std_str(&cc),
-               e->wps ? "true" : "false", e->pmf_cap ? "true" : "false",
-               e->crackable ? "true" : "false");
+        wifi_export_json_ap(&s_aps[i], line, sizeof(line));
+        printf("%s", line);
     }
     printf("],\"clients\":[");
     for (int i = 0; i < s_cli_cnt; i++) {
-        client_entry_t *c = &s_clients[i];
-        char mac[18], bssid[18];
-        mac_to_str(c->mac, mac);
-        mac_to_str(c->bssid, bssid);
         if (i > 0) printf(",");
-        printf("{\"mac\":\"%s\",\"bssid\":\"%s\",\"rssi\":%d,\"pkts\":%u,"
-               "\"vendor\":\"%s\",\"rssi_hist\":[",
-               mac, bssid, c->rssi, (unsigned)c->pkt_count, c->vendor);
-        int n = c->rssi_n;
-        int start = wifi_hist_start(c->rssi_i, (uint8_t)n);
-        for (int k = 0; k < n; k++) {
-            printf("%s%d", k ? "," : "", c->rssi_hist[(start + k) % WIFI_DB_RSSI_HIST]);
-        }
-        printf("]}");
+        wifi_export_json_client(&s_clients[i], line, sizeof(line));
+        printf("%s", line);
     }
     printf("],\"eapols\":[");
     for (int i = 0; i < s_eap_cnt; i++) {
-        eapol_entry_t *e = &s_eapols[i];
-        char src[18], dst[18];
-        mac_to_str(e->src, src);
-        mac_to_str(e->dst, dst);
         if (i > 0) printf(",");
-        printf("{\"src\":\"%s\",\"dst\":\"%s\",\"type\":%d,\"step\":%d}",
-               src, dst, e->eapol_type, e->handshake_step);
+        wifi_export_json_eapol(&s_eapols[i], line, sizeof(line));
+        printf("%s", line);
     }
     printf("]}\n");
     printf("META,WIFI,EXPORT,json,done,aps,%d,clients,%d,eapols,%d\n",
