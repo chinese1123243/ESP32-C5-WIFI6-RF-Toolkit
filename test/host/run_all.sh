@@ -21,6 +21,7 @@ run() {
 # 每加一项就在这里加一行, CI 用同一条命令跑全量
 run test_radio_rules main/radio_rules.c test/host/test_radio_rules.c
 run test_frame_build main/frame_build.c test/host/test_frame_build.c
+run test_frame_build_tx main/frame_build.c main/frame_build_tx.c main/radio_hal.c test/host/radio_hal_mock.c test/host/test_frame_build_tx.c
 
 printf '\n'
 if [ "$fail" -ne 0 ]; then printf 'HOST TESTS FAILED\n'; exit 1; fi

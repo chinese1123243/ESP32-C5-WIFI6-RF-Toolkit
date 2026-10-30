@@ -25,6 +25,7 @@
 #include "karma.h"
 #include "event_bus.h"
 #include "radio_arb.h"
+#include "radio_hal.h"
 #include "city_time.h"
 #include "frame_build.h"
 
@@ -897,6 +898,8 @@ esp_err_t wifi_attack_init(void)
     ESP_RETURN_ON_ERROR(err, TAG, "nvs init");
     /* 计时服务要在 NVS 之后, 否则 boot_count 拿不到历史值退化成 1 */
     city_time_init();
+    /* HAL 必须先于任何发射路径安装, 否则 fb_tx 走空实现直接回 INVALID_STATE */
+    radio_hal_esp_install();
 
     ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "netif init");
     ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "event loop");
