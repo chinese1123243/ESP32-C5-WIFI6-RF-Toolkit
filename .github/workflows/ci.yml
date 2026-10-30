@@ -63,3 +63,14 @@ jobs:
       # 只报告不拦，退出码恒为 0。看输出里的命中数即可。
       - name: 扫描 AI 味注释
         run: python scripts/check_slop.py
+
+  host:
+    name: 主机端纯逻辑单测
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 纯逻辑单元不依赖 ESP-IDF, 用系统 gcc 直接编.
+      # 每加一项单测就改 test/host/run_all.sh 里的一行, CI 跟着自动覆盖.
+      - name: 跑 test/host
+        run: bash test/host/run_all.sh
