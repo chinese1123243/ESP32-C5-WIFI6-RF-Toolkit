@@ -38,6 +38,7 @@
 #include "scenario.h"   /* /: 场景编排 + PMF 感知 */
 #include "locate.h"     /* 信号定位 */
 #include "event_bus.h"  /* 统一事件总线 */
+#include "city_time.h"
 #include "radio_arb.h"  /* 射频仲裁器: 唯一占用真值来源 */
 #include "version.h"    /* RFTOOL_VERSION */
 
@@ -1940,6 +1941,7 @@ static int cmd_health(int argc, char **argv)
      * 栈该给多大要拿这个数定, 不能靠估算. */
     uint32_t cli_stack_min =
         (uint32_t)uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+    city_time_t ct = city_clock();
 
     if (g_json) {
         printf("{\"ok\":true,\"heap_total\":%u,\"heap_min\":%u,\"internal_free\":%u,"
@@ -1947,14 +1949,17 @@ static int cmd_health(int argc, char **argv)
                "\"tasks\":%u,\"zbsniff\":%s,\"logring\":%u,\"events\":%u,"
                "\"cap_seg\":%d,\"cap_segs\":%d,"
                "\"internal_blocks\":%u,\"internal_free_blocks\":%u,\"internal_frag\":%u,"
-               "\"cli_stack_min\":%u,\"init_stack_min\":%u}\n",
+               "\"cli_stack_min\":%u,\"init_stack_min\":%u,"
+               "\"boot_count\":%u,\"monotonic_ms\":%u,\"wallclock_s\":%u}\n",
                (unsigned)total_free, (unsigned)min_free, (unsigned)int_free,
                (unsigned)int_largest, (unsigned)ps_free, (unsigned)ps_largest,
                (unsigned)uxTaskGetNumberOfTasks(), zbsniff_is_on() ? "\"run\"" : "\"idle\"",
                (unsigned)logring_used(), event_total(),
                cap_segment_index(), cap_segment_count(),
                (unsigned)mi.total_blocks, (unsigned)mi.free_blocks, frag,
-               (unsigned)cli_stack_min, (unsigned)g_init_stack_min);
+               (unsigned)cli_stack_min, (unsigned)g_init_stack_min,
+               (unsigned)ct.boot_count, (unsigned)ct.monotonic_ms,
+               (unsigned)ct.wallclock_s);
         fflush(stdout);
         return 0;
     }

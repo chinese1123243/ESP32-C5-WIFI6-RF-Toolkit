@@ -8,6 +8,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
+#include "city_time.h"
 
 /* 冲突规则数据化, 便于 test_sweep 遍历验证.
  * 比架构文档的五行多一组 TX_INJECT / RES_15_4: cmd_zbsniff 与 cmd_zbtx 都会先
@@ -39,6 +40,7 @@ typedef enum {
 typedef struct {
     uint32_t seq;
     uint32_t t_ms;
+    uint32_t boot;   /* 跨重启拼接轨迹要靠它, 只记 t_ms 分不清第几次开机 */
     uint32_t res;
     /* 存副本不存指针: radio_release 传进来的是栈上拼的缓冲, 存指针会悬垂,
      * 表现出来是判例里 who 为空或乱码 (实测 seq,2 与 seq,4). */
@@ -102,6 +104,7 @@ static void case_add(uint32_t res, const char *who, const char *holder, uint8_t 
     radio_case_t *c = &s_cases[s_case_wr];
     c->seq = ++s_case_seq;
     c->t_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    c->boot  = city_boot_count();
     c->res = res;
     snprintf(c->who, sizeof(c->who), "%s", who ? who : "-");
     snprintf(c->holder, sizeof(c->holder), "%s", holder ? holder : "-");
@@ -289,8 +292,8 @@ int radio_case_dump(int n)
         const radio_case_t *c = &s_cases[idx];
         char rs[48];
         res_str(c->res, rs, sizeof(rs));
-        printf("META,RADIO,LOG,seq,%u,t_ms,%u,res,%s,who,%s,verdict,%s,by,%s\n",
-               (unsigned)c->seq, (unsigned)c->t_ms, rs, c->who,
+        printf("META,RADIO,LOG,seq,%u,boot,%u,t_ms,%u,res,%s,who,%s,verdict,%s,by,%s\n",
+               (unsigned)c->seq, (unsigned)c->boot, (unsigned)c->t_ms, rs, c->who,
                verdict_str(c->verdict), c->holder);
         out++;
     }
