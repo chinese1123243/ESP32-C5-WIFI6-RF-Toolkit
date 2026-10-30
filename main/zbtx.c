@@ -9,6 +9,7 @@
  * 频率本来就不高).
  */
 #include "zbtx.h"
+#include "zbtx_frame.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -40,23 +41,6 @@
 
 static const char *TAG = "ZBTX";
 
-/* FCF 位, 802.15.4-2003 (Zigbee 用的版本 0) */
-#define FCF_TYPE(t)       ((uint16_t)((t) & 0x7))
-#define FCF_DST_MODE(m)   ((uint16_t)(((m) & 0x3) << 10))
-#define FCF_SRC_MODE(m)   ((uint16_t)(((m) & 0x3) << 14))
-#define FCF_PAN_COMP      (1u << 6)
-
-#define FT_BEACON     0
-#define FT_DATA       1
-#define FT_MAC_CMD    3
-
-#define AM_NONE   0
-#define AM_SHORT  2
-#define AM_EXT    3
-
-/* Zigbee NWK beacon payload: 协议ID + 版本/Profile + 容量 + 扩展PAN + TxOffset + UpdateId */
-#define ZB_PROTO_ID        0x00
-#define ZB_STACK_PROFILE   0x12   /* 版本 2, profile 1 (Zigbee) */
 
 /* 状态 */
 static _Atomic bool     s_on      = false;
@@ -107,98 +91,6 @@ IRAM_ATTR void esp_ieee802154_transmit_failed(const uint8_t *frame,
     atomic_store(&s_tx_err, (int)error);
     atomic_store(&s_tx_res, ESP_FAIL);
     atomic_store(&s_tx_busy, false);
-}
-
-/* 帧构造 */
-
-static int put_fcf(uint8_t *o, uint16_t fcf)
-{
-    o[0] = (uint8_t)(fcf & 0xFF);
-    o[1] = (uint8_t)(fcf >> 8);
-    return 2;
-}
-
-int zbtx_build_beacon(uint8_t *out, int cap, uint16_t pan, uint8_t ch, uint8_t seq)
-{
-    if (cap < 1 + 11 + 15) return 0;
-    if (pan == 0) pan = (uint16_t)(esp_random() & 0xFFFF);
-    if (pan == 0xFFFF) pan = 0xFFFE;      /* 广播 PAN 不能当协调器 */
-
-    /* [0] 留给长度前缀, 内容从 1 开始写 */
-    int n = 1;
-    n += put_fcf(out + n, FCF_TYPE(FT_BEACON) | FCF_SRC_MODE(AM_SHORT));
-    out[n++] = seq;
-    out[n++] = (uint8_t)(pan & 0xFF);      /* src PAN (beacon 无 dst, 压缩位必须为 0) */
-    out[n++] = (uint8_t)(pan >> 8);
-    out[n++] = 0x00;                       /* src short addr = 0 (协调器) */
-    out[n++] = 0x00;
-
-    /* superframe: BO=15, SO=15, PAN coord=1, assoc permit=1 */
-    out[n++] = 0xFF;
-    out[n++] = 0xCF;
-    out[n++] = 0x00;                       /* GTS: 无 */
-    out[n++] = 0x00;                       /* Pending addr: 无 */
-
-    /* Zigbee NWK beacon payload */
-    out[n++] = ZB_PROTO_ID;
-    out[n++] = ZB_STACK_PROFILE;
-    out[n++] = 0x05;                       /* 容量: depth 1, router cap 1 */
-    for (int i = 0; i < 8; i++) out[n++] = (uint8_t)(0x10 + i);   /* 扩展 PAN ID */
-    out[n++] = 0x00;                       /* Tx offset (3 字节) */
-    out[n++] = 0x00;
-    out[n++] = 0x00;
-    out[n++] = 0x00;                       /* Update ID */
-
-    out[0] = (uint8_t)(n - 1);             /* 长度不含自身, 不含 FCS */
-    (void)ch;
-    return n;
-}
-
-int zbtx_build_beacon_req(uint8_t *out, int cap, uint16_t pan, uint8_t seq)
-{
-    if (cap < 1 + 10) return 0;
-
-    int n = 1;
-    n += put_fcf(out + n, FCF_TYPE(FT_MAC_CMD) | FCF_DST_MODE(AM_SHORT) |
-                            FCF_SRC_MODE(AM_SHORT) | FCF_PAN_COMP);
-    out[n++] = seq;
-    /* dst PAN 用 0xFFFF (广播), 压缩位为 1 意味着 src PAN 与 dst 相同, 不再重复 */
-    out[n++] = 0xFF;
-    out[n++] = 0xFF;
-    out[n++] = 0xFF;                       /* dst short = 广播 */
-    out[n++] = 0xFF;
-    out[n++] = 0x34;                       /* src short (随便给一个) */
-    out[n++] = 0x12;
-    out[n++] = 0x07;                       /* cmd id 7 = Beacon Request */
-
-    out[0] = (uint8_t)(n - 1);
-    (void)pan;
-    return n;
-}
-
-int zbtx_build_data(uint8_t *out, int cap, uint16_t dst_pan, uint16_t dst,
-                    uint16_t src_pan, uint16_t src,
-                    const uint8_t *payload, int plen, uint8_t seq)
-{
-    if (cap < 1 + 9 + plen) return 0;
-    if (plen < 0) plen = 0;
-    if (plen > ZBTX_FRAME_MAX - 10) plen = ZBTX_FRAME_MAX - 10;
-
-    int n = 1;
-    n += put_fcf(out + n, FCF_TYPE(FT_DATA) | FCF_DST_MODE(AM_SHORT) |
-                            FCF_SRC_MODE(AM_SHORT) | FCF_PAN_COMP);
-    out[n++] = seq;
-    out[n++] = (uint8_t)(dst_pan & 0xFF);
-    out[n++] = (uint8_t)(dst_pan >> 8);
-    out[n++] = (uint8_t)(dst & 0xFF);
-    out[n++] = (uint8_t)(dst >> 8);
-    out[n++] = (uint8_t)(src & 0xFF);      /* 压缩位为 1: src PAN 省略, 视为与 dst 相同 */
-    out[n++] = (uint8_t)(src >> 8);
-    (void)src_pan;
-    for (int i = 0; i < plen; i++) out[n++] = payload[i];
-
-    out[0] = (uint8_t)(n - 1);
-    return n;
 }
 
 /* 发送 */
