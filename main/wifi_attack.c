@@ -25,6 +25,7 @@
 #include "karma.h"
 #include "event_bus.h"
 #include "radio_arb.h"
+#include "chan_sched.h"
 #include "radio_hal.h"
 #include "city_time.h"
 #include "frame_build.h"
@@ -294,24 +295,9 @@ static void auto_decay(void)
 static uint32_t auto_dwell_for(uint8_t ch, uint32_t base)
 {
     if (!atomic_load(&s_auto_adaptive)) return base;
-    uint32_t mean = atomic_load(&s_rate_mean);
-    if (mean < 2) return base;                /* 还没攒够样本, 先均匀扫一轮 */
-
     uint32_t h = (ch <= CH_IDX_MAX) ? (uint32_t)atomic_load(&s_ch_hits[ch]) : 0;
     uint32_t l = (ch <= CH_IDX_MAX) ? atomic_load(&s_ch_listen[ch]) : 0;
-    uint32_t r = (l >= 100) ? (uint32_t)((uint64_t)h * 1000u / l) : mean;
-
-    uint32_t d = (uint32_t)((uint64_t)base * (r + 1) / (mean + 1));
-
-    uint32_t lo = base / 6;
-    if (lo < 60) lo = 60;
-    uint32_t hi = base * 2;
-    if (hi > 2000) hi = 2000;
-    if (hi < lo + 1) hi = lo + 1;
-
-    if (d < lo) d = lo;
-    if (d > hi) d = hi;
-    return d;
+    return chan_dwell_wrl(base, h, l, atomic_load(&s_rate_mean));
 }
 
 /* PSD 的驻留: 按"本信道发现了多少台 AP"分配.
@@ -321,28 +307,11 @@ static uint32_t auto_dwell_for(uint8_t ch, uint32_t base)
  * 开方后最热与最冷的驻留比约 2.4:1, 与仿真的最优区间一致. */
 static uint32_t auto_dwell_psd(uint8_t ch, uint32_t base)
 {
-    uint32_t floor_ms = AUTO_DET_FLOOR_MS;
-    if (base <= floor_ms) floor_ms = base;   /* 用户把 base 调到下限以下才跟着降 */
-
     uint32_t w      = (ch <= CH_IDX_MAX) ? atomic_load(&s_ch_found[ch]) : 0;
     uint32_t total  = atomic_load(&s_ch_found_total);
     uint32_t visits = (ch <= CH_IDX_MAX) ? atomic_load(&s_ch_visits[ch]) : 0;
     uint32_t n      = (uint32_t)(N_CH_2G + N_CH_5G);
-
-    /* 第一次接触一律给 base, 与旧策略的首轮完全一致:
-     * 首轮就压到下限以下会少发现约 1.3 台 (实测 10 次 A/B), 而首轮的覆盖
-     * 速度并不值得拿检出率去换. 便宜只用在"探过、确认是空的"信道上. */
-    if (visits == 0) return base;
-    if (w == 0 || total == 0) return floor_ms * 3 / 5;   /* 探过是空的: 便宜地复检 */
-
-    float mean = (float)total / (float)n;
-    uint32_t d = (uint32_t)((float)base * sqrtf((float)w / mean));
-
-    uint32_t hi = base * 2;
-    if (hi > 2000) hi = 2000;
-    if (d < floor_ms) d = floor_ms;
-    if (d > hi) d = hi;
-    return d;
+    return chan_dwell_psd(base, w, total, visits, n);
 }
 
 static void auto_visit(uint8_t ch, uint32_t base)
@@ -363,23 +332,15 @@ static void auto_visit(uint8_t ch, uint32_t base)
  * 41 个元素, 插入排序足够, 且天然稳定 (相同权重保持原顺序, 不会来回抖). */
 static uint8_t s_psd_order[N_CH_2G + N_CH_5G];
 
+static uint16_t s_psd_w[CH_IDX_MAX + 1];
+
 static int psd_build_order(void)
 {
     int n = 0;
     for (size_t i = 0; i < N_CH_2G; i++) s_psd_order[n++] = s_channels_2g[i];
     for (size_t i = 0; i < N_CH_5G; i++) s_psd_order[n++] = s_channels_5g[i];
-    for (int i = 1; i < n; i++) {
-        uint8_t  v  = s_psd_order[i];
-        uint16_t wv = (v <= CH_IDX_MAX) ? atomic_load(&s_ch_found[v]) : 0;
-        int j = i - 1;
-        while (j >= 0 && ((s_psd_order[j] <= CH_IDX_MAX
-                           ? atomic_load(&s_ch_found[s_psd_order[j]]) : 0) < wv)) {
-            s_psd_order[j + 1] = s_psd_order[j];
-            j--;
-        }
-        s_psd_order[j + 1] = v;
-    }
-    return n;
+    for (int c = 0; c <= CH_IDX_MAX; c++) s_psd_w[c] = atomic_load(&s_ch_found[c]);
+    return chan_psd_order(s_psd_order, s_psd_w, n, s_psd_order);
 }
 
 static void channel_rotate_task(void *pv)

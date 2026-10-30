@@ -12,7 +12,7 @@ fail=0
 run() {
   local name="$1"; shift
   printf '== %s ==\n' "$name"
-  if ! "$CC" -std=c11 -Wall -Wextra -O1 -I main -I test/host/stub -o "$OUT/$name" "$@" ; then
+  if ! "$CC" -std=c11 -Wall -Wextra -O1 -I main -I test/host/stub -lm -o "$OUT/$name" "$@" ; then
     printf '  COMPILE FAIL\n'; fail=1; return
   fi
   "$OUT/$name" || fail=1
@@ -21,6 +21,7 @@ run() {
 # 每加一项就在这里加一行, CI 用同一条命令跑全量
 run test_radio_rules main/radio_rules.c test/host/test_radio_rules.c
 run test_frame_build main/frame_build.c test/host/test_frame_build.c
+run test_chan_sched main/chan_sched.c test/host/test_chan_sched.c
 run test_wifi_export main/wifi_export.c main/wifi_names.c main/ie_parse.c test/host/test_wifi_export.c
 run test_wifi_names main/wifi_names.c main/ie_parse.c test/host/test_wifi_names.c
 run test_zbtx_frame main/zbtx_frame.c main/radio_hal.c test/host/radio_hal_mock.c test/host/test_zbtx_frame.c
