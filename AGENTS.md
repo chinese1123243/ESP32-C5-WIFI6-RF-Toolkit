@@ -41,7 +41,9 @@ ESP-IDF v5.5.3，目标 `esp32c5`，app 起始偏移 `0x20000`。
 | 安全取舍 | `SECURITY.md` |
 | 命令注册表 | `main/cli.c` 的 `g_cmds[]` |
 | 输出协议现状 | `main/cli.c` 里所有 `printf("META`（310 处） |
-| 内存预算 / 射频 / HIL / 实验 / 术语 | `references/` 下同名文件 |
+| 内存预算（实测数字、largest 差距） | `references/memory-budget.md` |
+| 已批准的决定、例外、冲突裁决 | `references/decisions.md` |
+| 射频 / HIL / 实验 / 术语 | `references/` 下同名文件（待补） |
 
 ## Hard constraints
 
