@@ -22,6 +22,7 @@ run() {
 run test_radio_rules main/radio_rules.c test/host/test_radio_rules.c
 run test_frame_build main/frame_build.c test/host/test_frame_build.c
 run test_chan_sched main/chan_sched.c test/host/test_chan_sched.c
+run chan_dump main/chan_sched.c test/host/chan_dump.c
 run test_wifi_export main/wifi_export.c main/wifi_names.c main/ie_parse.c test/host/test_wifi_export.c
 run test_wifi_names main/wifi_names.c main/ie_parse.c test/host/test_wifi_names.c
 run test_zbtx_frame main/zbtx_frame.c main/radio_hal.c test/host/radio_hal_mock.c test/host/test_zbtx_frame.c

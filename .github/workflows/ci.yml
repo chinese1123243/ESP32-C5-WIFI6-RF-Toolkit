@@ -74,3 +74,8 @@ jobs:
       # 每加一项单测就改 test/host/run_all.sh 里的一行, CI 跟着自动覆盖.
       - name: 跑 test/host
         run: bash test/host/run_all.sh
+
+      # C 实现与 chan_sim.py 的公式逐点比对 (750 点).
+      # 依赖上一步产出的 build/host/chan_dump.
+      - name: 信道调度与仿真公式一致
+        run: python scripts/chan_cross.py
