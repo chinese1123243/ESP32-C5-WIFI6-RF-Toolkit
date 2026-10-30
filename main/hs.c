@@ -16,6 +16,7 @@
  *   EAPOL 字段上限 255 字节 (hashcat 侧限制).
  */
 #include "hs.h"
+#include "eapol_core.h"
 #include "radio_common.h"
 #include "wifi_db.h"
 #include "ble_cli.h"
@@ -81,34 +82,7 @@ static void hex_into(char *dst, const uint8_t *src, int n)
  * 之前把 MIC 写成 0x0008, 那是 key type, 所有 EAPOL-Key 帧都是 1. 结果真实
  * AP 的 M1 (0x008a) 被判成 M3, PMKID 提取那段从来没执行过. 自检没抓出来,
  * 因为自检构造的 M1 用了 0x0082 (没置 key type), 正好绕开了这个位. */
-static int eapol_msg_no(uint16_t ki)
-{
-    bool ack = (ki & 0x0080) != 0;
-    bool mic = (ki & 0x0100) != 0;
-    bool sec = (ki & 0x0200) != 0;
-    if (ack && !mic) return 1;              /* M1: AP→STA, 只带 ANonce */
-    if (ack && mic)  return 3;              /* M3: AP→STA, 带 MIC */
-    if (mic && !sec) return 2;              /* M2: STA→AP, 带 SNonce+MIC */
-    if (mic && sec)  return 4;              /* M4: STA→AP, 确认 */
-    return 0;
-}
-
-/* M1 的 Key Data 里找 PMKID KDE: DD len 00-0F-AC 04 */
-static bool extract_pmkid(const uint8_t *eo, int eo_len, uint8_t out[16])
-{
-    int p = 99;                             /* EAPOL 头 4 + EAPOL-Key 固定 95 */
-    while (p + 2 <= eo_len) {
-        uint8_t t = eo[p], l = eo[p + 1];
-        if (p + 2 + l > eo_len) break;
-        if (t == 0xDD && l >= 20 && eo[p + 2] == 0x00 && eo[p + 3] == 0x0F &&
-            eo[p + 4] == 0xAC && eo[p + 5] == 0x04) {
-            memcpy(out, eo + p + 6, 16);
-            return true;
-        }
-        p += 2 + l;
-    }
-    return false;
-}
+/* eapol_msg_no / extract_pmkid 已移到 eapol_core.c, 以便主机端单测 */
 
 /* 按 Replay Counter 判有效配对: 同一次握手里 M1/M2/M3/M4 的 RC 必然相同 */
 static int try_pair(const hs_t *h)
@@ -219,7 +193,7 @@ void hs_feed(const uint8_t *f, uint16_t len, int8_t rssi, uint8_t chan)
 
     if (msg == 1) {
         uint8_t pm[16];
-        if (extract_pmkid(h->eo[0], h->eo_len[0], pm)) {
+        if (eapol_extract_pmkid(h->eo[0], h->eo_len[0], pm)) {
             memcpy(h->pmkid, pm, 16);
             h->present |= P_PMKID;
         }
