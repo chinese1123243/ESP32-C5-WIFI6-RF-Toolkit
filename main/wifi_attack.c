@@ -860,6 +860,7 @@ esp_err_t wifi_attack_stop_all(void)
         atomic_store(&s_channel_rotate, false);
         esp_wifi_set_promiscuous(false);
         http_server_stop();
+        radio_release(RES_SOFTAP | RES_RX_PROMISC);
         atomic_store(&s_state, WIFI_ATK_IDLE);
         stopped_any = true;
     } else if (st == WIFI_ATK_SNIFF) {
@@ -1560,6 +1561,7 @@ esp_err_t wifi_attack_downgrade_start(const char *ssid, const char *pass)
      * 收到 30 包后回调判定到数, 把降级的抓包悄悄停了. SoftAP 还亮着,
      * 但 EAPOL 一条都收不到, 现象是" 降级跑起来却抓不到握手". */
     atomic_store(&s_sniff_remaining, UINT32_MAX);
+    radio_acquire(RES_SOFTAP | RES_RX_PROMISC, "downgrade", 0);
     atomic_store(&s_state, WIFI_ATK_DOWNGRADE);
     rgb_led_set_status(RGB_SNIFF_AUTO);   /* 复用 auto 状态, 后续可加专用状态 */
 

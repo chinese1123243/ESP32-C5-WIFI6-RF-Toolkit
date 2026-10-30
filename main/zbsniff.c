@@ -42,6 +42,7 @@
 #if CONFIG_IEEE802154_ENABLED
 
 #include "esp_ieee802154.h"
+#include "radio_arb.h"
 
 static const char *TAG = "ZBSNIFF";
 
@@ -172,6 +173,7 @@ esp_err_t zb_radio_acquire(void)
     }
     esp_ieee802154_set_promiscuous(true);
     esp_ieee802154_set_rx_when_idle(true);
+    radio_acquire(RES_15_4, "154", 0);
     return ESP_OK;
 }
 
@@ -179,6 +181,7 @@ void zb_radio_release(void)
 {
     int left = atomic_fetch_sub(&s_radio_refs, 1) - 1;
     if (left > 0) return;                    /* 还有使用者, 射频不能关 */
+    radio_release(RES_15_4);
 
     if (left < 0) {                          /* 防御: 多 release 会把 refs 压成负数 */
         atomic_store(&s_radio_refs, 0);

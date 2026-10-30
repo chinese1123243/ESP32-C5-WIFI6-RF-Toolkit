@@ -39,6 +39,7 @@
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
 #include "wifi_attack.h"
+#include "radio_arb.h"
 
 static const char *TAG = "PHISH";
 
@@ -558,6 +559,7 @@ esp_err_t phish_start(const char *ssid, const char *pass)
 
     /* 与嗅探/注入互斥: 单射频, AP + 混杂抓包会互相抢占 */
     wifi_attack_stop_all();
+    radio_acquire(RES_SOFTAP, "phish", 0);
 
     if (!http_server_is_running()) {
         esp_err_t e = http_server_start(ssid, pass);
@@ -597,6 +599,7 @@ esp_err_t phish_start(const char *ssid, const char *pass)
 esp_err_t phish_stop(void)
 {
     if (!s_on) return ESP_ERR_INVALID_STATE;
+    radio_release(RES_SOFTAP);
     s_on = false;
     s_dns_run = false;
     /* 等 DNS 任务退出 */

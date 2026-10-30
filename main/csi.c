@@ -25,6 +25,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "radio_arb.h"
 
 static const char *TAG = "CSI";
 
@@ -284,6 +285,7 @@ esp_err_t csi_start(uint8_t ch)
 
     esp_err_t e = csi_lazy_init();
     if (e != ESP_OK) return e;
+    radio_acquire(RES_RX_PROMISC, "csi", 0);
 
     s_ch = ch;
     s_dropped = 0;
@@ -333,6 +335,7 @@ esp_err_t csi_start(uint8_t ch)
 esp_err_t csi_stop(void)
 {
     if (!s_on) return ESP_ERR_INVALID_STATE;
+    radio_release(RES_RX_PROMISC);
     s_on = false;
     esp_wifi_set_csi(false);
     esp_wifi_set_promiscuous(false);
