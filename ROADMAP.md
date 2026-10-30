@@ -86,6 +86,22 @@ city_time_t city_clock(void);   /* 单调时钟 + 墙钟 + boot_count */
 
 审计日志与判例库两个都记。只记墙钟的话，一次跨重启的实验参数轨迹拼不起来。
 
+### S1 执行分解
+
+四个单元，按此顺序落地。每个单元独立可编译、可回退，做完一个立刻验一个。
+
+| 单元 | 新增/改动 | 验收（可 grep 或可数） |
+|---|---|---|
+| U1 仲裁器 | 新增 `main/radio_arb.c` `.h`；改 `wifi_attack.c`、`phish.c`、`csi.c`、`zbsniff.c`、`zbtx.c`、`http_server.c`、`cli.c` | 跨功能仲裁点读 bool 的次数为 0；`radio_owner()` 返回非空；`META,RADIO` 覆盖 ACQ/REL/PREEMPT/BUSY/ERR 五类 |
+| U2 判例库 | 并入 `radio_arb.c`，不新建任务、不 malloc | `radio log 20` 能拉出最近 20 条裁决，每条含申请者、资源、阻挡者、判决 |
+| U3 时间服务 | 新增 `main/city_time.c` `.h` | `health` 含 `boot_count`；重启后 `boot_count` 加 1，判例记录带 `boot_count` |
+| U4 HAL 与单测 | 新增 `main/radio_hal.h`、`main/platform_hal.h`、`test/host/` | `tests/host` 一条命令跑完 7 项；CI 加 job；每项至少一条变异用例（改坏实现必须 FAIL） |
+
+U1 的顺序约束：先加仲裁器并让新旧并存，再逐个把跨功能判断改成 `radio_owner()`，最后删旧路径。
+一次性替换六处 bool 无法定位回归来源。
+
+U4 必须早于拆 `cli.c`。`cli.c` 现在 2,530 行、占 `main/` 总量 18.6%，没有测试兜底重构等于闭眼跳。
+
 ### S2 可观测
 
 **Job 户籍账本**

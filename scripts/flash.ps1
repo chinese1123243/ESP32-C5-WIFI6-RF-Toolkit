@@ -5,7 +5,22 @@ param(
   [string]$IdfPath = $env:IDF_TOOLS_PATH
 )
 
-$root = Split-Path -Parent $PSScriptRoot
+$ErrorActionPreference = 'Continue'
+
+# 后台任务包装下 $PSScriptRoot 可能为空, 逐级兜底
+$scriptDir = $PSScriptRoot
+if (-not $scriptDir) {
+  foreach ($p in @($PSCommandPath, $MyInvocation.MyCommand.Path, $MyInvocation.MyCommand.Definition)) {
+    if ($p -and (Test-Path -LiteralPath $p)) { $scriptDir = Split-Path -Parent $p; break }
+  }
+}
+$root = if ($scriptDir) { Split-Path -Parent $scriptDir } else { (Get-Location).Path }
+if (-not (Test-Path -LiteralPath (Join-Path $root 'main\cli.c'))) {
+  Write-Host "[!] 无法定位仓库根 (解析结果: $root). 请在仓库根目录执行本脚本."
+  exit 1
+}
+$logs = Join-Path $root 'logs'
+New-Item -ItemType Directory -Path $logs -Force | Out-Null
 Set-Location $root
 
 $idfVersion = 'v5.5.3'
@@ -45,6 +60,11 @@ for p in L.comports():
 }
 Write-Host "[*] 使用端口: $Port"
 
-$p = Start-Process -FilePath "idf.py" -ArgumentList "--no-ccache","-p",$Port,"-b","921600","flash" -Wait -PassThru -NoNewWindow
-Write-Host "FLASH_EXIT=$($p.ExitCode)"
-exit $p.ExitCode
+# 直接调用 idf.py, 不用 Start-Process: 进程环境块里存在仅大小写不同的重复键
+# (HTTPS_PROXY / https_proxy), Start-Process 复制环境时报键冲突直接抛异常.
+$log = Join-Path $logs 'flash.log'
+& idf.py --no-ccache -p $Port -b 921600 flash *> $log
+$rc = $LASTEXITCODE
+Write-Host "FLASH_EXIT=$rc"
+if ($rc -ne 0) { Get-Content $log -Tail 30 }
+exit $rc

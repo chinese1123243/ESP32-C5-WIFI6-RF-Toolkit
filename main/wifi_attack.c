@@ -24,6 +24,7 @@
 #include "hs.h"
 #include "karma.h"
 #include "event_bus.h"
+#include "radio_arb.h"
 #include "frame_build.h"
 
 #include <stdatomic.h>
@@ -830,6 +831,7 @@ static void inject_task(void *pv)
 
     free(a);
     WDT_DEL();
+    radio_release(RES_TX_INJECT);
     atomic_store(&s_inject_running, false);
     vTaskDelete(NULL);
 }
@@ -1177,6 +1179,8 @@ esp_err_t wifi_attack_sniff_start(uint8_t channel, uint32_t count)
     /* count=0 -> 永续: 用 UINT32_MAX 占位 (回调里 !=UINT32_MAX 才递减, 故永不动) */
     atomic_store(&s_sniff_remaining, count ? count : UINT32_MAX);
     atomic_store(&s_sniff_total, 0);
+    /* 互斥已由上面的 stop_all 完成, 这里只登记归属, 让 radio_owner() 说得清 */
+    radio_acquire(RES_RX_PROMISC, "sniff", 0);
     atomic_store(&s_state, WIFI_ATK_SNIFF);
     rgb_led_set_status(RGB_SNIFF_SINGLE);
     sniff_progress_start();
@@ -1213,6 +1217,7 @@ static esp_err_t inject_start_common(inject_args_t *a)
     atomic_store(&s_inject_stop, false);
     atomic_store(&s_inject_total, 0);
     atomic_store(&s_state, WIFI_ATK_INJECT);
+    radio_acquire(RES_TX_INJECT, "inject", 0);
     const char *mode_name = (a->mode == INJECT_DEAUTH)   ? "deauth" :
                             (a->mode == INJECT_DISASSOC) ? "disassoc" :
                             (a->mode == INJECT_AUTH)     ? "auth" :
@@ -1417,6 +1422,7 @@ static void sniff_stop_common(void)
 
     /* DONE 从命令上下文发出: 走 raw_out 而不是 printf, 这样从编排任务等
      * 非命令上下文调用时也能送到手机 (raw_out 自带 BLE 事件投递). */
+    radio_release(RES_RX_PROMISC);
     raw_out("META,WIFI,SNIFF,DONE,total,%u\n", (unsigned)atomic_load(&s_sniff_total));
 }
 

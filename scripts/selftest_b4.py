@@ -5,9 +5,16 @@ Batch 4 板级自检 (C-2/C-3/C-4/B-2/B-5/D-5/D-2 + OTA)
 依赖: pyserial (pip install pyserial)
 """
 import sys, time, serial
+import re as _re
+import pathlib as _pl
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "COM4"
 BAUD = 115200
+
+# 版本号从 main/version.h 读, 硬编码会在每次升版后假失败 (曾停在 2.0.0 对不上 2.4.1)
+_vh = _pl.Path(__file__).resolve().parent.parent / "main" / "version.h"
+_m = _re.search(r'RFTOOL_VERSION\s+"([^"]+)"', _vh.read_text(encoding="utf-8"))
+FW_VER = _m.group(1) if _m else ""
 
 CMDS = [
     "version",
@@ -52,8 +59,8 @@ def main():
     ser.close()
 
     checks = [
-        ("firmware 2.0.0",  "2.0.0" in out["version"]),
-        ("version json",    '"version":"2.0.0"' in out["version --json"]),
+        ("firmware " + FW_VER, FW_VER in out["version"]),
+        ("version json",    '"version":"%s"' % FW_VER in out["version --json"]),
         ("status json",     '"state"' in out["status --json"] and '"locate"' in out["status --json"]),
         ("health json",     '"cap_segs"' in out["health --json"] and '"events"' in out["health --json"]),
         ("ota status",      "META,OTA,STATUS" in out["ota status"]),

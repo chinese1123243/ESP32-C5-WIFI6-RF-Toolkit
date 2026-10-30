@@ -38,6 +38,7 @@
 #include "scenario.h"   /* /: 场景编排 + PMF 感知 */
 #include "locate.h"     /* 信号定位 */
 #include "event_bus.h"  /* 统一事件总线 */
+#include "radio_arb.h"  /* 射频仲裁器: 唯一占用真值来源 */
 #include "version.h"    /* RFTOOL_VERSION */
 
 #include <stdio.h>
@@ -462,6 +463,61 @@ static struct {
     arg_str_t *pass;
     arg_end_t *end;
 } http_args;
+
+static int radio_res_parse(const char *s)
+{
+    if (strcmp(s, "promisc") == 0) return RES_RX_PROMISC;
+    if (strcmp(s, "inject")  == 0) return RES_TX_INJECT;
+    if (strcmp(s, "softap")  == 0) return RES_SOFTAP;
+    if (strcmp(s, "154")     == 0) return RES_15_4;
+    if (strcmp(s, "ble")     == 0) return RES_BLE_CENTRAL;
+    return -1;
+}
+
+/* radio [status] | radio log [n] | radio test <a> <b> */
+static int cmd_radio(int argc, char **argv)
+{
+    const char *sub = argc > 1 ? argv[1] : "status";
+
+    if (strcmp(sub, "status") == 0) {
+        uint32_t held = radio_held_mask();
+        printf("META,RADIO,STATUS,owner,%s,held,%s,cases,%u,cap,%d\n",
+               radio_owner(), radio_res_str(held),
+               (unsigned)radio_case_total(), radio_case_capacity());
+        fflush(stdout);
+        return 0;
+    }
+
+    if (strcmp(sub, "log") == 0) {
+        int n = argc > 2 ? atoi(argv[2]) : 10;
+        if (n <= 0) { printf("META,RADIO,ERR,msg,bad_count\n"); fflush(stdout); return 1; }
+        if (radio_case_dump(n) == 0) {
+            printf("META,RADIO,LOG,empty,1\n");
+            fflush(stdout);
+        }
+        return 0;
+    }
+
+    if (strcmp(sub, "test") == 0) {
+        if (argc < 4) { printf("META,RADIO,ERR,msg,need_two_res\n"); fflush(stdout); return 1; }
+        int a = radio_res_parse(argv[2]);
+        int b = radio_res_parse(argv[3]);
+        if (a < 0 || b < 0) {
+            printf("META,RADIO,ERR,msg,bad_res,want,promisc|inject|softap|154|ble\n");
+            fflush(stdout);
+            return 1;
+        }
+        const char *why = radio_conflict_reason((radio_res_t)a, (radio_res_t)b);
+        printf("META,RADIO,TEST,a,%s,b,%s,conflict,%d,why,%s\n",
+               argv[2], argv[3], why ? 1 : 0, why ? why : "-");
+        fflush(stdout);
+        return 0;
+    }
+
+    printf("META,RADIO,ERR,msg,bad_subcmd,want,status|log|test\n");
+    fflush(stdout);
+    return 1;
+}
 
 static void http_arg_reset(void)
 {
@@ -2343,6 +2399,7 @@ static const cli_cmd_t g_cmds[] = {
     { "beaconflood", "Beacon flood",         "-p <prefix> [opts]",   cmd_beaconflood, beacon_arg_reset },
     { "probeflood",  "Probe req flood",      "[opts]",               cmd_probeflood,  probe_arg_reset },
     { "flood",       "Flood AP (deauth/disassoc/auth)", "-b <bssid> -t <type> [opts]", cmd_flood, flood_arg_reset },
+    { "radio",       "Radio arbiter (owner/case log/conflict table)", "[status]|log <n>|test <a> <b>", cmd_radio, NULL },
     { "http",        "HTTP REST API",        "<start|stop|status>",  cmd_http,        http_arg_reset },
     { "downgrade",   "WPA3->WPA2 downgrade AP + EAPOL capture", "<ssid> [opts]|list", cmd_downgrade, downgrade_arg_reset },
     { "phish",       "Captive portal (phishing AP)", "start|stop|status|stations|creds|html", cmd_phish, NULL },
