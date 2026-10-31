@@ -27,6 +27,8 @@ static loc_sample_t *s_smp = NULL;
 static int16_t      *s_scr = NULL;   /* loc_estimate 的排序暂存, 放 PSRAM */
 static int16_t      *s_vals = NULL;  /* 采样值的连续副本, 放 PSRAM (600B 不能上栈) */
 static loc_stat_t    s_st;           /* 最近一次的抗离群统计, 供输出 */
+static uint32_t      s_stat_us = 0;  /* 上一次统计花了多少微秒 */
+static uint32_t      s_stat_us_max = 0;
 static int          s_n = 0;
 static volatile bool s_run = false;
 static TaskHandle_t s_task = NULL;
@@ -107,10 +109,14 @@ static void locate_task(void *arg)
 
         if (++tick % 4 == 0) {                 /* 每 2s 报一次, 不刷屏 */
             int avg, mn, mx; const char *trend;
+            int64_t t_before = esp_timer_get_time();
             statistics(&avg, &mn, &mx, &trend);
+            s_stat_us = (uint32_t)(esp_timer_get_time() - t_before);
+            if (s_stat_us > s_stat_us_max) s_stat_us_max = s_stat_us;
             char macs[18]; mac_to_str(s_mac, macs);
-            printf("META,LOCATE,T,mac,%s,rssi,%d,avg,%d,med,%d,mad,%d,min,%d,max,%d,n,%d,trend,%s\n",
-                   macs, rssi, avg, s_st.median, s_st.mad, mn, mx, s_n, trend);
+            printf("META,LOCATE,T,mac,%s,rssi,%d,avg,%d,med,%d,mad,%d,min,%d,max,%d,n,%d,trend,%s,us,%u\n",
+                   macs, rssi, avg, s_st.median, s_st.mad, mn, mx, s_n, trend,
+                   (unsigned)s_stat_us);
             fflush(stdout);
             event_publish("LOCATE", "mac=%s rssi=%d avg=%d trend=%s", macs, rssi, avg, trend);
         }
@@ -121,8 +127,8 @@ static void locate_task(void *arg)
 
     int avg, mn, mx; const char *trend;
     statistics(&avg, &mn, &mx, &trend);
-    printf("META,LOCATE,DONE,samples,%d,avg,%d,min,%d,max,%d,miss,%d\n",
-           s_n, avg, mn, mx, s_miss);
+    printf("META,LOCATE,DONE,samples,%d,avg,%d,min,%d,max,%d,miss,%d,us,%u,us_max,%u\n",
+           s_n, avg, mn, mx, s_miss, (unsigned)s_stat_us, (unsigned)s_stat_us_max);
     fflush(stdout);
     event_publish("LOCATE", "done samples=%d avg=%d", s_n, avg);
 
@@ -161,6 +167,7 @@ esp_err_t locate_start(const uint8_t mac[6], bool is_client, uint32_t secs)
     s_secs = secs;
     s_n = 0;
     s_miss = 0;
+    s_stat_us = s_stat_us_max = 0;
     s_run = true;
 
     char macs[18]; mac_to_str(s_mac, macs);
