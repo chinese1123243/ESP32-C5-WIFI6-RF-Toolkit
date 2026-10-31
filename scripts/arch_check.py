@@ -25,7 +25,9 @@ MAIN = ROOT / "main"
 # 2515 = 2514 + job.h 的 include 一行 (Job 户籍).
 BASELINE = {
     "cli_c_lines": 2515,
-    "meta_printf": 318,
+    # 319 = 318 + CSI 无帧告警. 未关联 AP 时驱动不下发 CSI, 命令却回 START ok,
+    # 用户只看到静默; 这条 ERR 是错误通道的正经用途, 不是顺手加的日志.
+    "meta_printf": 319,
     "reverse_deps": 4,
     "max_file_lines": 2515,
 }

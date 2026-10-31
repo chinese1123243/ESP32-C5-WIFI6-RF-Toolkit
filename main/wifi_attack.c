@@ -382,6 +382,42 @@ static int psd_build_order(void)
     return chan_psd_order(s_psd_order, s_psd_w, n, s_psd_order);
 }
 
+/* ADT 的事件驱动选信道: 每一步挑"剩余量 / 要花的时间"最高的那条.
+ *
+ * 轮询结构 (按顺序走完一圈) 有一处硬伤: 热信道在第一轮只有一次机会, 它的
+ * 续期必须等其余 77 条走完才轮到, 实机 8 秒窗口里根本等不到. 仿真里 ADT3 的
+ * 中位 3.6s 靠的就是"探到就接着探", 这里把它落到真机上.
+ *
+ * seen 是本轮已访问过的信道位图, 保证一圈必然收敛; 调用方每圈清一次.
+ * 剩余量用 k*(1-p)/p 收缩一半 (p 是命中率 1-exp(-E/bi)), 空信道只按先验 0.3 算,
+ * 且未查够下限时才保留排队资格 (否则一次空探就把有 9 台的信道永久放弃).
+ */
+static int adt_pick(uint32_t base, const uint8_t *seen)
+{
+    int best = -1;
+    float best_s = 0.0f;
+    for (int band = 0; band < 2; band++) {
+        const uint8_t *arr = band ? s_channels_5g : s_channels_2g;
+        size_t n = band ? N_CH_5G : N_CH_2G;
+        for (size_t i = 0; i < n; i++) {
+            uint8_t ch = arr[i];
+            if (ch > CH_IDX_MAX) continue;
+            if (seen[ch >> 3] & (uint8_t)(1u << (ch & 7))) continue;
+            uint32_t k = atomic_load(&s_ch_found[ch]);
+            uint32_t e = atomic_load(&s_ch_exposure[ch]);
+            uint32_t dwell = chan_dwell_adt(base, k, e, atomic_load(&s_adt_eps));
+            float p = 1.0f - expf(-(float)e / 102.4f);
+            float rem;
+            if (e == 0)          rem = 1.0f;
+            else if (k == 0)     rem = 0.3f * (1.0f - p);
+            else                 rem = 0.5f * (float)k * (1.0f - p) / (p > 0.01f ? p : 0.01f);
+            float sc = rem / (float)(dwell + 20);
+            if (sc > best_s) { best_s = sc; best = (int)ch; }
+        }
+    }
+    return best;
+}
+
 static void channel_rotate_task(void *pv)
 {
     /* 会话号在创建时固定: 见 sniff_progress_task 里同样的处理.
@@ -395,6 +431,22 @@ static void channel_rotate_task(void *pv)
     bool band_2g = true;
     while (atomic_load(&s_channel_rotate) && atomic_load(&s_rotate_gen) == mine) {
         uint32_t base = atomic_load(&s_dwell_ms);
+
+        if (atomic_load(&s_auto_policy) == AUTO_POLICY_ADT) {
+            uint8_t seen[(CH_IDX_MAX + 8) / 8];
+            memset(seen, 0, sizeof(seen));
+            for (;;) {
+                if (!atomic_load(&s_channel_rotate) ||
+                    atomic_load(&s_rotate_gen) != mine) break;
+                int ch = adt_pick(base, seen);
+                if (ch < 0) break;
+                seen[ch >> 3] |= (uint8_t)(1u << (ch & 7));
+                auto_visit((uint8_t)ch, base);
+                WDT_RESET();
+            }
+            auto_decay();                 /* eps 每圈减半, 否则漏检阈值永远停在 5% */
+            continue;
+        }
 
         if (atomic_load(&s_auto_policy) == AUTO_POLICY_PSD) {
             int n = psd_build_order();

@@ -128,6 +128,7 @@ static void csi_task(void *arg)
     (void)arg;
     uint32_t win_start = (uint32_t)(esp_timer_get_time() / 1000);
     uint32_t win_frames = 0;
+    bool warned_no_frames = false;
     uint32_t s_sample_cnt = 0;
     int16_t amp[CSI_MAX_SUB];
 
@@ -135,9 +136,18 @@ static void csi_task(void *arg)
         uint32_t t = atomic_load(&s_tail);
         uint32_t h = atomic_load(&s_head);
         if (t == h) {
+            /* 未关联 AP 时驱动根本不给 CSI 帧, 命令却回 START ok, 用户只看到
+             * 一片安静. 3 秒没有一帧就明说, 别让人对着静默猜. */
+            if (!warned_no_frames &&
+                (uint32_t)(esp_timer_get_time() / 1000) - win_start > 3000) {
+                warned_no_frames = true;
+                printf("META,CSI,ERR,msg,no_frames_3s (未关联 AP 时驱动不下发 CSI)\n");
+                fflush(stdout);
+            }
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
+        warned_no_frames = true;   /* 收到过帧, 不再告警 */
 
         csi_ent_t *e = &s_ring[t % CSI_RING_ENTRIES];
         atomic_store(&s_tail, t + 1);
