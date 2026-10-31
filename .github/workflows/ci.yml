@@ -19,9 +19,9 @@ jobs:
     name: 协议与前端校验
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
 
@@ -38,9 +38,9 @@ jobs:
     name: 脚本可编译
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -54,9 +54,9 @@ jobs:
     name: 架构红线
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -69,9 +69,9 @@ jobs:
     name: 注释质量扫描
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -83,7 +83,7 @@ jobs:
     name: 主机端纯逻辑单测
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # 纯逻辑单元不依赖 ESP-IDF, 用系统 gcc 直接编.
       # 每加一项单测就改 test/host/run_all.sh 里的一行, CI 跟着自动覆盖.
