@@ -375,8 +375,152 @@ def run_adt(world, horizon, prior=None, probe=60.0, empty_stop=2,
         rnd += 1
     return t
 
+def run_adt2(world, horizon, prior=None, probe=40.0, floor=DET_FLOOR,
+             shrink=0.5, empty_prior=0.3, cap=BASE_DWELL * 3, **kw):
+    """ADT2: 密度估计 + 探测下限, 每次只挑一条最值的信道.
+
+    估计: 驻留 E 毫秒后单台 AP 的命中率 p = 1-exp(-E/bi). 只命中 k 台时,
+    真实台数的粗估是 k/p (标称计数), 直接用会高估 (k 小时方差极大), 所以往 k
+    收缩: n_hat = k + shrink*k*(1-p)/p. shrink=0.5 相当于"信一半".
+    一台没命中的信道不能判空: k=0 只说明"可能少", 不说明"没有". 判空必须
+    先查够探测下限 floor (250ms 覆盖 2.4 个 beacon 周期), 在此之前按先验
+    empty_prior 保留排队资格. 这一条是上一版最大的坑: 40ms 没探到就把有 7 台
+    AP 的信道永久放弃, 抽检时那一局正好命中.
+
+    调度: 一次只处理一条, 指数 = 剩余量 / (续期 + 切信道). 热信道探出多台后
+    续期指数最高, 当场续到底, 不必等其余 77 条走完.
+    """
+    prior = prior or {}
+    found = {c: 0 for c in CHANNELS}
+    exposure = {c: 0.0 for c in CHANNELS}
+
+    def hit_prob(ch):
+        return 1.0 - math.exp(-exposure[ch] / BEACON_MS)
+
+    def remaining(ch):
+        k = found[ch]
+        E = exposure[ch]
+        if E <= 0:
+            return float(prior.get(ch, 1.0))
+        p = hit_prob(ch)
+        if k == 0:
+            # 没查够下限, 不许判空; 查够了才按先验的残余量算
+            return empty_prior if E < floor else empty_prior * (1.0 - p)
+        return shrink * k * (1.0 - p) / p
+
+    sat_ms = BEACON_MS * math.log(10.0)     # 命中率 90% 所需的累计驻留
+
+    def need(ch):
+        """再待多久能把命中率推到 90%."""
+        return max(probe, sat_ms - exposure[ch])
+
+    t = 0.0
+    while t < horizon:
+        best_ch, best_dwell, best_score = None, probe, -1.0
+        for ch in CHANNELS:
+            r = remaining(ch)
+            E = exposure[ch]
+            if E <= 0:
+                dwell = probe
+            elif E < sat_ms:
+                dwell = min(need(ch), cap)      # 还没探够一个满窗, 续到满窗
+            else:
+                # 已经探过满窗仍要回探的: 给满探测下限. 给 probe 的话对上轮
+                # 漏掉的那批只有 32% 命中率, 回探等于没探.
+                dwell = floor
+            score = r / (dwell + world.switch_ms)
+            if score > best_score:
+                best_ch, best_dwell, best_score = ch, dwell, score
+        if best_ch is None:
+            break
+        new, _frames = world.drain(best_ch, best_dwell, t)
+        t += best_dwell + world.switch_ms
+        found[best_ch] += new
+        exposure[best_ch] += best_dwell
+    return t
+def run_adt3(world, horizon, probe=150.0, miss_eps=0.05, floor=DET_FLOOR,
+             cap=BASE_DWELL * 2, prior=None, **kw):
+    """ADT3: 快扫一趟, 见到 AP 就地压到"漏检概率 < miss_eps", 之后只回探有货的信道.
+
+    饱和条件从结论倒推: 信道上有 k 台已发现, 想让"还剩一台没发现"的概率低于
+    miss_eps, 需要累计暴露 E >= bi*ln(k/miss_eps) (指数分布无记忆, 多次驻留可加).
+    k=9 时要 532ms, k=1 时要 307ms. 这比"固定 250ms 探测下限"更贴实际: 台数越多
+    越值得多待, 只发现一台的信道不必陪跑.
+
+    与 ADT2 的差别在排序: ADT2 用"剩余量/时间"给所有信道排序, 一个从没访问过的
+    信道按先验 1 台算, 指数压过了"已知有 9 台的热信道", 于是首轮还是铺满 78 条,
+    热信道的续期被排到 4.7 秒之后. 这里不做全局排序: 第一趟按信道号顺序快扫,
+    遇到有货的当场就地续期, 续期只花 0.8 秒就把 4 条热信道压到饱和.
+    """
+    prior = prior or {}
+    E = {c: 0.0 for c in CHANNELS}
+    k = {c: 0 for c in CHANNELS}
+    t = 0.0
+
+    eps = [miss_eps]      # 每过一轮减半: 漏检概率按几何衰减, 不是停一次就完事
+
+    def target(ch):
+        # 台数用"已发现"与"先验"的较大者: 首探为空但先验说有货的信道,
+        # 也要压到饱和, 否则一台没探到就被当成空信道永远放弃 (实测这样
+        # 只有 18% 的局能找齐).
+        n = max(1, k[ch], int(prior.get(ch, 0)))
+        return BEACON_MS * math.log(n / eps[0])
+
+    def visit(ch, dwell):
+        nonlocal t
+        new, _f = world.drain(ch, dwell, t)
+        t += dwell + world.switch_ms
+        k[ch] += new
+        E[ch] += dwell
+
+    # 第一趟: 快扫, 有货就地续到饱和
+    for ch in CHANNELS:
+        if t >= horizon:
+            return t
+        visit(ch, probe)
+        # 就地续期只给"强证据"或"先验说有货". 只发现 1 台就当场续 250ms 的话,
+        # 冷信道场景 (几十台散在 78 条信道上) 会边扫边续, 一趟走成 17 秒,
+        # 后半段信道连首探都轮不到, 实测找到比例从 96.5% 掉到 75.9%.
+        if (k[ch] >= 2 or prior.get(ch, 0) > 0) and t < horizon:
+            need = target(ch) - E[ch]
+            if need > 0:
+                visit(ch, min(need, cap))
+
+    # 扫完之后: 按已发现台数从多到少补压, 弱证据 (k=1) 到这里才轮到
+    while t < horizon:
+        hot = sorted([c for c in CHANNELS if k[c] > 0],
+                     key=lambda c: -k[c])
+        if not hot:
+            break
+        progressed = False
+        for ch in hot:
+            if t >= horizon:
+                break
+            need = target(ch) - E[ch]
+            if need <= 0:
+                continue
+            visit(ch, min(need, cap))
+            progressed = True
+        if not progressed:
+            # 这一档全部压满: 先把空信道按探测下限回扫一遍 (首探 150ms 仍会漏
+            # 掉 23% 的 AP), 再回来把阈值减半继续压.
+            swept = False
+            for ch in CHANNELS:
+                if t >= horizon:
+                    break
+                if k[ch] == 0 and E[ch] < floor:
+                    visit(ch, floor - E[ch])
+                    swept = True
+            if swept:
+                continue
+            eps[0] *= 0.5
+            if eps[0] < 1e-4:
+                break
+    return t
+
 POLICIES = {"uniform": run_uniform, "wrl": run_wrl, "psd": run_psd,
-            "cov": run_cov, "band": run_band, "adt": run_adt}
+            "cov": run_cov, "band": run_band, "adt": run_adt,
+            "adt2": run_adt2, "adt3": run_adt3}
 
 
 def episode(policy, seed, horizon, n_cold_aps=0, **kw):

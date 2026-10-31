@@ -73,7 +73,7 @@ int cmd_health(int argc, char **argv)
                "\"ev_pub\":%u,\"ev_dropped\":%u,\"ev_ble_drop\":%u,"
                "\"out_rate_x10\":%u,\"ev_rho_pct\":%u,"
                "\"jobs_active\":%d,\"jobs_aux\":%d,\"jobs_peak\":%d,\"jobs_cap\":%d,"
-               "\"jobs_rejected\":%u,"
+               "\"jobs_rejected\":%u,\"jobs_rej_name\":\"%s\","
                "\"cap_seg\":%d,\"cap_segs\":%d,"
                "\"internal_blocks\":%u,\"internal_free_blocks\":%u,\"internal_frag\":%u,"
                "\"cli_stack_min\":%u,\"init_stack_min\":%u,"
@@ -85,6 +85,7 @@ int cmd_health(int argc, char **argv)
                event_published(), event_dropped(), st.dropped,
                lam_x10, ev_rho,
                job_active(), job_aux(), job_peak(), job_capacity(), job_rejected(),
+               job_last_rejected(),
                cap_segment_index(), cap_segment_count(),
                (unsigned)mi.total_blocks, (unsigned)mi.free_blocks, frag,
                (unsigned)cli_stack_min, (unsigned)g_init_stack_min,
@@ -112,8 +113,9 @@ int cmd_health(int argc, char **argv)
            event_published(), event_dropped(), st.dropped);
     printf("out rate        : %u.%u /s, rho %u%% of BLE %d /s\n",
            lam_x10 / 10, lam_x10 % 10, ev_rho, ev_cap);
-    printf("jobs            : %d active (%d aux), peak %d, cap %d, rejected %u\n",
-           job_active(), job_aux(), job_peak(), job_capacity(), job_rejected());
+    printf("jobs            : %d active (%d aux), peak %d, cap %d, rejected %u%s%s\n",
+           job_active(), job_aux(), job_peak(), job_capacity(), job_rejected(),
+           job_rejected() ? " last " : "", job_last_rejected());
 
     if (int_largest < 8192) {
         printf("WARN: internal largest block %u B < 8KB, 新的 AP/HTTP 会话可能起不来\n",

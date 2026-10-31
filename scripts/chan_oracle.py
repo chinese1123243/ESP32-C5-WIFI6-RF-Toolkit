@@ -96,6 +96,43 @@ def policy_find_time(policy, seed, horizon_ms, n_aps, **kw):
     return max(ts)
 
 
+SUITE = [
+    ("默认",          dict()),
+    ("冷信道40",       dict(n_cold_aps=40)),
+    ("高信道8",        dict(late_5g=8)),
+    ("中途上线6",      dict(arrivals=6)),
+    ("忙信道6",        dict(busy_ch=6, busy_rate=40.0)),
+    ("冷信道80",       dict(n_cold_aps=80)),
+]
+
+
+def suite(args):
+    """多场景对照: 视界内找到多少台, 以及找齐与否.
+
+    冷信道场景里"找齐"不可达 (几十台 AP 散在 78 条信道上, 20 秒扫不完),
+    所以主指标用"找到比例", 找齐时间只在能找齐的场景里读.
+    """
+    prior = {1: 7, 6: 9, 11: 5, 36: 1}
+    print("=== 多场景对照 (视界 %.0fs, %d 局/格) ===" % (args.horizon, args.episodes))
+    print("%-12s %-6s %8s %8s %7s" % ("场景", "策略", "找到比例", "中位台数", "找齐率"))
+    for name, env_kw in SUITE:
+        for pol in args.policies.split(","):
+            hit, n_tot, allc = [], 0, 0
+            for seed in range(args.episodes):
+                aps = cs.episode(pol, seed, args.horizon * 1000.0,
+                                 env_kw.get("n_cold_aps", 0),
+                                 prior=prior if pol == "adt3" else None,
+                                 **{k: v for k, v in env_kw.items()
+                                    if k != "n_cold_aps"})
+                got = sum(1 for a in aps if a.found)
+                hit.append(got)
+                n_tot = len(aps)
+                allc += 1 if got == len(aps) else 0
+            print("%-12s %-6s %7.1f%% %8.1f %6.0f%%"
+                  % (name, pol, 100.0 * statistics.fmean(hit) / n_tot,
+                     statistics.median(hit), 100.0 * allc / len(hit)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--episodes", type=int, default=300)
@@ -104,7 +141,12 @@ def main():
     ap.add_argument("--policies", default="uniform,wrl,psd,cov,band")
     ap.add_argument("--switch", type=float, default=cs.SWITCH_MS)
     ap.add_argument("--floor", type=float, default=cs.DET_FLOOR)
+    ap.add_argument("--suite", action="store_true", help="多场景对照")
     args = ap.parse_args()
+
+    if args.suite:
+        suite(args)
+        return
 
     horizon_ms = args.horizon * 1000.0
     base_aps = cs.make_env(random.Random(0), n_cold_aps=args.cold_aps)

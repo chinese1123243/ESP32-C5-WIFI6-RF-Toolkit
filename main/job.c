@@ -24,6 +24,10 @@ static int      s_active;      /* 含内部辅助 */
 static int      s_aux;
 static int      s_peak;
 static unsigned s_rej;
+/* 最近一次被名额挡回的作业名. 只留指针: def->name 是各文件里的字符串字面量,
+ * 生命周期长于本模块. 没有名字的话, 拒绝计数只能告诉你"有人被挡了",
+ * 定位不了是谁. */
+static const char *s_rej_name;
 
 static void job_trampoline(void *pv)
 {
@@ -52,7 +56,7 @@ esp_err_t job_spawn(const job_def_t *def, TaskHandle_t *out)
     portENTER_CRITICAL(&s_mux);
     int external = s_active - s_aux;
     if (internal || external < JOB_MAX) {
-        for (int i = 0; i < JOB_MAX; i++) {
+        for (int i = 0; i < JOB_SLOTS; i++) {
             if (!s_slots[i].used) { idx = i; break; }
         }
     }
@@ -63,6 +67,7 @@ esp_err_t job_spawn(const job_def_t *def, TaskHandle_t *out)
         if (s_active > s_peak) s_peak = s_active;
     } else {
         s_rej++;
+        s_rej_name = def->name;
     }
     portEXIT_CRITICAL(&s_mux);
 
@@ -88,3 +93,4 @@ int      job_aux(void)      { return s_aux; }
 int      job_peak(void)     { return s_peak; }
 int      job_capacity(void) { return JOB_MAX; }
 unsigned job_rejected(void) { return s_rej; }
+const char *job_last_rejected(void) { return s_rej_name ? s_rej_name : ""; }

@@ -51,6 +51,8 @@ int      job_aux(void);
 int      job_peak(void);
 int      job_capacity(void);
 unsigned job_rejected(void);
+/* 最近一次因名额被挡回的作业名, 空串表示还没有过. */
+const char *job_last_rejected(void);
 
 #ifdef __cplusplus
 }

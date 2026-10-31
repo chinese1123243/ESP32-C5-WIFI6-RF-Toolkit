@@ -4,7 +4,7 @@
  */
 
 /* 版本 */
-const APP_VERSION  = '2.4.3';
+const APP_VERSION  = '2.4.4';
 const APP_BUILD    = '2026.09';
 const APP_AUTHOR      = 'CN112';
 const APP_AUTHOR_FULL = 'CN1123243';
