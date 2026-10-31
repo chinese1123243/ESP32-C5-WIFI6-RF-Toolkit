@@ -114,20 +114,29 @@ def main():
     ap.add_argument("--dur", type=float, default=15.0, help="单次试验时长(秒)")
     ap.add_argument("--dwell", type=int, default=300)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--marks", default="",
+                    help="采样点秒数, 逗号分隔; 默认 5,10,dur")
+    ap.add_argument("--policies", default="wrl,psd",
+                    help="两条策略, 逗号分隔 (wrl|psd|adt)")
     args = ap.parse_args()
 
-    marks = [5, 10, int(args.dur)]
+    pols = [x.strip() for x in args.policies.split(",") if x.strip()]
+    if len(pols) != 2:
+        print("--policies 必须是两条, 例如 psd,adt"); return 2
+    marks = ([int(x) for x in args.marks.split(",") if x.strip()]
+             if args.marks else [5, 10, int(args.dur)])
+    marks = [m for m in marks if m <= args.dur] or [int(args.dur)]
     dev = Dev(args.port)
     dev.sync()
 
     order = []
     for i in range(args.trials):
-        order += ["wrl", "psd"] if i % 2 == 0 else ["psd", "wrl"]
+        order += pols if i % 2 == 0 else list(reversed(pols))
     random.Random(args.seed).shuffle(order)
     # 洗牌后仍要保证两种策略次数相同 (上面已经配平, 洗牌不改变计数)
 
-    res = {"wrl": {m: [] for m in marks}, "psd": {m: [] for m in marks}}
-    allocs = {"wrl": [], "psd": []}
+    res = {p: {m: [] for m in marks} for p in pols}
+    allocs = {p: [] for p in pols}
     print("每组 %d 次, 单次 %.0fs, dwell %dms, 采样点 %s"
           % (args.trials, args.dur, args.dwell, marks))
     for i, pol in enumerate(order, 1):
@@ -141,7 +150,7 @@ def main():
 
     print("\n=== 发现数（中位数, 最小-最大）===")
     print("%-6s" % "策略" + "".join("%16s" % ("t=%ds" % m) for m in marks))
-    for pol in ("wrl", "psd"):
+    for pol in pols:
         row = "%-6s" % pol
         for m in marks:
             v = res[pol][m]
@@ -149,9 +158,9 @@ def main():
                              if v else "-")
         print(row)
 
-    print("\n=== psd - wrl 的差（bootstrap 95% 区间）===")
+    print("\n=== %s - %s 的差（bootstrap 95%% 区间）===" % (pols[1], pols[0]))
     for m in marks:
-        a, b = res["wrl"][m], res["psd"][m]
+        a, b = res[pols[0]][m], res[pols[1]][m]
         if len(a) < 3 or len(b) < 3:
             continue
         lo, hi = boot_ci(a, b)
@@ -161,7 +170,7 @@ def main():
               % (m, diffs, lo, hi, verdict))
 
     print("\n=== 末轮驻留分配（信道:dwell:发现数, 只列前 8）===")
-    for pol in ("wrl", "psd"):
+    for pol in pols:
         rows = allocs[pol][-1] if allocs[pol] else []
         print("  %-4s %s" % (pol, " ".join("%d:%d:%d" % r for r in rows[:8]) or "-"))
 

@@ -28,6 +28,7 @@ run test_wifi_names main/wifi_names.c main/ie_parse.c test/host/test_wifi_names.
 run test_zbtx_frame main/zbtx_frame.c main/radio_hal.c test/host/radio_hal_mock.c test/host/test_zbtx_frame.c
 run test_eapol_core main/eapol_core.c test/host/test_eapol_core.c
 run test_ie_parse main/ie_parse.c test/host/test_ie_parse.c
+run test_csi_det main/csi_det.c test/host/test_csi_det.c
 run test_frame_build_tx main/frame_build.c main/frame_build_tx.c main/radio_hal.c test/host/radio_hal_mock.c test/host/test_frame_build_tx.c
 
 printf '\n'

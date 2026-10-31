@@ -195,12 +195,12 @@ static int cmd_sniff(int argc, char **argv)
                 i += 2;
             } else if (strcmp(a, "--policy") == 0 && i + 1 < argc) {
                 const char *p = argv[i+1];
-                if (strcmp(p, "psd") == 0)      wifi_attack_set_auto_policy(1);
-                else if (strcmp(p, "wrl") == 0) wifi_attack_set_auto_policy(0);
+                int pol = !strcmp(p, "psd") ? 1 : !strcmp(p, "wrl") ? 0
+                        : !strcmp(p, "adt") ? 2 : -1;
+                if (pol >= 0) { wifi_attack_set_auto_policy(pol); }
                 else {
-                    printf("META,WIFI,ERR,msg,bad_policy (wrl|psd)\n");
-                    fflush(stdout);
-                    return 1;
+                    printf("META,WIFI,ERR,msg,bad_policy (wrl|psd|adt)\n");
+                    fflush(stdout); return 1;
                 }
                 i += 2;
             } else {

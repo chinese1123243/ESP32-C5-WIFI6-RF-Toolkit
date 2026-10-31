@@ -98,6 +98,32 @@ int main(void)
     CHECK_EQ(chan_psd_order(NULL, w, 3, out), 0, "chans=NULL 返回 0");
     CHECK_EQ(chan_psd_order(ch, w, 3, NULL), 0, "out=NULL 返回 0");
 
+    /* ---------- ADT: 按已发现台数反推饱和驻留 ---------- */
+    /* 第一次接触给 base: 短探针在 102.4ms beacon 上只有三四成命中率 */
+    CHECK_EQ(chan_dwell_adt(300, 0, 0, 50), 150, "首接触给下限的 60%");
+    CHECK_EQ(chan_dwell_adt(300, 9, 0, 50), 150, "首接触不按台数加码");
+    /* 探过但一台没发现: 只回探, 给下限 */
+    CHECK_EQ(chan_dwell_adt(300, 0, 300, 50), 250, "空信道回探给下限");
+    /* 9 台要 102.4*ln(9/0.05)=529.6ms; 已暴露 200ms, 还差 329ms */
+    {
+        unsigned d = chan_dwell_adt(300, 9, 200, 50);
+        CHECK(d >= 325 && d <= 335, "9 台剩 329ms 左右");
+    }
+    CHECK_EQ(chan_dwell_adt(300, 1, 100, 50), 250, "差额不足下限时抬到下限");
+    CHECK_EQ(chan_dwell_adt(300, 3, 2000, 50), 250, "已压满只回探");
+    /* 30 台要 102.4*ln(600)=655ms, 已暴露 100ms, 还差 555ms (未触上限) */
+    CHECK_EQ(chan_dwell_adt(300, 30, 100, 50), 555, "30 台还差 555ms");
+    /* 已暴露很少时不夹的话会到 655ms, 超过 2*base=600 才夹 */
+    CHECK_EQ(chan_dwell_adt(300, 30, 20, 50), 600, "超上限夹到 2*base");
+    /* eps 从 5% 收到 0.6%: 9 台要 748ms, 已暴露 400ms, 还差 348ms */
+    {
+        unsigned d = chan_dwell_adt(300, 9, 400, 6);
+        CHECK(d >= 344 && d <= 352, "eps=6 还差 348ms");
+    }
+    /* base 压到下限以下时, 上下限跟着降, 不许返回比 base 更大的值 */
+    CHECK(chan_dwell_adt(150, 9, 0, 50) == 90, "小 base 首接触按 60% 下限");
+    CHECK(chan_dwell_adt(150, 9, 1000, 50) <= 300, "小 base 上限 2*base");
+
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

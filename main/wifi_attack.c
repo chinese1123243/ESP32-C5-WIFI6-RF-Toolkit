@@ -210,6 +210,10 @@ static _Atomic uint16_t s_ch_hits[CH_IDX_MAX + 1];   /* uint16 够了: 每轮结
  * 帧多, 形成正反馈, 权重比值会失控, 这正是 实测只跑出
  * -0.4%(等于白做)的原因. 同时记驻留毫秒数, 两者相除才是可比的量. */
 static _Atomic uint32_t s_ch_listen[CH_IDX_MAX + 1]; /* 该信道累计驻留 ms */
+/* ADT 用的累计暴露, 不参与每轮减半: 饱和判据是 E >= bi*ln(k/eps), 一减半
+ * 就永远到不了目标, 每个信道都会被顶在上限. 200 条信道 800 字节. */
+static _Atomic uint32_t s_ch_exposure[CH_IDX_MAX + 1];
+static _Atomic uint32_t s_adt_eps = 50;   /* 千分数, 50 = 5%. 每轮减半 */
 static _Atomic uint32_t s_rate_mean     = 0;         /* 每轮重算一次, 避免逐信道遍历 */
 static _Atomic uint32_t s_ch_hits_total  = 0;
 static _Atomic uint32_t s_auto_round     = 0;
@@ -247,7 +251,7 @@ static inline void chan_new_ap(uint8_t ch)
 }
 
 /* 调度策略. wrl = 原来的按帧率加权, psd = 按发现数排序 + 探测下限. */
-typedef enum { AUTO_POLICY_WRL = 0, AUTO_POLICY_PSD = 1 } auto_policy_t;
+typedef enum { AUTO_POLICY_WRL = 0, AUTO_POLICY_PSD = 1, AUTO_POLICY_ADT = 2 } auto_policy_t;
 /* 默认 psd: 实测 dwell=150 时 15 秒内多发现 1.1 台 (bootstrap 区间 +0.2~+1.8),
  * dwell=300 时与 wrl 打平. 短驻留正是"想快扫"的用户会选的配置, 那里旧的
  * 每信道 floor(base/6=25ms) 已经低于 beacon 间隔, 系统性地漏检. */
@@ -266,6 +270,7 @@ static void chan_close(uint8_t ch, uint32_t dwell_ms)
 {
     if (ch == 0 || ch > CH_IDX_MAX || dwell_ms == 0) return;
     atomic_fetch_add(&s_ch_listen[ch], dwell_ms);
+    atomic_fetch_add(&s_ch_exposure[ch], dwell_ms);
 }
 
 /* 一轮结束: 命中/驻留同时减半(指数遗忘), 并重算全网收益率均值.
@@ -285,6 +290,10 @@ static void auto_decay(void)
             cnt++;
         }
     }
+    /* ADT: 每轮把漏检阈值减半, 否则每轮 5% 的漏检会永久留下 (仿真里 32% 的局
+     * 因此找不齐). 最低 6‰, 再往下调驻留只会顶到上限, 没有收益. */
+    uint32_t eps = atomic_load(&s_adt_eps);
+    if (eps > 6) atomic_store(&s_adt_eps, eps / 2);
     atomic_store(&s_ch_hits_total, atomic_load(&s_ch_hits_total) / 2);
     atomic_store(&s_rate_mean, cnt ? (sum / (uint32_t)cnt) : 0);
 }
@@ -315,17 +324,46 @@ static uint32_t auto_dwell_psd(uint8_t ch, uint32_t base)
     return chan_dwell_psd(base, w, total, visits, n);
 }
 
+/* ADT: 已发现 k 台时还差多少毫秒才能把"还剩一台"的概率压到 eps 以下. */
+static uint32_t auto_dwell_adt(uint8_t ch, uint32_t base)
+{
+    uint32_t k = (ch <= CH_IDX_MAX) ? atomic_load(&s_ch_found[ch]) : 0;
+    uint32_t e = (ch <= CH_IDX_MAX) ? atomic_load(&s_ch_exposure[ch]) : 0;
+    return chan_dwell_adt(base, k, e, atomic_load(&s_adt_eps));
+}
+
 static void auto_visit(uint8_t ch, uint32_t base)
 {
     esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
     atomic_store(&s_sniff_channel, ch);
     rgb_led_event(RGB_EV_CHAN_SWITCH, 300);
 
-    uint32_t dwell = (atomic_load(&s_auto_policy) == AUTO_POLICY_PSD)
-                     ? auto_dwell_psd(ch, base) : auto_dwell_for(ch, base);
+    uint8_t pol = atomic_load(&s_auto_policy);
+    uint32_t dwell = (pol == AUTO_POLICY_PSD) ? auto_dwell_psd(ch, base)
+                   : (pol == AUTO_POLICY_ADT) ? auto_dwell_adt(ch, base)
+                   : auto_dwell_for(ch, base);
     atomic_store(&s_auto_dwell_now, dwell);
     vTaskDelay(pdMS_TO_TICKS(dwell));
     chan_close(ch, dwell);
+
+    /* ADT 的关键不是驻留公式, 是"见到货就地续期": 一轮要扫 78 条信道 (25 秒),
+     * 只按公式给时长的话, 热信道在首轮只能拿到一次机会, 与 psd 没有区别.
+     * 这里在发现 >=2 台时就地续到饱和, 最多 2*base, 不改变轮次顺序. */
+    if (pol == AUTO_POLICY_ADT && ch <= CH_IDX_MAX) {
+        uint32_t k = atomic_load(&s_ch_found[ch]);
+        uint32_t spent = dwell;
+        uint32_t hi = base * 2;
+        if (hi > 2000) hi = 2000;
+        while (k >= 2 && spent < hi && atomic_load(&s_channel_rotate)) {
+            uint32_t extra = chan_dwell_adt(base, k, atomic_load(&s_ch_exposure[ch]),
+                                           atomic_load(&s_adt_eps));
+            if (extra <= CHAN_DWELL_FLOOR_MS || extra > hi - spent) break;
+            vTaskDelay(pdMS_TO_TICKS(extra));
+            chan_close(ch, extra);
+            spent += extra;
+            k = atomic_load(&s_ch_found[ch]);
+        }
+    }
     if (ch <= CH_IDX_MAX) atomic_fetch_add(&s_ch_visits[ch], 1);
 }
 
@@ -1307,12 +1345,13 @@ esp_err_t wifi_attack_inject_stop(void)
 
 void wifi_attack_set_auto_policy(int policy)
 {
-    atomic_store(&s_auto_policy, policy ? AUTO_POLICY_PSD : AUTO_POLICY_WRL);
+    if (policy < 0 || policy > AUTO_POLICY_ADT) policy = AUTO_POLICY_PSD;
+    atomic_store(&s_auto_policy, (uint8_t)policy);
 }
 
 int wifi_attack_get_auto_policy(void)
 {
-    return atomic_load(&s_auto_policy) == AUTO_POLICY_PSD ? 1 : 0;
+    return (int)atomic_load(&s_auto_policy);
 }
 
 esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms, uint32_t count)
@@ -1346,11 +1385,13 @@ esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms, uint32_t count)
     for (int i = 0; i <= CH_IDX_MAX; i++) {
         atomic_store(&s_ch_hits[i], 0);
         atomic_store(&s_ch_found[i], 0);
+        atomic_store(&s_ch_exposure[i], 0);
         atomic_store(&s_ch_visits[i], 0);
         atomic_store(&s_ch_listen[i], 0);
     }
     atomic_store(&s_ch_hits_total, 0);
     atomic_store(&s_ch_found_total, 0);
+    atomic_store(&s_adt_eps, 50);
     atomic_store(&s_rate_mean, 0);
     atomic_store(&s_auto_round, 0);
     atomic_store(&s_auto_dwell_now, dwell_ms);
@@ -1374,7 +1415,8 @@ esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms, uint32_t count)
 
     printf("META,WIFI,SNIFF,AUTO,START,dwell_ms,%u,adaptive,%u,policy,%s\n",
            (unsigned)dwell_ms, atomic_load(&s_auto_adaptive) ? 1u : 0u,
-           atomic_load(&s_auto_policy) == AUTO_POLICY_PSD ? "psd" : "wrl");
+           atomic_load(&s_auto_policy) == AUTO_POLICY_PSD ? "psd"
+             : atomic_load(&s_auto_policy) == AUTO_POLICY_ADT ? "adt" : "wrl");
     event_publish("WIFI", "sniff auto start dwell=%u", (unsigned)dwell_ms);
     fflush(stdout);
     return ESP_OK;

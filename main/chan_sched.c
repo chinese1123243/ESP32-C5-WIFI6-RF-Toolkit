@@ -56,6 +56,37 @@ uint32_t chan_dwell_psd(uint32_t base_ms, uint32_t found, uint32_t found_total,
     return d;
 }
 
+uint32_t chan_dwell_adt(uint32_t base_ms, uint32_t found, uint32_t exposure_ms,
+                        uint32_t eps_permille)
+{
+    uint32_t floor_ms = CHAN_DWELL_FLOOR_MS;
+    if (base_ms <= floor_ms) floor_ms = base_ms;
+    if (eps_permille < 1) eps_permille = 1;
+
+    uint32_t hi = base_ms * 2;
+    if (hi > 2000) hi = 2000;
+    if (hi < floor_ms) hi = floor_ms;
+
+    /* 第一次接触: 给下限的 60% (300ms base 时是 150ms), 与 psd 对冷信道的
+     * 首探一致. 给满 base 的话一趟 78 条要 25 秒, 实机 8 秒窗口里只走完三分之一,
+     * 发现数比 psd 少 3 台 (COM4 实测 -3.2, 95% 区间 [-5.5,-0.5]).
+     * 探到的信道靠"就地续期"补时间, 不必在首探就押重注. */
+    if (exposure_ms == 0) return floor_ms * 3 / 5;
+    if (found == 0) return floor_ms;
+
+    /* 目标暴露 = bi*ln(k/eps). bi 取 102.4ms 的标称 beacon 间隔. */
+    float target = 102.4f * logf((float)found * 1000.0f / (float)eps_permille);
+    uint32_t d;
+    if (target <= (float)exposure_ms) {
+        d = floor_ms;                 /* 已压满, 只回探 */
+    } else {
+        d = (uint32_t)(target - (float)exposure_ms);
+        if (d < floor_ms) d = floor_ms;
+    }
+    if (d > hi) d = hi;
+    return d;
+}
+
 int chan_psd_order(const uint8_t *chans, const uint16_t *weights, int n, uint8_t *out)
 {
     if (n <= 0 || !chans || !out) return 0;

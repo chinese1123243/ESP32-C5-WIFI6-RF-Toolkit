@@ -11,6 +11,7 @@
  *   避免安静环境下 base 趋近 0 导致噪声也触发.
  */
 #include "csi.h"
+#include "csi_det.h"
 #include "radio_common.h"
 #include "wifi_attack.h"
 
@@ -72,9 +73,10 @@ typedef struct {
     uint8_t  mac[6];
     float    prev[CSI_MAX_SUB];
     int      n;
-    float    base;
+    float    base;       /* 自检与输出用的慢速基线, 判定见 csi_det_t */
     float    peak;       /* 该源出现过的最大相邻帧差, 自检用它判定 */
     uint32_t frames;
+    csi_det_t det;       /* 动作判定: 非对称基线 + 离散度归一 + CUSUM 兜底 */
 } mac_stat_t;
 static mac_stat_t s_ms[CSI_MAC_SLOTS];
 
@@ -162,6 +164,7 @@ static void csi_task(void *arg)
                     ms->n = 0;
                     ms->base = -1.0f;
                     ms->frames = 0;
+                    csi_det_reset(&ms->det);   /* 槽位复用, 旧基线不许带过来 */
                     break;
                 }
             }
@@ -214,12 +217,14 @@ static void csi_task(void *arg)
 
         /* 采样输出按帧数计而不是按时间: 时间门在多源交替时会被判空的帧占满 */
         if (++s_sample_cnt % CSI_SAMPLE_EVERY == 0) {
-            bool motion = ms && (metric > ms->base * CSI_MOTION_K) &&
-                          (metric > CSI_MOTION_FLOOR);
+            /* 判定交给 csi_det: 固定 2 倍门限在持续动作时会被自己的基线学走
+             * (离线合成序列 1600 样本只有 1% 仍报动作), 且不看噪声水平. */
+            bool motion = ms && csi_det_update(&ms->det, metric);
+            float score = ms ? ms->det.score : 0.0f;
             printf("META,CSI,SAMPLE,mac,%02x%02x%02x%02x%02x%02x,metric,%.2f,base,%.2f,"
-                   "motion,%d,rssi,%d,len,%u\n",
+                   "z,%.1f,motion,%d,rssi,%d,len,%u\n",
                    e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5],
-                   metric, ms ? ms->base : 0.0f, motion ? 1 : 0,
+                   metric, ms ? ms->base : 0.0f, score, motion ? 1 : 0,
                    (int)e->rssi, (unsigned)e->len);
             if (motion) s_motion_cnt++;
             fflush(stdout);
