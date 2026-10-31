@@ -1,5 +1,6 @@
 /* locate.c: 信号定位实现 */
 #include "locate.h"
+#include "locate_est.h"
 #include "wifi_db.h"
 #include "radio_common.h"
 #include "job.h"
@@ -23,6 +24,9 @@ typedef struct { int16_t rssi; uint8_t ch; uint32_t t_ms; } loc_sample_t;
 
 /* 300 个采样点若放内部 RAM 要 2.4KB, NimBLE 会因此起不来, 改 PSRAM. */
 static loc_sample_t *s_smp = NULL;
+static int16_t      *s_scr = NULL;   /* loc_estimate 的排序暂存, 放 PSRAM */
+static int16_t      *s_vals = NULL;  /* 采样值的连续副本, 放 PSRAM (600B 不能上栈) */
+static loc_stat_t    s_st;           /* 最近一次的抗离群统计, 供输出 */
 static int          s_n = 0;
 static volatile bool s_run = false;
 static TaskHandle_t s_task = NULL;
@@ -53,26 +57,34 @@ static int ch_now(void)
 
 static void statistics(int *avg, int *mn, int *mx, const char **trend)
 {
-    int sum = 0, lo = 0, hi = -127;
+    int lo = 0, hi = -127;
     for (int i = 0; i < s_n; i++) {
         int v = s_smp[i].rssi;
-        sum += v;
-        if (v < lo) lo = v;
-        if (v > hi) hi = v;
+        if (i == 0 || v < lo) lo = v;
+        if (i == 0 || v > hi) hi = v;
     }
-    *avg = s_n ? sum / s_n : 0;
     *mn = s_n ? lo : 0;
     *mx = s_n ? hi : 0;
 
-    /* 趋势: 最近 4 个样本 vs 最早 4 个 */
-    const char *t = "flat";
-    if (s_n >= 8) {
-        int a = 0, b = 0;
-        for (int i = 0; i < 4; i++) { a += s_smp[i].rssi; b += s_smp[s_n - 1 - i].rssi; }
-        if (b - a >= 4) t = "up";          /* 数值变大 = 更近 */
-        else if (a - b >= 4) t = "down";
+    /* 主估计用截尾均值: 多径深衰落是重尾的, 算术平均会被 10~15dB 的掉点拉低.
+     * 离线对照 (test/host/test_locate_est.c, 每种 400 次): 离群 20% 时
+     * 均值 RMSE 1.83dB, 截尾 1.04dB, 中位 0.99dB; 离群 30% 时截尾仍最好.
+     * 截尾均值在"无离群"场景只比均值差 0.04dB, 所以取它做默认.
+     */
+    if (s_n > 0 && s_scr && s_vals) {
+        for (int i = 0; i < s_n; i++) s_vals[i] = s_smp[i].rssi;
+        loc_estimate(s_vals, s_n, s_scr, &s_st);
+        *avg = s_st.trimmed;
+        int slope = loc_trend(s_vals, s_n, s_scr);
+        if (slope >= 1)      *trend = "up";     /* 数值变大 = 更近 */
+        else if (slope <= -1) *trend = "down";
+        else                  *trend = "flat";
+    } else {
+        *avg = 0;
+        *trend = "flat";
+        s_st.median = s_st.mad = s_st.mean = 0;
+        s_st.n = s_n;
     }
-    *trend = t;
 }
 
 static void locate_task(void *arg)
@@ -97,8 +109,8 @@ static void locate_task(void *arg)
             int avg, mn, mx; const char *trend;
             statistics(&avg, &mn, &mx, &trend);
             char macs[18]; mac_to_str(s_mac, macs);
-            printf("META,LOCATE,T,mac,%s,rssi,%d,avg,%d,min,%d,max,%d,n,%d,trend,%s\n",
-                   macs, rssi, avg, mn, mx, s_n, trend);
+            printf("META,LOCATE,T,mac,%s,rssi,%d,avg,%d,med,%d,mad,%d,min,%d,max,%d,n,%d,trend,%s\n",
+                   macs, rssi, avg, s_st.median, s_st.mad, mn, mx, s_n, trend);
             fflush(stdout);
             event_publish("LOCATE", "mac=%s rssi=%d avg=%d trend=%s", macs, rssi, avg, trend);
         }
@@ -132,6 +144,17 @@ esp_err_t locate_start(const uint8_t mac[6], bool is_client, uint32_t secs)
         if (!s_smp) s_smp = malloc(LOC_MAX * sizeof(loc_sample_t));
         if (!s_smp) return ESP_ERR_NO_MEM;
     }
+    if (!s_scr) {
+        s_scr = heap_caps_malloc(LOC_MAX * sizeof(int16_t),
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_scr) s_scr = malloc(LOC_MAX * sizeof(int16_t));
+    }
+    if (!s_vals) {
+        s_vals = heap_caps_malloc(LOC_MAX * sizeof(int16_t),
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_vals) s_vals = malloc(LOC_MAX * sizeof(int16_t));
+    }
+    if (!s_scr || !s_vals) return ESP_ERR_NO_MEM;
 
     memcpy(s_mac, mac, 6);
     s_is_client = is_client;
