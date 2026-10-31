@@ -1,6 +1,6 @@
 {
   "name": "rftool-c5-app",
-  "version": "2.4.0",
+  "version": "2.4.8",
   "description": "ESP32-C5 RF 控制器 (BLE 直连)",
   "private": true,
   "scripts": {
