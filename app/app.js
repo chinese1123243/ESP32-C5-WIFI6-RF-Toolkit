@@ -1372,14 +1372,18 @@ function scenarioText(p){
 function locateText(p){
     const k = p[2];
     const kv = kvOf(p, 3);
+    const TREND = { up:'变近', down:'变远', flat:'平稳' };
     if (k === 'T')
         return 'rssi ' + (kv.rssi || '?') + ' · 均 ' + (kv.avg || '?') +
+               ' · 中位 ' + (kv.med || '?') +
                ' · 区间 ' + (kv.min || '?') + '~' + (kv.max || '?') +
-               ' · n ' + (kv.n || 0) + ' · ' + (kv.trend || '');
+               ' · 离散 ' + (kv.mad || '0') + ' dB' +
+               ' · n ' + (kv.n || 0) + ' · ' + (TREND[kv.trend] || kv.trend || '');
     if (k === 'START') return '采样开始 · ' + (kv.kind === 'client' ? '客户端' : 'AP') +
                               ' · ' + (kv.secs || '?') + 's';
     if (k === 'DONE')  return '采样完成 · ' + (kv.samples || 0) + ' 个 · 均值 ' +
-                              (kv.avg || '?') + ' · 丢失 ' + (kv.miss || 0);
+                              (kv.avg || '?') + ' · 丢失 ' + (kv.miss || 0) +
+                              ' · 统计 ' + (kv.us_max || '?') + ' µs';
     if (k === 'STOP')  return '采样已停止';
     if (k === 'ERR')   return '失败: ' + (kv.msg || '?');
     return p.slice(2).join(' · ');
@@ -1423,6 +1427,26 @@ function parseOutputLine(line){
     /* 导出载荷采集: start 与 done 之间的非 META 行原样收进缓冲 */
     if (exportCap && !line.startsWith('META,')) exportCap.lines.push(line);
 
+    /* health --json: 把新加的可观测字段(作业数、出站速率、ρ)收进一条摘要.
+     * 原来这行 JSON 直接落进日志, 字段一多没人读得过来. */
+    if (line.startsWith('{"ok":true')){
+        try {
+            const h = JSON.parse(line);
+            const rho = (h.ev_rho_pct != null) ? (h.ev_rho_pct + '%') : '?';
+            let msg = '[诊断] 堆 ' + fmtBytes(h.internal_free) +
+                      ' · 最大连续 ' + fmtBytes(h.internal_largest) +
+                      ' · 任务 ' + (h.tasks != null ? h.tasks : '?') +
+                      ' · 作业 ' + (h.jobs_active || 0) + '/' + (h.jobs_cap || 0) +
+                      (h.jobs_peak ? ' (peak ' + h.jobs_peak + ')' : '') +
+                      ' · 出站 ' + ((h.out_rate_x10 || 0) / 10) + '/s' +
+                      ' · ρ ' + rho;
+            if (h.jobs_rejected) msg += ' · 拒 ' + h.jobs_rejected +
+                                        ' (' + (h.jobs_rej_name || '') + ')';
+            log(msg, 'meta');
+        } catch(_) { log(line); }
+        return;
+    }
+
     /* 设备拒绝: 协议层错误与 PMF 拦截.
      * 这两类以前没有任何分支, 设备回了话 App 当普通日志滚过去, 调用方
      * 还在等回执, 8 秒后报"设备无响应"。设备明明说了原因却没人听. */
@@ -1440,7 +1464,8 @@ function parseOutputLine(line){
             const kv = kvOf(line.split(','), 3);
             log('[CSI] 自检 ' + kv.result + ' · peak ' + kv.peak, kv.result === 'pass' ? 'ok' : 'err');
         } else if (line.startsWith('META,CSI,ERR,')){
-            log('[CSI] 失败: ' + line.slice(14), 'err');
+            const kv = kvOf(line.split(','), 3);
+            log('[CSI] ' + (kv.msg || kv.detail || '失败'), 'err');
         }
         return;
     }
@@ -2983,7 +3008,7 @@ const CLI_REF = [
     ]},
     { g:'扫描与嗅探', items:[
         { c:'sniff 6',                     d:'定信道嗅探, -n 0 表示不限包数' },
-        { c:'sniff auto --dwell 300',      d:'全信道轮询, 按各信道发现数排序; --policy wrl 用旧的帧率加权' },
+        { c:'sniff auto --dwell 300',      d:'全信道轮询; --policy psd(默认)|adt(前2秒更快)|wrl(帧率加权)' },
         { c:'airtime --band 2g',           d:'逐信道测空口占用, 给注入挑一条真闲的信道' },
         { c:'wifi6',                       d:'看 BSS Color 冲突、TWT 与 6GHz 邻居' },
         { c:'csi start 6',                d:'CSI 动作感知; csi selftest 验判定链路', danger:true },
@@ -4840,6 +4865,8 @@ const RF_NAV = [
       lb:'嗅探与握手', d:'抓帧, 自动归档可破解握手', panel:'sniff', blks:[0,1] },
     { k:'capture', tip:'',
       lb:'原始帧落盘', d:'写 Flash, 导出 pcap', panel:'sniff', blks:[2] },
+    { k:'scenario', tip:'三个动作都会先自动扫一轮，再按有没有目标决定下一步。',
+      lb:'一键编排', d:'勘察、抓握手、判 PMF', panel:'adv', blks:[0] },
   ]},
   { g:'注入', items:[
     { k:'deauth', tip:'目标必须先出现在扫描列表里。PMF 必需的 AP 会直接拒绝，改走降级或 Evil Twin。',
@@ -4859,41 +4886,45 @@ const RF_NAV = [
     { k:'downgrade', tip:'只对 WPA3 过渡模式有效，纯 WPA3 的 AP 没有降级空间。',
       lb:'WPA3 降级', d:'逼出 WPA2 四次握手', panel:'downgrade', blks:[0] },
   ]},
-  { g:'工具', items:[
-    { k:'scenario', tip:'三个动作都会先自动扫一轮，再按有没有目标决定下一步。',
-      lb:'一键编排', d:'勘察、抓握手、判 PMF', panel:'adv', blks:[0] },
-    { k:'rawframe', tip:'十六进制裸帧，设备不做校验，填错不会有提示。',
-      lb:'原始帧构造', d:'手写 802.11 帧并发送', panel:'adv', blks:[3] },
-    { k:'bleadv', tip:'广播内容自己填。控制链还在，不影响 App 连接。',
-      lb:'BLE 广播伪造', d:'iBeacon、Eddystone', panel:'tools', blks:[1] },
+  { g:'测量', items:[
     { k:'ftm', tip:'',
       lb:'FTM 测距', d:'802.11mc 测真实距离', panel:'tools', blks:[2] },
     { k:'locate', tip:'采样时拿着设备走动，静止只会得到一条噪声曲线。',
       lb:'信号定位', d:'RSSI 采样与趋势', panel:'tools', blks:[3] },
+  ]},
+  { g:'无线', items:[
+    { k:'rawframe', tip:'十六进制裸帧，设备不做校验，填错不会有提示。',
+      lb:'原始帧构造', d:'手写 802.11 帧并发送', panel:'adv', blks:[3] },
+    { k:'bleadv', tip:'广播内容自己填。控制链还在，不影响 App 连接。',
+      lb:'BLE 广播伪造', d:'iBeacon、Eddystone', panel:'tools', blks:[1] },
     { k:'zb', tip:'802.15.4 与 BLE 广播争同一块内部 RAM，本版默认关闭。',
       lb:'802.15.4 嗅探', d:'Zigbee、Thread', panel:'tools', blks:[4] },
     { k:'blepwr', tip:'提高功率会增加功耗和发热，链路稳定后可以调回。',
       lb:'BLE 发射功率', d:'调控制链功率', panel:'tools', blks:[5] },
   ]},
-  { g:'系统', items:[
-    { k:'conn', tip:'GATT 与 MTU 在连接时协商，这里只显示链路层信息。',
-      lb:'连接信息', d:'链路、固件版本', panel:'data', blks:[0] },
+  { g:'数据', items:[
     { k:'snapshot', tip:'读的是设备端内存表，上限 256 个 AP、256 个客户端。',
       lb:'数据库快照', d:'AP、客户端、握手', panel:'data', blks:[1] },
     { k:'export', tip:'导出由设备端拼装，数据量大时先停掉嗅探。',
       lb:'导出', d:'JSON、CSV、pcap', panel:'data', blks:[2] },
     { k:'http', tip:'服务起在 192.168.71.1，先让手机连板子的热点。',
       lb:'板载 HTTP', d:'浏览器访问 /api', panel:'data', blks:[3] },
+  ]},
+  { g:'维护', items:[
     { k:'ota', tip:'新镜像写进另一个分区，45 秒内不崩才确认，崩了由引导器回滚。',
       lb:'固件升级', d:'双分区, 可回滚', panel:'data', blks:[4] },
     { k:'diag', tip:'自检看堆、任务、模块状态。日志级别在 CLI 里改。',
       lb:'诊断', d:'自检与日志', panel:'data', blks:[5] },
-    { k:'about', tip:'仓库里有固件、App 与版本说明。链接跳系统浏览器，连接不会断。',
-      lb:'关于', d:'版本、作者、仓库', panel:'data', blks:[6] },
+  ]},
+  { g:'系统', items:[
+    { k:'conn', tip:'GATT 与 MTU 在连接时协商，这里只显示链路层信息。',
+      lb:'连接信息', d:'链路、固件版本', panel:'data', blks:[0] },
     { k:'cli', tip:'直接敲固件命令，输出原样回显。',
       lb:'CLI 控制台', d:'直接敲命令', panel:'raw', blks:[0] },
     { k:'cmds', tip:'点一行填进控制台，参数可以再改。标红的需要 --yes。',
       lb:'指令速查', d:'全部命令与用法', panel:'raw', blks:[1] },
+    { k:'about', tip:'仓库里有固件、App 与版本说明。链接跳系统浏览器，连接不会断。',
+      lb:'关于', d:'版本、作者、仓库', panel:'data', blks:[6] },
   ]},
 ];
 
