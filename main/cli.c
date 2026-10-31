@@ -37,6 +37,7 @@
 #include "ota.h"        /* 双区 OTA */
 #include "scenario.h"   /* /: 场景编排 + PMF 感知 */
 #include "locate.h"     /* 信号定位 */
+#include "job.h"
 #include "health.h"     /* 整机自检 (独立文件) */
 #include "event_bus.h"  /* 统一事件总线 */
 #include "out_stream.h" /* 出站汇点: 到达率计量 */
@@ -1210,7 +1211,7 @@ static void ev_push_task(void *pv)
     printf("META,EVILTWIN,PUSH,done,bursts,%d\n", a->bursts);
     fflush(stdout);
     free(a);
-    vTaskDelete(NULL);
+    return;   /* 出口在 job_trampoline */
 }
 
 static int cmd_eviltwin(int argc, char **argv)
@@ -1273,7 +1274,7 @@ static int cmd_eviltwin(int argc, char **argv)
         if (a) {
             memcpy(a->bssid, bssid, 6);
             a->bursts = 20;
-            if (xTaskCreate(ev_push_task, "ev_push", 3072, a, 5, NULL) != pdPASS) {
+            if (job_spawn(&(job_def_t){"ev_push", ev_push_task, a, 3072, 5, 0}, NULL) != ESP_OK) {
                 free(a);
                 printf("META,EVILTWIN,PUSH,err,task_create\n"); fflush(stdout);
             }

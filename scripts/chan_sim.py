@@ -324,8 +324,59 @@ def run_band(world, horizon, base=BASE_DWELL, prior=None, floor=DET_FLOOR,
     return t
 
 
+def run_adt(world, horizon, prior=None, probe=60.0, empty_stop=2,
+            cap=BASE_DWELL * 4, empty_gap=4, **kw):
+    """自适应截断驻留 (ADT): 短探针起步, 有货就续, 连续空窗就撤.
+
+    与 psd 的差别在"一轮要给每条信道多少时间". psd 首轮按探测下限 250ms 铺满
+    78 条信道, 一轮就是 21 秒, 20 秒视界内根本轮不到第二轮; 而热信道上 9 台 AP
+    在 250ms 里只能发现 0.913^9 = 44%, 剩下那批要等下一轮, 于是尾延迟很长.
+
+    ADT 反过来: 首轮每条只给 probe=60ms, 一轮 6.2 秒; 有 AP 露面的信道当场续期,
+    每次 probe 续一段, 直到连续 empty_stop 个空窗或到 cap. 没有 AP 露面的信道
+    直接撤, 之后每 empty_gap 轮才回探一次.
+
+    代价是首轮对"beacon 间隔 204.8ms 的慢 AP"漏检率高 (60ms 命中率 25%),
+    靠回探补. 这正是"先便宜地扫一遍, 再对可疑处加注"的思路.
+    """
+    prior = prior or {}
+    found_here = {c: 0 for c in CHANNELS}
+    misses = {c: 0 for c in CHANNELS}      # 连续没探到的轮数
+    last_round = {c: -99 for c in CHANNELS}
+    rnd = 0
+    t = 0.0
+    while t < horizon:
+        order = [c for c in CHANNELS
+                 if misses[c] == 0 or rnd - last_round[c] >= empty_gap * (1 << min(2, misses[c] // 2))]
+        if not order:
+            order = list(CHANNELS)
+        order.sort(key=lambda c: (-prior.get(c, 0), -found_here[c], c))
+        for ch in order:
+            if t >= horizon:
+                break
+            spent = 0.0
+            empty_run = 0
+            while spent < cap and t < horizon:
+                new, _frames = world.drain(ch, probe, t)
+                t += probe + (world.switch_ms if spent == 0 else 0.0)
+                spent += probe
+                if new:
+                    found_here[ch] += new
+                    empty_run = 0
+                else:
+                    empty_run += 1
+                    if empty_run >= empty_stop:
+                        break
+            last_round[ch] = rnd
+            if found_here[ch] == 0:
+                misses[ch] += 1
+            else:
+                misses[ch] = 0
+        rnd += 1
+    return t
+
 POLICIES = {"uniform": run_uniform, "wrl": run_wrl, "psd": run_psd,
-            "cov": run_cov, "band": run_band}
+            "cov": run_cov, "band": run_band, "adt": run_adt}
 
 
 def episode(policy, seed, horizon, n_cold_aps=0, **kw):

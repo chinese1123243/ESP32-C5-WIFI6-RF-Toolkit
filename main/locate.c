@@ -2,6 +2,7 @@
 #include "locate.h"
 #include "wifi_db.h"
 #include "radio_common.h"
+#include "job.h"
 #include "event_bus.h"
 #include "wifi_attack.h"
 
@@ -115,7 +116,7 @@ static void locate_task(void *arg)
 
     s_run = false;
     s_task = NULL;
-    vTaskDelete(NULL);
+    return;   /* 出口在 job_trampoline */
 }
 
 esp_err_t locate_start(const uint8_t mac[6], bool is_client, uint32_t secs)
@@ -145,7 +146,8 @@ esp_err_t locate_start(const uint8_t mac[6], bool is_client, uint32_t secs)
     fflush(stdout);
     event_publish("LOCATE", "start %s %s", macs, is_client ? "client" : "ap");
 
-    if (xTaskCreate(locate_task, "locate", 3072, NULL, 4, &s_task) != pdPASS) {
+    if (job_spawn(&(job_def_t){ .name = "locate", .fn = locate_task,
+                                .stack = 3072, .prio = 4 }, &s_task) != ESP_OK) {
         s_run = false;
         return ESP_FAIL;
     }

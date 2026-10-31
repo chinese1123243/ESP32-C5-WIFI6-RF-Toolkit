@@ -23,6 +23,7 @@
 #include "cap.h"
 #include "hs.h"
 #include "karma.h"
+#include "job.h"
 #include "event_bus.h"
 #include "radio_arb.h"
 #include "chan_sched.h"
@@ -388,7 +389,8 @@ static void channel_rotate_task(void *pv)
         WDT_RESET();
     }
     WDT_DEL();
-    vTaskDelete(NULL);
+    /* 出口由 job_trampoline 负责, 这里自己删会让户籍槽位泄漏 */
+    return;
 }
 
 typedef enum {
@@ -502,7 +504,8 @@ static void sniff_progress_task(void *pv)
     }
     s_progress_task = NULL;
     WDT_DEL();
-    vTaskDelete(NULL);
+    /* 出口由 job_trampoline 负责, 这里自己删会让户籍槽位泄漏 */
+    return;
 }
 
 static void sniff_progress_start(void)
@@ -515,8 +518,10 @@ static void sniff_progress_start(void)
      * 改成" 号不对就退出", 旧任务最多再活一秒, 不会重复输出. */
     uint32_t g = (uint32_t)atomic_fetch_add(&s_progress_gen, 1) + 1;
     atomic_store(&s_progress_run, true);
-    if (xTaskCreate(sniff_progress_task, "snprog", 3072,
-                    (void *)(uintptr_t)g, 3, &s_progress_task) != pdPASS) {
+    if (job_spawn(&(job_def_t){ .name = "snprog", .fn = sniff_progress_task,
+                                .arg = (void *)(uintptr_t)g,
+                                .stack = 3072, .prio = 3, .flags = JOB_F_INTERNAL },
+                  &s_progress_task) != ESP_OK) {
         atomic_store(&s_progress_run, false);
     }
 }
@@ -796,7 +801,7 @@ static void inject_task(void *pv)
     WDT_DEL();
     radio_release(RES_TX_INJECT);
     atomic_store(&s_inject_running, false);
-    vTaskDelete(NULL);
+    return;   /* 出口在 job_trampoline */
 }
 
 
@@ -1203,8 +1208,9 @@ static esp_err_t inject_start_common(inject_args_t *a)
            (unsigned)a->channel);
     fflush(stdout);
 
-    BaseType_t r = xTaskCreate(inject_task, "inject", 4096, a, 5, NULL);
-    if (r != pdPASS) {
+    esp_err_t r = job_spawn(&(job_def_t){ .name = "inject", .fn = inject_task,
+                                          .arg = a, .stack = 4096, .prio = 5 }, NULL);
+    if (r != ESP_OK) {
         atomic_store(&s_state, WIFI_ATK_IDLE);
         atomic_store(&s_inject_running, false);
         rgb_led_set_status(RGB_IDLE);
@@ -1353,9 +1359,11 @@ esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms, uint32_t count)
     sniff_progress_start();
 
     uint32_t rg = (uint32_t)atomic_fetch_add(&s_rotate_gen, 1) + 1;
-    BaseType_t r = xTaskCreate(channel_rotate_task, "chrot", 2048,
-                               (void *)(uintptr_t)rg, 5, NULL);
-    if (r != pdPASS) {
+    esp_err_t r = job_spawn(&(job_def_t){ .name = "chrot", .fn = channel_rotate_task,
+                                          .arg = (void *)(uintptr_t)rg,
+                                          .stack = 2048, .prio = 5,
+                                          .flags = JOB_F_INTERNAL }, NULL);
+    if (r != ESP_OK) {
         atomic_store(&s_state, WIFI_ATK_IDLE);
         atomic_store(&s_channel_rotate, false);
         esp_wifi_set_promiscuous(false);

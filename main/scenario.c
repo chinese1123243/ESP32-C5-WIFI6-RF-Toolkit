@@ -4,6 +4,7 @@
 #include "wifi_db.h"
 #include "radio_common.h"
 #include "hs.h"
+#include "job.h"
 #include "event_bus.h"
 
 #include <stdio.h>
@@ -162,7 +163,7 @@ static void scen_task(void *arg)
     s_run = false;
     s_kind = SCEN_IDLE;
     s_task = NULL;
-    vTaskDelete(NULL);
+    return;   /* 出口在 job_trampoline */
 }
 
 static esp_err_t scen_spawn(scen_t kind, uint32_t secs)
@@ -172,7 +173,8 @@ static esp_err_t scen_spawn(scen_t kind, uint32_t secs)
     s_secs = secs ? secs : 30;
     s_rounds = 0;
     s_run = true;
-    if (xTaskCreate(scen_task, "scenario", 4096, NULL, 4, &s_task) != pdPASS) {
+    if (job_spawn(&(job_def_t){ .name = "scenario", .fn = scen_task,
+                                .stack = 4096, .prio = 4 }, &s_task) != ESP_OK) {
         s_run = false;
         s_kind = SCEN_IDLE;
         return ESP_FAIL;

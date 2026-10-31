@@ -365,7 +365,8 @@ def main():
     REQUIRED_HEALTH = (
         "heap_total", "internal_free", "internal_largest", "psram_free",
         "tasks", "events", "ev_pub", "ev_dropped", "ev_ble_drop",
-        "out_rate_x10", "ev_rho_pct", "cli_stack_min", "init_stack_min",
+        "out_rate_x10", "ev_rho_pct", "jobs_active", "jobs_aux", "jobs_peak",
+        "jobs_cap", "jobs_rejected", "cli_stack_min", "init_stack_min",
         "boot_count",
     )
     probe = d.health_fields()
