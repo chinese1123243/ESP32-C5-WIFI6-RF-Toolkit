@@ -296,6 +296,7 @@ let connected = false, connecting = false, negotiatedMtu = 0;
 let bleScanHandle = null;
 const bleDevices = new Map();
 const apList = [];
+let lastHealth = null;   /* 最近一次 health --json, 供仪表盘系统观测行 */
 const clientList = [];
 let selectedAp = null, selectedClient = null;
 
@@ -1443,6 +1444,9 @@ function parseOutputLine(line){
             if (h.jobs_rejected) msg += ' · 拒 ' + h.jobs_rejected +
                                         ' (' + (h.jobs_rej_name || '') + ')';
             log(msg, 'meta');
+            lastHealth = h;
+            const sys = document.getElementById('dashSys');
+            if (sys){ sys.hidden = false; sys.textContent = '系统观测 · ' + msg.slice(5); }
         } catch(_) { log(line); }
         return;
     }
@@ -4718,6 +4722,44 @@ if ('serviceWorker' in navigator){
 
     const INK = 'rgba(234,242,255,';   /* 单色: 只用近白 + 透明度 */
 
+    function drawChans(){
+        const cv = $i('dashChans');
+        if (!cv) return;
+        const w = cv.clientWidth || 240, h = 56;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        if (cv.width !== Math.round(w*dpr) || cv.height !== Math.round(h*dpr)){
+            cv.width = Math.round(w*dpr); cv.height = Math.round(h*dpr);
+        }
+        const ctx = cv.getContext('2d');
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, w, h);
+
+        const counts = {};
+        (apList || []).forEach(a => { if (a.channel) counts[a.channel] = (counts[a.channel] || 0) + 1; });
+        const chs = Object.keys(counts).map(Number).sort((a, b) => a - b);
+        if (!chs.length){
+            ctx.fillStyle = 'rgba(232,241,255,.18)';
+            ctx.font = '9px ui-monospace,monospace';
+            ctx.fillText('信道分布 · 扫描后显示', 1, h - 4);
+            return;
+        }
+        const max = Math.max(...Object.values(counts));
+        const bw = Math.max(2, (w - (chs.length - 1)) / chs.length);
+        let x = 0;
+        chs.forEach(ch => {
+            const c = counts[ch];
+            const bh = Math.max(2, (c / max) * (h - 16));
+            ctx.fillStyle = 'rgba(234,242,255,' + (0.22 + 0.6 * (c / max)).toFixed(2) + ')';
+            ctx.fillRect(x, h - 5 - bh, bw - 1, bh);
+            x += bw;
+        });
+        let busy = chs[0];
+        chs.forEach(ch => { if (counts[ch] > counts[busy]) busy = ch; });
+        ctx.fillStyle = 'rgba(232,241,255,.55)';
+        ctx.font = '9px ui-monospace,monospace';
+        ctx.fillText('信道分布 · 最忙 ch' + busy + ' ×' + counts[busy], 1, 10);
+    }
+
     function drawSpark(){
         const w = spark.clientWidth || 240, h = 34;
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -4743,7 +4785,9 @@ if ('serviceWorker' in navigator){
 
         ctx.beginPath();
         hist.forEach((v, i) => { const x = xOf(i), y = yOf(v); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
-        ctx.strokeStyle = INK + '.85)';
+        const state = txtOf('stState') || 'IDLE';
+        const active = state !== 'IDLE';
+        ctx.strokeStyle = INK + (active ? '.85' : '.35)');
         ctx.lineWidth = 1;
         ctx.lineJoin = 'round';
         ctx.stroke();
@@ -4770,6 +4814,7 @@ if ('serviceWorker' in navigator){
         $i('dashCred').textContent = String(numOf('credCount'));
 
         drawSpark();
+        drawChans();
 
         const msg = $i('dashMsg');
         if (!connected){
@@ -4781,7 +4826,7 @@ if ('serviceWorker' in navigator){
         }
     }
     setInterval(dashTick, 1000);
-    window.addEventListener('resize', drawSpark, { passive:true });
+    window.addEventListener('resize', () => { drawSpark(); drawChans(); }, { passive:true });
     dashTick();
 
     /* 仪表盘快捷动作 -> 复用既有按钮 */
