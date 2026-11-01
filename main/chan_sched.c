@@ -104,3 +104,50 @@ int chan_psd_order(const uint8_t *chans, const uint16_t *weights, int n, uint8_t
     }
     return n;
 }
+
+
+#define SACS_BI_MS      102.4f
+#define SACS_Q0         0.35f    /* 空信道"其实有货"的先验 */
+#define SACS_PRIOR_REM  1.2f     /* 先验下空信道的剩余台数 */
+
+static float sacs_survive(uint32_t exposure_ms)
+{
+    float e = (float)exposure_ms;
+    return 0.75f * expf(-e / SACS_BI_MS) + 0.25f * expf(-e / (2.0f * SACS_BI_MS));
+}
+
+float chan_residual(uint32_t found, uint32_t exposure_ms)
+{
+    float s = sacs_survive(exposure_ms);
+    /* 上下都要夹: 曝光为 0 时 s=1, 不夹的话 1-s=0 直接除出 inf. */
+    if (s < 1e-3f) s = 1e-3f;
+    if (s > 0.999f) s = 0.999f;
+    if (found) return (float)found * s / (1.0f - s);
+    /* 贝叶斯后验: 先验有货 q0, 探过 E 仍没看到 -> 后验 q0*s/(q0*s+1-q0) */
+    float post = SACS_Q0 * s / (SACS_Q0 * s + (1.0f - SACS_Q0));
+    return SACS_PRIOR_REM * post;
+}
+
+uint32_t chan_dwell_sat(uint32_t floor_ms, uint32_t cap_ms, uint32_t found,
+                        uint32_t exposure_ms, uint32_t eps_permille)
+{
+    if (found < 2 || eps_permille < 1) return floor_ms;
+    float need = SACS_BI_MS * logf(((float)found + 2.0f) * 1000.0f / (float)eps_permille);
+    float left = need - (float)exposure_ms;
+    if (left < (float)floor_ms) return floor_ms;
+    if (left > (float)cap_ms) return cap_ms;
+    return (uint32_t)left;
+}
+
+uint32_t chan_dwell_opt(uint32_t switch_ms)
+{
+    /* e^-x (x + a + 1) = 1, a = switch/bi. 二分 30 次足够到 0.1ms */
+    float a = (float)switch_ms / SACS_BI_MS;
+    float lo = 0.01f, hi = 12.0f;
+    for (int i = 0; i < 30; i++) {
+        float mid = 0.5f * (lo + hi);
+        float f = expf(-mid) * (mid + a + 1.0f) - 1.0f;
+        if (f > 0.0f) lo = mid; else hi = mid;
+    }
+    return (uint32_t)(0.5f * (lo + hi) * SACS_BI_MS);
+}

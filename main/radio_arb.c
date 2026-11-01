@@ -10,6 +10,9 @@
 #include "freertos/task.h"
 #include "esp_timer.h"
 #include "city_time.h"
+#include "esp_wifi.h"
+#include "esp_log.h"
+#include "esp_phy_init.h"
 
 #define RADIO_CASE_MAX 32
 

@@ -185,13 +185,30 @@ void hs_feed(const uint8_t *f, uint16_t len, int8_t rssi, uint8_t chan)
             memcmp(s_tab[i].sta, sta, 6) == 0) { h = &s_tab[i]; break; }
     }
     if (!h) {
-        if (s_used >= HS_SLOTS) return;              /* 槽满: 丢弃新目标 */
+        if (s_used >= HS_SLOTS) {
+            /* 槽满时优先挤掉"还没配成完整握手且信号最弱"的那条.
+             * 原来的做法是一律丢弃新目标: 现场先扫到几个弱信号目标就会把 8 个
+             * 槽占死, 之后真正在握手的那台一个位置都没有. 已完整的记录不挤. */
+            hs_t *victim = NULL;
+            for (int i = 0; i < s_used; i++) {
+                if (is_complete(&s_tab[i])) continue;
+                if (!victim || s_tab[i].rssi < victim->rssi) victim = &s_tab[i];
+            }
+            if (!victim) return;                     /* 全是完整记录: 不挤 */
+            h = victim;
+            memset(h, 0, sizeof(*h));
+            memcpy(h->bssid, bssid, 6);
+            memcpy(h->sta, sta, 6);
+            h->chan = chan;
+            goto have_slot;
+        }
         h = &s_tab[s_used++];
         memset(h, 0, sizeof(*h));
         memcpy(h->bssid, bssid, 6);
         memcpy(h->sta, sta, 6);
         h->chan = chan;
     }
+have_slot:;
 
     int idx = msg - 1;
     memcpy(h->rc[idx], f + eo + 9, 8);               /* Replay Counter */

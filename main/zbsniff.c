@@ -161,15 +161,23 @@ static void zb_task(void *pv)
 
 /* 射频引用计数, zbsniff 与 zbtx 共用 */
 static _Atomic int s_radio_refs = 0;
+/* MAC 只初始化一次. esp_ieee802154_enable() 的 mac_init 不幂等 (二次调用报
+ * No free interrupt inputs), 而 disable() 会把与 Wi-Fi 共用的中断 free 掉,
+ * 之后 Wi-Fi 一帧都收不到. 所以这边只 init 不 deinit, 关的时候用 sleep. */
+static bool s_mac_up = false;
 
 esp_err_t zb_radio_acquire(void)
 {
     if (atomic_fetch_add(&s_radio_refs, 1) > 0) return ESP_OK;   /* 别人已经开过 */
 
-    esp_err_t e = esp_ieee802154_enable();
-    if (e != ESP_OK) {
-        atomic_fetch_sub(&s_radio_refs, 1);
-        return e;
+    esp_err_t e = ESP_OK;
+    if (!s_mac_up) {
+        e = esp_ieee802154_enable();
+        if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
+            atomic_fetch_sub(&s_radio_refs, 1);
+            return e;
+        }
+        s_mac_up = true;
     }
     esp_ieee802154_set_promiscuous(true);
     esp_ieee802154_set_rx_when_idle(true);
@@ -189,7 +197,12 @@ void zb_radio_release(void)
     }
     esp_ieee802154_set_rx_when_idle(false);
     esp_ieee802154_set_promiscuous(false);
-    esp_ieee802154_disable();
+
+    /* 只休眠, 不 disable. esp_ieee802154_disable() 内部走 mac_deinit ->
+     * esp_intr_free, 会把与 Wi-Fi 共用的那条中断释放掉, 之后 Wi-Fi 收到 0 帧,
+     * 而且 esp_wifi_stop/start、esp_phy_enable、重挂混杂都救不回来, 只能重启板子
+     * (2.4.10 实测). sleep 只关射频, MAC 与中断都留着, 下次 receive() 就唤醒. */
+    esp_ieee802154_sleep();
 }
 
 int zb_radio_refs(void) { return atomic_load(&s_radio_refs); }

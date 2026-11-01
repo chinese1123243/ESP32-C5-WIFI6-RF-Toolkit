@@ -375,6 +375,54 @@ def run_adt(world, horizon, prior=None, probe=60.0, empty_stop=2,
         rnd += 1
     return t
 
+def run_adtx(world, horizon, prior=None, probe=60.0, empty_stop=2,
+            cap=BASE_DWELL * 4, gap=2, growth=1.0, sat_eps=0.0, **kw):
+    """ADT-X: ADT + 有界回探.
+
+    ADT 对空信道做指数退避 (4, 8, 16 轮), 静态场景下省时间, 代价是运行中
+    才上线的 AP 基本等不到回探 (仿真里 6 台中途上线, 80% 的局漏检). 这里把
+    退避改成"每 gap 轮回探一次", 并把有货信道的驻留按饱和公式给足.
+
+    growth=1.0 表示不增长; 大于 1 时按空窗次数线性放大间隔.
+    """
+    prior = prior or {}
+    found_here = {c: 0 for c in CHANNELS}
+    misses = {c: 0 for c in CHANNELS}
+    last_round = {c: -99 for c in CHANNELS}
+    rnd = 0
+    t = 0.0
+    while t < horizon:
+        order = [c for c in CHANNELS
+                 if rnd - last_round[c] >= gap + int(growth * misses[c])]
+        if not order:
+            order = list(CHANNELS)
+        order.sort(key=lambda c: (-prior.get(c, 0), -found_here[c], c))
+        for ch in order:
+            if t >= horizon:
+                break
+            spent = 0.0
+            empty_run = 0
+            while spent < cap and t < horizon:
+                d = probe
+                if sat_eps > 0 and found_here[ch] >= 2:
+                    need = BEACON_MS * math.log((found_here[ch] + 2.0) / sat_eps) - spent
+                    d = max(probe, min(cap - spent, need))
+                new, _f = world.drain(ch, d, t)
+                t += d + (world.switch_ms if spent == 0 else 0.0)
+                spent += d
+                if new:
+                    found_here[ch] += new
+                    empty_run = 0
+                else:
+                    empty_run += 1
+                    if empty_run >= empty_stop:
+                        break
+            last_round[ch] = rnd
+            misses[ch] = 0 if found_here[ch] else misses[ch] + 1
+        rnd += 1
+    return t
+
+
 def run_adt2(world, horizon, prior=None, probe=40.0, floor=DET_FLOOR,
              shrink=0.5, empty_prior=0.3, cap=BASE_DWELL * 3, **kw):
     """ADT2: 密度估计 + 探测下限, 每次只挑一条最值的信道.
@@ -466,6 +514,16 @@ def run_adt3(world, horizon, probe=150.0, miss_eps=0.05, floor=DET_FLOOR,
         n = max(1, k[ch], int(prior.get(ch, 0)))
         return BEACON_MS * math.log(n / eps[0])
 
+    def dwell_for(ch):
+        if sat_eps <= 0.0:
+            return probe
+        # 饱和驻留: 已发现 k 台时把"还剩一台"的概率压到 sat_eps 需要
+        # bi*ln((k+1)/sat_eps) 的累计暴露, 增量部分就地补上.
+        if k[ch] < 2:
+            return probe
+        need = BI * math.log((k[ch] + 2.0) / sat_eps) - E[ch]
+        return max(probe, min(cap, need))
+
     def visit(ch, dwell):
         nonlocal t
         new, _f = world.drain(ch, dwell, t)
@@ -518,9 +576,101 @@ def run_adt3(world, horizon, probe=150.0, miss_eps=0.05, floor=DET_FLOOR,
                 break
     return t
 
+def _opt_dwell(switch_ms, bi=BEACON_MS, lo=0.05, hi=10.0):
+    """解析最优驻留: max_d (1-e^{-d/bi})/(d+s) 的一阶条件 e^{-x}(x+s/bi+1)=1.
+
+    解只跟 s/bi 有关, 与信道上几台 AP 无关, 所以全局一个 d*.
+    """
+    a = switch_ms / bi
+    f = lambda x: math.exp(-x) * (x + a + 1.0) - 1.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if f(mid) > 0: lo = mid
+        else: hi = mid
+    return (lo + hi) / 2 * bi
+
+
+def run_sacs(world, horizon, probe=120.0, floor=DET_FLOOR, cap=BASE_DWELL * 2,
+             thresh=0.45, prior_rem=1.2, renew_thresh=0.5, q0=0.35,
+             sat_eps=0.0, **kw):
+    """SACS: 生存分析 + 贝叶斯剩余量 + 递减 ε 探索.
+
+    三块:
+
+    1. 剩余量估计. 每台 AP 独立发 beacon, 累计暴露 E 后仍未发现的概率 s(E)
+       (两成分混合, 0.75@bi + 0.25@2bi, 对应现场混着 2 倍周期的 AP).
+       发现 k 台时 r = k*s/(1-s).
+
+    2. 空信道的后验. 不能因为"探过没看到"就把信道判死: 先验有货概率 q0,
+       探过 E 仍没货的后验 P(有货|没看到) = q0*s(E) / (q0*s(E) + 1 - q0),
+       剩余量 = E[n] * P. 这条保证长周期 AP 还有机会被回探, 也是尾延迟的来源.
+
+    3. 递减 ε 探索. 每 explore_every 次决策插入一次"最久没去过"的信道,
+       该间隔按 1.5 倍递增. 纯贪心会让冷信道永远排不上, 固定 ε 又会浪费
+       前期时间, 递减是二者之间的折中.
+    """
+    BI = BEACON_MS
+    E = {c: 0.0 for c in CHANNELS}
+    k = {c: 0 for c in CHANNELS}
+    last = {c: -1e9 for c in CHANNELS}
+    t = 0.0
+    dstar = max(probe, min(cap, _opt_dwell(world.switch_ms)))
+
+    def survive(ch):
+        e = E[ch]
+        return 0.75 * math.exp(-e / BI) + 0.25 * math.exp(-e / (2.0 * BI))
+
+    def rem(ch):
+        sv = max(1e-3, survive(ch))
+        if k[ch]:
+            return k[ch] * sv / max(1e-3, 1.0 - sv)
+        post = q0 * sv / (q0 * sv + (1.0 - q0))
+        return prior_rem * post
+
+    def dwell_for(ch):
+        if sat_eps <= 0.0:
+            return probe
+        # 饱和驻留: 已发现 k 台时把"还剩一台"的概率压到 sat_eps 需要
+        # bi*ln((k+1)/sat_eps) 的累计暴露, 增量部分就地补上.
+        if k[ch] < 2:
+            return probe
+        need = BI * math.log((k[ch] + 2.0) / sat_eps) - E[ch]
+        return max(probe, min(cap, need))
+
+    def visit(ch, dwell):
+        nonlocal t
+        new, _f = world.drain(ch, dwell, t)
+        t += dwell + world.switch_ms
+        k[ch] += new
+        E[ch] += dwell
+        last[ch] = t
+
+    for ch in CHANNELS:
+        if t >= horizon:
+            return t
+        visit(ch, probe)
+        while k[ch] >= 2 and t < horizon and rem(ch) >= renew_thresh:
+            visit(ch, dwell_for(ch))
+
+    slot = 0
+    explore_every = 3.0
+    while t < horizon:
+        slot += 1
+        if slot % int(max(2, explore_every)) == 0:
+            ch = min(CHANNELS, key=lambda c: last[c])
+        else:
+            ch = max(CHANNELS, key=rem)
+            if rem(ch) < thresh:
+                ch = min(CHANNELS, key=lambda c: last[c])
+                explore_every *= 1.5
+        visit(ch, floor if k[ch] == 0 else min(dstar, cap))
+    return t
+
+
 POLICIES = {"uniform": run_uniform, "wrl": run_wrl, "psd": run_psd,
             "cov": run_cov, "band": run_band, "adt": run_adt,
-            "adt2": run_adt2, "adt3": run_adt3}
+            "adt2": run_adt2, "adt3": run_adt3,
+            "sacs": run_sacs, "adtx": run_adtx}
 
 
 def episode(policy, seed, horizon, n_cold_aps=0, **kw):

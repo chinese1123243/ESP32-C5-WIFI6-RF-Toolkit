@@ -974,6 +974,18 @@ button.mi{ width:100%; background:none; border:0; text-align:left; font:inherit;
               <div class="field"><label>包数 0=∞</label><input id="sniffCount" type="number" value="1000" min="0" /></div>
               <div class="field"><label>驻留 ms</label><input id="sniffDwell" type="number" value="300" min="50" /></div>
             </div>
+            <div class="row3">
+              <div class="field">
+                <label>调度策略</label>
+                <select id="sniffPolicy">
+                  <option value="psd" selected>PSD 发现数优先</option>
+                  <option value="sacs">SACS 饱和感知</option>
+                  <option value="adt">ADT 短探针续期</option>
+                  <option value="wrl">WRL 帧率加权</option>
+                </select>
+              </div>
+              <div class="field"><label>策略说明</label><div class="note" id="sniffPolicyNote" style="margin:0">稳，一轮 78 条要 20 秒</div></div>
+            </div>
           </div>
           <div class="actions">
             <button class="btn primary" id="btnSniff">开始嗅探</button>

@@ -242,6 +242,11 @@ static _Atomic uint32_t s_ch_switch_err = 0;
  * 首轮的 150ms 会让"没探过"和"探过是空的"变成同一件事, 实测 5 秒时比
  * 均匀扫描少发现 3.8 台. */
 static _Atomic uint16_t s_ch_visits[CH_IDX_MAX + 1];
+/* SACS 的两张记账表: 上一次访问的轮次与连续空窗次数. 都用 uint8:
+ * 内部堆只剩 30KB 出头, 512B 也是钱. 轮次回绕只会让该信道提前被回探一次,
+ * 不影响正确性 (age 用无符号差, 回绕后算出的是小值). */
+static _Atomic uint8_t s_ch_last_round[CH_IDX_MAX + 1];
+static _Atomic uint8_t s_ch_misses[CH_IDX_MAX + 1];
 
 static inline void chan_new_ap(uint8_t ch)
 {
@@ -252,7 +257,8 @@ static inline void chan_new_ap(uint8_t ch)
 }
 
 /* 调度策略. wrl = 原来的按帧率加权, psd = 按发现数排序 + 探测下限. */
-typedef enum { AUTO_POLICY_WRL = 0, AUTO_POLICY_PSD = 1, AUTO_POLICY_ADT = 2 } auto_policy_t;
+typedef enum { AUTO_POLICY_WRL = 0, AUTO_POLICY_PSD = 1, AUTO_POLICY_ADT = 2,
+               AUTO_POLICY_SACS = 3 } auto_policy_t;
 /* 默认 psd: 实测 dwell=150 时 15 秒内多发现 1.1 台 (bootstrap 区间 +0.2~+1.8),
  * dwell=300 时与 wrl 打平. 短驻留正是"想快扫"的用户会选的配置, 那里旧的
  * 每信道 floor(base/6=25ms) 已经低于 beacon 间隔, 系统性地漏检. */
@@ -333,7 +339,7 @@ static uint32_t auto_dwell_adt(uint8_t ch, uint32_t base)
     return chan_dwell_adt(base, k, e, atomic_load(&s_adt_eps));
 }
 
-static void auto_visit(uint8_t ch, uint32_t base)
+static bool chan_enter(uint8_t ch)
 {
     esp_err_t ce = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
     if (ce != ESP_OK) {
@@ -343,10 +349,16 @@ static void auto_visit(uint8_t ch, uint32_t base)
         if (n <= 3 || (n % 50) == 0)
             raw_out("META,WIFI,SNIFF,ERR,msg,set_channel_failed,ch,%u,ret,%d,total,%u\n",
                     (unsigned)ch, (int)ce, (unsigned)n);
-        return;
+        return false;
     }
     atomic_store(&s_sniff_channel, ch);
     rgb_led_event(RGB_EV_CHAN_SWITCH, 300);
+    return true;
+}
+
+static void auto_visit(uint8_t ch, uint32_t base)
+{
+    if (!chan_enter(ch)) return;
 
     uint8_t pol = atomic_load(&s_auto_policy);
     uint32_t dwell = (pol == AUTO_POLICY_PSD) ? auto_dwell_psd(ch, base)
@@ -381,15 +393,17 @@ static void auto_visit(uint8_t ch, uint32_t base)
  * 41 个元素, 插入排序足够, 且天然稳定 (相同权重保持原顺序, 不会来回抖). */
 static uint8_t s_psd_order[N_CH_2G + N_CH_5G];
 
-static uint16_t s_psd_w[CH_IDX_MAX + 1];
+/* psd 与 sacs 互斥运行, 共用一张权重表: 256 个信道 x 2B = 512B 内部 RAM,
+ * 内部堆只剩 30KB 出头, 不值得为两条互斥路径各留一份. */
+static uint16_t s_sched_w[CH_IDX_MAX + 1];
 
 static int psd_build_order(void)
 {
     int n = 0;
     for (size_t i = 0; i < N_CH_2G; i++) s_psd_order[n++] = s_channels_2g[i];
     for (size_t i = 0; i < N_CH_5G; i++) s_psd_order[n++] = s_channels_5g[i];
-    for (int c = 0; c <= CH_IDX_MAX; c++) s_psd_w[c] = atomic_load(&s_ch_found[c]);
-    return chan_psd_order(s_psd_order, s_psd_w, n, s_psd_order);
+    for (int c = 0; c <= CH_IDX_MAX; c++) s_sched_w[c] = atomic_load(&s_ch_found[c]);
+    return chan_psd_order(s_psd_order, s_sched_w, n, s_psd_order);
 }
 
 /* ADT 的事件驱动选信道: 每一步挑"剩余量 / 要花的时间"最高的那条.
@@ -428,6 +442,73 @@ static int adt_pick(uint32_t base, const uint8_t *seen)
     return best;
 }
 
+/* SACS: 驻留用饱和公式给足, 回探间隔线性增长 (不做指数退避).
+ *
+ * 驻留为什么不是固定值: 已发现 k 台时, 把"还剩一台"的概率压到 2e-1 需要
+ * 累计暴露 bi*ln((k+2)/eps); 差额部分就地补齐, 上限 4*base. k<2 只给探针,
+ * 单台信道不值得陪跑.
+ *
+ * 回探为什么不用指数退避: 指数退避在静态场景省时间, 但运行中上线的 AP
+ * 要等 4/8/16 轮才轮到一次, 仿真里 6 台中途上线时有 80% 的局漏检. 改成
+ * 2+连续空窗轮, 代价是静态场景多花一点时间.
+ */
+static void sacs_visit(uint8_t ch, uint32_t base)
+{
+    if (ch == 0 || ch > CH_IDX_MAX) return;
+    if (!chan_enter(ch)) return;
+
+    uint32_t probe = base / 3;          /* base=300 时 100ms, 与仿真一致 */
+    if (probe < 80) probe = 80;
+    if (probe > CHAN_DWELL_FLOOR_MS) probe = CHAN_DWELL_FLOOR_MS;
+    uint32_t cap = base * 4;
+    if (cap > 2000) cap = 2000;
+    if (cap < probe * 2) cap = probe * 2;
+
+    uint32_t spent = 0;
+    uint32_t empty_run = 0;
+    while (spent < cap && atomic_load(&s_channel_rotate)) {
+        uint32_t k = atomic_load(&s_ch_found[ch]);
+        uint32_t e = atomic_load(&s_ch_exposure[ch]);
+        uint32_t d = chan_dwell_sat(probe, cap - spent, k, e, 200);
+        if (d < probe) d = probe;
+        if (d > cap - spent) d = cap - spent;
+        atomic_store(&s_auto_dwell_now, d);
+        vTaskDelay(pdMS_TO_TICKS(d));
+        chan_close(ch, d);
+        spent += d;
+        if (atomic_load(&s_ch_found[ch]) > k) empty_run = 0;
+        else if (++empty_run >= 2) break;   /* 连续两个空窗就撤 */
+        WDT_RESET();
+    }
+    atomic_fetch_add(&s_ch_visits[ch], 1);
+}
+
+static uint8_t  s_sacs_order[N_CH_2G + N_CH_5G];
+
+/* 组本轮要访问的信道: 先按"距上次访问的轮数"过滤, 再按已发现台数降序.
+ * 过滤条件 age >= 2 + misses, misses 是连续空窗次数 (线性增长, 见上). */
+static int sacs_build_order(uint32_t rnd)
+{
+    int n = 0;
+    for (int band = 0; band < 2; band++) {
+        const uint8_t *arr = band ? s_channels_5g : s_channels_2g;
+        size_t cnt = band ? N_CH_5G : N_CH_2G;
+        for (size_t i = 0; i < cnt; i++) {
+            uint8_t ch = arr[i];
+            if (ch > CH_IDX_MAX) continue;
+            uint8_t last = atomic_load(&s_ch_last_round[ch]);
+            uint8_t age = (uint8_t)((uint8_t)rnd - last);
+            uint8_t miss = atomic_load(&s_ch_misses[ch]);
+            if (age < (uint8_t)(2u + miss)) continue;
+            s_sacs_order[n] = ch;
+            s_sched_w[ch] = atomic_load(&s_ch_found[ch]);
+            n++;
+        }
+    }
+    if (n == 0) return 0;
+    return chan_psd_order(s_sacs_order, s_sched_w, n, s_sacs_order);
+}
+
 static void channel_rotate_task(void *pv)
 {
     /* 会话号在创建时固定: 见 sniff_progress_task 里同样的处理.
@@ -441,6 +522,32 @@ static void channel_rotate_task(void *pv)
     bool band_2g = true;
     while (atomic_load(&s_channel_rotate) && atomic_load(&s_rotate_gen) == mine) {
         uint32_t base = atomic_load(&s_dwell_ms);
+
+        if (atomic_load(&s_auto_policy) == AUTO_POLICY_SACS) {
+            for (uint32_t rnd = 0;; rnd++) {
+                if (!atomic_load(&s_channel_rotate) ||
+                    atomic_load(&s_rotate_gen) != mine) break;
+                int n = sacs_build_order(rnd);
+                if (n == 0) {           /* 全被过滤: 放开一轮, 保证不停转 */
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    continue;
+                }
+                for (int i = 0; i < n; i++) {
+                    if (!atomic_load(&s_channel_rotate) ||
+                        atomic_load(&s_rotate_gen) != mine) break;
+                    uint8_t ch = s_sacs_order[i];
+                    uint32_t before = atomic_load(&s_ch_found[ch]);
+                    sacs_visit(ch, base);
+                    atomic_store(&s_ch_last_round[ch], (uint8_t)rnd);
+                    if (atomic_load(&s_ch_found[ch]) == before)
+                        atomic_fetch_add(&s_ch_misses[ch], 1);
+                    else
+                        atomic_store(&s_ch_misses[ch], 0);
+                    WDT_RESET();
+                }
+            }
+            continue;
+        }
 
         if (atomic_load(&s_auto_policy) == AUTO_POLICY_ADT) {
             uint8_t seen[(CH_IDX_MAX + 8) / 8];
@@ -1421,7 +1528,7 @@ esp_err_t wifi_attack_inject_stop(void)
 
 void wifi_attack_set_auto_policy(int policy)
 {
-    if (policy < 0 || policy > AUTO_POLICY_ADT) policy = AUTO_POLICY_PSD;
+    if (policy < 0 || policy > AUTO_POLICY_SACS) policy = AUTO_POLICY_PSD;
     atomic_store(&s_auto_policy, (uint8_t)policy);
 }
 
@@ -1463,6 +1570,9 @@ esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms, uint32_t count)
         atomic_store(&s_ch_found[i], 0);
         atomic_store(&s_ch_exposure[i], 0);
         atomic_store(&s_ch_visits[i], 0);
+        /* 0xF0 是"很久以前": 首轮 rnd=0 时 age=0-0xF0=0x10, 一定过回探过滤 */
+        atomic_store(&s_ch_last_round[i], 0xF0u);
+        atomic_store(&s_ch_misses[i], 0);
         atomic_store(&s_ch_listen[i], 0);
     }
     atomic_store(&s_ch_hits_total, 0);
@@ -1489,10 +1599,14 @@ esp_err_t wifi_attack_sniff_auto_start(uint32_t dwell_ms, uint32_t count)
         return ESP_FAIL;
     }
 
-    printf("META,WIFI,SNIFF,AUTO,START,dwell_ms,%u,adaptive,%u,policy,%s\n",
-           (unsigned)dwell_ms, atomic_load(&s_auto_adaptive) ? 1u : 0u,
-           atomic_load(&s_auto_policy) == AUTO_POLICY_PSD ? "psd"
-             : atomic_load(&s_auto_policy) == AUTO_POLICY_ADT ? "adt" : "wrl");
+    {
+        uint8_t pol = atomic_load(&s_auto_policy);
+        const char *pname = pol == AUTO_POLICY_PSD ? "psd"
+                          : pol == AUTO_POLICY_ADT ? "adt"
+                          : pol == AUTO_POLICY_SACS ? "sacs" : "wrl";
+        printf("META,WIFI,SNIFF,AUTO,START,dwell_ms,%u,adaptive,%u,policy,%s\n",
+               (unsigned)dwell_ms, atomic_load(&s_auto_adaptive) ? 1u : 0u, pname);
+    }
     event_publish("WIFI", "sniff auto start dwell=%u", (unsigned)dwell_ms);
     fflush(stdout);
     return ESP_OK;

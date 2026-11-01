@@ -30,7 +30,7 @@ bool csi_det_update(csi_det_t *d, float metric)
         d->base = metric;
         d->mad = MAD_FLOOR;
         d->score = 0.0f;
-        d->init = true;
+            d->init = true;
         return false;
     }
 
@@ -40,6 +40,9 @@ bool csi_det_update(csi_det_t *d, float metric)
     /* CUSUM: 只积正向偏差, 慢动作的瞬时 z 不高, 但会同号累积 */
     d->cusum += dev - CSI_DET_CUSUM_K * d->mad;
     if (d->cusum < 0.0f) d->cusum = 0.0f;
+    /* 已经在动作态时累积和没有意义, 而且会一路涨到几百. 退出条件里带着
+     * "累积和已泄掉", 不在这里清零的话, 动作结束要等几十个样本才退得出去. */
+    if (d->motion) d->cusum = 0.0f;
 
     bool enter = (d->score > CSI_DET_ENTER_Z) ||
                  (d->cusum > CSI_DET_CUSUM_H * (d->mad + MAD_FLOOR));
@@ -59,11 +62,22 @@ bool csi_det_update(csi_det_t *d, float metric)
     }
 
     /* 基线/离散度最后更新: 判定用的是"更新前"的背景, 否则当前样本会先污染
-     * 判据再被判据使用, 高 metric 会被自己的基线抬走. */
-    if (dev < 0.0f) d->base += BASE_DOWN * dev;
-    else            d->base += BASE_UP * dev;
-    d->mad += MAD_RATE * (fabsf(dev) - d->mad);
-    if (d->mad < MAD_FLOOR) d->mad = MAD_FLOOR;
+     * 判据再被判据使用, 高 metric 会被自己的基线抬走.
+     *
+     * 增益取快/慢只看"当前是否判定为动作", 不看偏差的正负:
+     *  - 按正负分快慢时, 平稳噪声会让基线单向爬到低分位, 之后噪声的上半部分
+     *    全变成正偏差, 静止场景也持续报动作 (主机测试 120 个静止样本报 96 次).
+     *  - 判定为动作期间用慢速率, 就是"不把当前电平学成背景". 之前用偏差的慢
+     *    均值做这一步是徒劳的: 基线一旦追上去, 慢均值自己就归零了.
+     * 动作结束、退出判定后回到快速率, 基线几秒内就能重新对齐环境. */
+    d->base += (d->motion ? BASE_UP : BASE_DOWN) * dev;
+    /* 离散度同理: 动作期间的偏差是信号本身, 拿它更新 mad 会让 z 分数自己
+     * 稀释掉 (实测第 18 个样本 score 从 30 掉到 1.5, 检测器主动退出动作态).
+     * mad 估计的是背景噪声, 只在非动作态更新. */
+    if (!d->motion) {
+        d->mad += MAD_RATE * (fabsf(dev) - d->mad);
+        if (d->mad < MAD_FLOOR) d->mad = MAD_FLOOR;
+    }
 
     return d->motion;
 }

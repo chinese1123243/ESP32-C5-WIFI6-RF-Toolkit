@@ -55,6 +55,7 @@ KNOWN_REJECT = {
     # App 发出命令后等不到任何回应, 也就是"设备无响应". 现在统一走这里.
     "arg_parse_failed",
     # 下面是扫全实际跑出来的, 逐个核过语义后才归类
+    "bad_policy",
     "need_confirm",           # 危险命令缺 --yes: 固件不接受, 调用方要弹窗后重发
     "set_channel_failed",     # 轮询切信道失败: 跳过该条, 作业不停, 不算命令失败
     "unknown_command",        # 固件没有这条命令
@@ -205,6 +206,8 @@ CASES = [
 
     ("sniff 6",                       "stop", "2.4G 定信道", None),
     ("sniff auto",                    "stop", "自动跳信道", None),
+    ("sniff auto --policy sacs",     "stop", "饱和感知调度", None),
+    ("sniff auto --policy nope",     None,   "非法策略: 应当被拒", "reject"),
     ("sniff 36",                      "stop", "5G 信道", None),
     ("sniff 177",                     "stop", "上边界", None),
     ("sniff 0",                       None, "非法信道: 应当被拒", "reject"),

@@ -92,6 +92,16 @@ def main():
     n_ap = len(re.findall(r"^AP,", t, re.M))
     check("自动轮询发现 AP", n_ap >= 0, f"aps={n_ap}" + ("" if n_ap else " (环境无 AP 时可为 0)"))
 
+    # 4b SACS 策略同样能发现 AP
+    d.cmd("stop", 0.8)
+    t = d.cmd("sniff auto --dwell 300 --policy sacs", 0.8)
+    started = "policy,sacs" in t
+    d.read(5.0)
+    d.cmd("stop", 1.0)
+    t = d.cmd("dump aps", 2.5)
+    n_sacs = len(re.findall(r"^AP,", t, re.M))
+    check("SACS 策略发现 AP", started and n_sacs > 0, f"start={started} aps={n_sacs}")
+
     # 5 beacon 洪泛 30 帧全发出
     t = d.cmd("beaconflood -p QA -n 30 -c 6 --yes", 4.0)
     sent = one(r"INJECT,DONE,mode,\d,sent,(\d+)", t, 0, int)

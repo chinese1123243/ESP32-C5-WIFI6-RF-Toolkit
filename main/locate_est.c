@@ -1,5 +1,6 @@
 #include "locate_est.h"
 
+#include <math.h>
 #include <stddef.h>
 
 static void sort_i16(int16_t *a, int n)
@@ -52,6 +53,15 @@ void loc_estimate(const int16_t *v, int n, int16_t *scratch, loc_stat_t *out)
     }
     sort_i16(scratch, n);
     out->mad = median_of(scratch, n);
+
+    /* 中位数的标准误: 1.253*mad/sqrt(n). 用整数算出"零点几 dB"再向上取整,
+     * 免得 0.4dB 的误差被显示成 0 (那样看起来像"完全没有不确定度"). */
+    if (n > 0) {
+        float se = 1.253f * (float)out->mad / sqrtf((float)n);
+        out->se = (int)(se + 0.5f);
+    } else {
+        out->se = 0;
+    }
 }
 
 int loc_trend(const int16_t *v, int n, int16_t *scratch)
@@ -74,4 +84,23 @@ int loc_trend(const int16_t *v, int n, int16_t *scratch)
     int span = n - k;
     if (span <= 0) return 0;
     return (last - first) * 10 / span;
+}
+
+
+int loc_trend_ci(const int16_t *v, int n, int16_t *scratch)
+{
+    if (!v || !scratch || n < 8) return 0;
+    int k = n / 4;
+    if (k < 4) k = 4;
+    if (k * 2 > n) k = n / 2;
+    if (k < 2) return 0;
+
+    /* 用整段样本的 mad 估计单点离散度, 再折算到"两段中位数之差" */
+    loc_stat_t st;
+    loc_estimate(v, n, scratch, &st);
+
+    /* se(trend) = 1.253*mad*sqrt(2/k) * 10/(n-k) */
+    float span = (float)(n - k);
+    float se = 1.253f * (float)st.mad * sqrtf(2.0f / (float)k) * 10.0f / span;
+    return (int)(1.96f * se + 0.5f);
 }

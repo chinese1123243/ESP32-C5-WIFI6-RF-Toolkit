@@ -27,6 +27,8 @@ esp_err_t radio_acquire(radio_res_t need, const char *owner, uint32_t timeout_ms
 /* 释放 held 中当前无人竞争的位. 传自己申请的那一组, 不要传 RADIO_RES_MASK. */
 void radio_release(radio_res_t held);
 
+
+
 /* 当前持有者, 逗号分隔; 无人持有返回 "idle".
  * 返回的是内部静态缓冲, 下次调用会被覆盖, 拿去做参数前先拷走. */
 const char *radio_owner(void);

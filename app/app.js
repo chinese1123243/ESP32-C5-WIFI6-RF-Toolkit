@@ -4,7 +4,7 @@
  */
 
 /* 版本 */
-const APP_VERSION  = '2.4.9';
+const APP_VERSION  = '2.4.10';
 const APP_BUILD    = '2026.09';
 const APP_AUTHOR      = 'CN112';
 const APP_AUTHOR_FULL = 'CN1123243';
@@ -2618,7 +2618,7 @@ function scanAps(secs){
 
     log('开始嗅探发现 AP (' + secs + 's)…', 'warn');
     toast('正在扫描附近 AP…', 'warn');
-    sendCmd('sniff auto --dwell 200');
+    sendCmd('sniff auto --dwell 200 --policy ' + ($('sniffPolicy')?.value || 'psd'));
     setTimeout(() => {
         if (!apScanning) return;
         sendCmd('stop');
@@ -2774,6 +2774,20 @@ function renderApList(){
     window.RFRefreshPicks?.();
 }
 
+/* 策略说明: 一句话讲清代价, 不写"更快更稳"这种没信息量的话 */
+{
+    const polSel = $('sniffPolicy'), note = $('sniffPolicyNote');
+    const TEXT = {
+        sacs: '长时间扫描更少漏，短扫与 PSD 打平',
+        psd:  '稳，但一轮 78 条要 20 秒',
+        adt:  '前 2 秒最快，空信道回探稀疏',
+        wrl:  '按帧率加权，热信道可能只是有人在刷视频',
+    };
+    polSel?.addEventListener('change', () => {
+        if (note) note.textContent = TEXT[polSel.value] || '';
+    });
+}
+
 $('apSearch')?.addEventListener('input', renderApList);
 
 function copyText(text){
@@ -2899,7 +2913,8 @@ $('btnSniff').addEventListener('click', () => {
     const cnt = $('sniffCount').value;
     const dwell = $('sniffDwell').value;
     expectConfirm('嗅探', 6000);
-    if (ch === 'auto') sendCmd(`sniff auto --dwell ${dwell}`);
+    const pol = $('sniffPolicy')?.value || 'psd';
+    if (ch === 'auto') sendCmd(`sniff auto --dwell ${dwell} --policy ${pol}`);
     else sendCmd(`sniff ${ch} -n ${cnt}`);
 });
 

@@ -36,6 +36,8 @@ static uint8_t      s_mac[6];
 static bool         s_is_client = false;
 static uint32_t     s_secs = 30;
 static int          s_miss = 0;
+static int16_t      s_trend = 0;     /* 最近一次趋势, 每 10 个样本的 dB */
+static int16_t      s_trend_ci = 0;  /* 该趋势的 95% 半宽 */
 
 static int rssi_now(void)
 {
@@ -77,9 +79,15 @@ static void statistics(int *avg, int *mn, int *mx, const char **trend)
         for (int i = 0; i < s_n; i++) s_vals[i] = s_smp[i].rssi;
         loc_estimate(s_vals, s_n, s_scr, &s_st);
         *avg = s_st.trimmed;
+        /* 先看趋势是否大过自己的 95% 半宽. 不分青红皂白地按 "+1dB 就算近"
+         * 判方向, 会把噪声读成移动; 采样 40 个点时半宽通常在 0.5~1.5dB,
+         * 正好是原先被当成"移动"的量级. */
         int slope = loc_trend(s_vals, s_n, s_scr);
-        if (slope >= 1)      *trend = "up";     /* 数值变大 = 更近 */
-        else if (slope <= -1) *trend = "down";
+        int ci = loc_trend_ci(s_vals, s_n, s_scr);
+        s_trend = (int16_t)slope;
+        s_trend_ci = (int16_t)ci;
+        if (slope > ci)       *trend = "up";     /* 数值变大 = 更近 */
+        else if (slope < -ci) *trend = "down";
         else                  *trend = "flat";
     } else {
         *avg = 0;
@@ -114,9 +122,10 @@ static void locate_task(void *arg)
             s_stat_us = (uint32_t)(esp_timer_get_time() - t_before);
             if (s_stat_us > s_stat_us_max) s_stat_us_max = s_stat_us;
             char macs[18]; mac_to_str(s_mac, macs);
-            printf("META,LOCATE,T,mac,%s,rssi,%d,avg,%d,med,%d,mad,%d,min,%d,max,%d,n,%d,trend,%s,us,%u\n",
-                   macs, rssi, avg, s_st.median, s_st.mad, mn, mx, s_n, trend,
-                   (unsigned)s_stat_us);
+            printf("META,LOCATE,T,mac,%s,rssi,%d,avg,%d,med,%d,mad,%d,se,%d,min,%d,max,%d,n,%d,"
+                   "trend,%s,slope,%d,ci,%d,us,%u\n",
+                   macs, rssi, avg, s_st.median, s_st.mad, s_st.se, mn, mx, s_n, trend,
+                   (int)s_trend, (int)s_trend_ci, (unsigned)s_stat_us);
             fflush(stdout);
             event_publish("LOCATE", "mac=%s rssi=%d avg=%d trend=%s", macs, rssi, avg, trend);
         }

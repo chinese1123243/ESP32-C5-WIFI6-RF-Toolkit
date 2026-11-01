@@ -43,3 +43,25 @@ uint32_t chan_dwell_adt(uint32_t base_ms, uint32_t found, uint32_t exposure_ms,
 /* 按权重降序排信道. 稳定插入排序: 权重相同保持原顺序, 避免每轮来回抖.
  * weights 与 chans 等长, 结果写入 out. 返回信道数. */
 int chan_psd_order(const uint8_t *chans, const uint16_t *weights, int n, uint8_t *out);
+
+/* SACS 的剩余量估计: 已发现 found 台、累计暴露 exposure_ms 时, 该信道上
+ * 还剩多少台没找到.
+ *
+ * k = n*(1-s) => n = k/(1-s), 剩余 r = k*s/(1-s), s 是"还没被发现"的概率.
+ * s 用两成分混合: 0.75*exp(-E/bi) + 0.25*exp(-E/2bi). 现场有相当一部分 AP
+ * 的 beacon 间隔是 2 倍周期, 单成分模型会把它们的剩余量估成 0, 于是"最后一台"
+ * 永远等不到回探, 这正是尾延迟的来源.
+ *
+ * found == 0 时返回空信道后验: q0*s/(q0*s + 1-q0) * 1.2, 保证探过没货的信道
+ * 不会被永久判死 (运行中上线的 AP 就是从这里捞回来的).
+ */
+float chan_residual(uint32_t found, uint32_t exposure_ms);
+
+/* 饱和驻留: 已发现 found 台时, 把"还剩一台"的概率压到 eps 需要的总暴露
+ * 减去已累计的, 夹到 [floor_ms, cap_ms]. found < 2 直接返回 floor_ms. */
+uint32_t chan_dwell_sat(uint32_t floor_ms, uint32_t cap_ms, uint32_t found,
+                        uint32_t exposure_ms, uint32_t eps_permille);
+
+/* 单位时间期望新发现数最大化的驻留 (一阶条件 e^-x(x+s/bi+1)=1).
+ * 解只跟切换开销/beacon 间隔有关, 与台数无关. 返回毫秒. */
+uint32_t chan_dwell_opt(uint32_t switch_ms);
