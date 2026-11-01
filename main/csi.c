@@ -374,7 +374,9 @@ void csi_stats(void)
 void csi_selftest(void)
 {
     if (!s_ring || !s_task) {
-        printf("META,CSI,ERR,msg,not_running\n");
+        /* 自检要往环形缓冲里灌合成帧, 得先有采集任务在消费.
+         * 只说 not_running 的话, 调用方不知道是"坏了"还是"没开". */
+        printf("META,CSI,ERR,msg,not_running,advice,run csi start <ch> first\n");
         fflush(stdout);
         return;
     }

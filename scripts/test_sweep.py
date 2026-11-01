@@ -56,6 +56,7 @@ KNOWN_REJECT = {
     "arg_parse_failed",
     # 下面是扫全实际跑出来的, 逐个核过语义后才归类
     "need_confirm",           # 危险命令缺 --yes: 固件不接受, 调用方要弹窗后重发
+    "set_channel_failed",     # 轮询切信道失败: 跳过该条, 作业不停, 不算命令失败
     "unknown_command",        # 固件没有这条命令
     "empty_prefix",           # beaconflood -p "" : 入参校验
     "need_key", "need_key_value", "set_failed", "bad_subcmd",

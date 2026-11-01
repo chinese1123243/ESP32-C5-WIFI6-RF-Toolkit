@@ -237,6 +237,7 @@ static inline void chan_hit(uint8_t ch, uint16_t w)
  * 只在自动轮询期间累计, 每次 auto 启动清零. */
 static _Atomic uint16_t s_ch_found[CH_IDX_MAX + 1];
 static _Atomic uint32_t s_ch_found_total = 0;
+static _Atomic uint32_t s_ch_switch_err = 0;
 /* 每信道被驻留过几次. 第一次必须给足探测下限, 之后才敢用便宜的 150ms:
  * 首轮的 150ms 会让"没探过"和"探过是空的"变成同一件事, 实测 5 秒时比
  * 均匀扫描少发现 3.8 台. */
@@ -334,7 +335,16 @@ static uint32_t auto_dwell_adt(uint8_t ch, uint32_t base)
 
 static void auto_visit(uint8_t ch, uint32_t base)
 {
-    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    esp_err_t ce = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    if (ce != ESP_OK) {
+        /* 切不过去还照驻留, 这段时间收到的帧会被记到 ch 头上, ADT 的曝光
+         * 统计跟着一起假. 跳过这一条, 下一轮还会再挑到它. */
+        uint32_t n = atomic_fetch_add(&s_ch_switch_err, 1) + 1;
+        if (n <= 3 || (n % 50) == 0)
+            raw_out("META,WIFI,SNIFF,ERR,msg,set_channel_failed,ch,%u,ret,%d,total,%u\n",
+                    (unsigned)ch, (int)ce, (unsigned)n);
+        return;
+    }
     atomic_store(&s_sniff_channel, ch);
     rgb_led_event(RGB_EV_CHAN_SWITCH, 300);
 
@@ -792,7 +802,12 @@ static void inject_task(void *pv)
     WDT_ADD();
 
     if (a->channel && is_valid_channel(a->channel)) {
-        esp_wifi_set_channel(a->channel, WIFI_SECOND_CHAN_NONE);
+        esp_err_t ce = esp_wifi_set_channel(a->channel, WIFI_SECOND_CHAN_NONE);
+        if (ce != ESP_OK) {
+            /* 换信道失败还照发, 帧会落在旧信道上: 表现为"发了很多台一台没见" */
+            raw_out("META,WIFI,INJECT,ERR,msg,set_channel_failed,ret,%d,ch,%u\n",
+                    (int)ce, (unsigned)a->channel);
+        }
         atomic_store(&s_sniff_channel, a->channel);
     }
 
@@ -809,7 +824,7 @@ static void inject_task(void *pv)
                 len = mk_deauth_frame(frame, a->bssid, a->sta, true, a->reason);
                 uint8_t f2[26];
                 int l2 = mk_deauth_frame(f2, a->bssid, a->sta, false, a->reason);
-                esp_wifi_80211_tx(WIFI_IF_STA, f2, l2, true);
+                if (esp_wifi_80211_tx(WIFI_IF_STA, f2, l2, true) != ESP_OK) errs++;
             }
         } else if (a->mode == INJECT_DISASSOC) {
             bool broadcast = (a->sta[0]|a->sta[1]|a->sta[2]|a->sta[3]|a->sta[4]|a->sta[5]) == 0;
@@ -820,7 +835,7 @@ static void inject_task(void *pv)
                 len = mk_disassoc_frame(frame, a->bssid, a->sta, true, a->reason);
                 uint8_t f2[26];
                 int l2 = mk_disassoc_frame(f2, a->bssid, a->sta, false, a->reason);
-                esp_wifi_80211_tx(WIFI_IF_STA, f2, l2, true);
+                if (esp_wifi_80211_tx(WIFI_IF_STA, f2, l2, true) != ESP_OK) errs++;
             }
         } else if (a->mode == INJECT_AUTH) {
             /* auth flood: 每帧换随机源 MAC, 让 AP 为"新"客户端反复分配关联态.
@@ -846,6 +861,15 @@ static void inject_task(void *pv)
 
         if (len > 0) {
             esp_err_t e = esp_wifi_80211_tx(WIFI_IF_STA, frame, len, true);
+            /* 发送队列满时先让出 CPU 再重发同一帧. 直接丢弃的话 -i 10ms 下
+             * 实测 30 帧丢 13 帧 (ESP_ERR_NO_MEM), 调用方看到 sent=17 却不知道
+             * 是间隔太密还是射频有问题. */
+            /* 8 次 x 25ms 是实测定的: 3 次时 -i 10 仍有 5/35 帧不够,
+             * 而 200ms 的总退避还没有超过队列排空的最坏时间. */
+            for (int retry = 0; e == ESP_ERR_NO_MEM && retry < 8; retry++) {
+                vTaskDelay(pdMS_TO_TICKS(25));
+                e = esp_wifi_80211_tx(WIFI_IF_STA, frame, len, true);
+            }
             if (e == ESP_OK) {
                 sent++;
                 atomic_store(&s_inject_total, sent);

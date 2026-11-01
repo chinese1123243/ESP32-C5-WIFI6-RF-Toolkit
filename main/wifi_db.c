@@ -19,8 +19,10 @@
 #include "esp_log.h"
 
 /* 厂商表由 tools/gen_oui.py 从 IEEE 注册表生成, 按 OUI 升序可直接二分.
- * 811 条覆盖主流消费设备; 全量 34114 条塞不进 flash, 也没必要. */
+ * 1963 条覆盖主流消费设备; 全量 34114 条塞不进这个 flash 窗口, 也没必要. */
 #include "oui_table.h"
+
+static const char *DB_TAG = "WDB";
 
 const char *oui_lookup(const uint8_t mac[3])
 {

@@ -4,7 +4,7 @@
  */
 
 /* 版本 */
-const APP_VERSION  = '2.4.8';
+const APP_VERSION  = '2.4.9';
 const APP_BUILD    = '2026.09';
 const APP_AUTHOR      = 'CN112';
 const APP_AUTHOR_FULL = 'CN1123243';
@@ -2207,6 +2207,7 @@ function parseOutputLine(line){
             if (kv.html_bytes !== undefined) phishHtmlBytes = parseInt(kv.html_bytes);
             updatePhishUI();
             confirmAction('门户已启动 ' + (kv.ssid || '') + ' @ ' + (kv.ip || ''));
+            if (kv.dns === '0') log('[门户] DNS 劫持没起来，认证页不会自动弹（可手动开 ' + (kv.ip || '') + '）', 'warn');
         } else if (kind === 'STOP'){
             phishOn = false; updatePhishUI();
             phishStas = []; renderPhishSta();
@@ -2343,6 +2344,19 @@ function parseOutputLine(line){
             if (kv.clients !== undefined){ setStat('stCli', kv.clients); setStat('stCli2', kv.clients); }
             setJobActive(true);
             clearPendingAction();
+        } else if (kind === 'SNIFF' && p[3] === 'ERR'){
+            /* 轮询切信道失败只是跳过这一条, 作业还在跑, 不能清 pending;
+             * 其它错误说明命令没起来, 必须收尾, 否则要等满超时才报"无响应". */
+            const kv = {};
+            for (let i=4; i<p.length-1; i+=2) kv[p[i]] = p[i+1];
+            const why = kv.msg || 'error';
+            if (why === 'set_channel_failed'){
+                log('[嗅探] 换信道失败 ch' + (kv.ch || '?') + '，已跳过 (累计 ' + (kv.total || '?') + ')', 'warn');
+            } else {
+                log('[嗅探] 失败: ' + why, 'err');
+                clearPendingAction();
+                setJobActive(false);
+            }
         } else if (kind === 'SNIFF' && p[3] === 'DONE'){
             log('[嗅探] 完成 total=' + (p[5] || '0'), 'warn');
             clearPendingAction();
@@ -5086,12 +5100,12 @@ function rfRefreshPicks(){
 
     const dlSta = document.getElementById('dlSta');
     if (dlSta) dlSta.innerHTML = mk(sta, c =>
-        `<option value="${c.mac}">${c.vendor} · ${c.rssi}dBm</option>`);
+        `<option value="${c.mac}">${devLabel(c.mac, c.vendor)} · ${c.rssi}dBm</option>`);
 
     const dlMac = document.getElementById('dlMac');
     if (dlMac) dlMac.innerHTML =
         mk(byRssi, a => `<option value="${a.bssid}">${a.ssid} (AP)</option>`) +
-        mk(sta, c => `<option value="${c.mac}">${c.vendor} (客户端)</option>`);
+        mk(sta, c => `<option value="${c.mac}">${devLabel(c.mac, c.vendor)} (客户端)</option>`);
 
     if (typeof renderFtmApSelect === 'function') renderFtmApSelect();
 }
@@ -5106,14 +5120,15 @@ function rfSyncTarget(){
     if (ap){
         bar.classList.remove('empty');
         name.textContent = ap.ssid || '(隐藏)';
-        meta.textContent = [ap.bssid, 'CH' + ap.channel, ap.rssi + 'dBm', ap.pmf ? 'PMF' : '']
+        meta.textContent = [ap.bssid, 'CH' + ap.channel, ap.rssi + 'dBm',
+                            devLabel(ap.bssid, ap.vendor), ap.pmf ? 'PMF' : '']
             .filter(Boolean).join(' · ');
         document.getElementById('tgtScan').textContent = '扫描';
         document.getElementById('tgtChange').textContent = '更换';
     } else if (cli){
         bar.classList.remove('empty');
         name.textContent = '客户端 ' + cli.mac.slice(-8);
-        meta.textContent = cli.vendor + ' · ' + cli.rssi + 'dBm';
+        meta.textContent = devLabel(cli.mac, cli.vendor) + ' · ' + cli.rssi + 'dBm';
         document.getElementById('tgtScan').textContent = '扫描';
         document.getElementById('tgtChange').textContent = '更换';
     } else {

@@ -85,12 +85,26 @@ static void hex_into(char *dst, const uint8_t *src, int n)
 /* eapol_msg_no / extract_pmkid 已移到 eapol_core.c, 以便主机端单测 */
 
 /* 按 Replay Counter 判有效配对: 同一次握手里 M1/M2/M3/M4 的 RC 必然相同 */
+/* 大端 64 位, next 正好是 base 的 +1 时返回 true */
+static bool rc_plus_one(const uint8_t next[8], const uint8_t base[8])
+{
+    uint8_t inc[8];
+    memcpy(inc, base, 8);
+    for (int i = 7; i >= 0; i--) {
+        if (++inc[i] != 0) break;
+    }
+    return memcmp(next, inc, 8) == 0;
+}
+
 static int try_pair(const hs_t *h)
 {
+    /* M2 回显 M1 的 replay counter, 相等才算同一轮 */
     if ((h->present & P_M1) && (h->present & P_M2) &&
         memcmp(h->rc[0], h->rc[1], 8) == 0) return 1;
+    /* M3 的 counter 是 M2 的 +1 (802.11 4-way), 只认相等的话
+     * "只抓到 M2+M3" 这种最常见的场景一条都出不来. */
     if ((h->present & P_M2) && (h->present & P_M3) &&
-        memcmp(h->rc[1], h->rc[2], 8) == 0) return 2;
+        (memcmp(h->rc[1], h->rc[2], 8) == 0 || rc_plus_one(h->rc[2], h->rc[1]))) return 2;
     return 0;
 }
 
@@ -409,8 +423,18 @@ int hs_selftest(void)
     int got3 = hs_export_22000(selftest_sink, NULL);
     printf("---- selftest: RC 不一致 -> lines=%d (期望 0) ----\n", got3);
 
+    /* 4) M2 + M3, M3 的 counter 比 M2 大 1 -> 应判 m2m3 (真实 4-way 的常态) */
     hs_clear();
-    return (got == 1 && got2 == 1 && got3 == 0) ? 0 : 1;
+    uint8_t rc3[8] = {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x89};
+    n = build_eapol_frame(f, false, 2, rc,  snonce, mic, NULL); hs_feed(f, (uint16_t)n, -40, 36);
+    n = build_eapol_frame(f, true,  3, rc3, anonce, mic, NULL); hs_feed(f, (uint16_t)n, -40, 36);
+    printf("---- selftest: M2+M3(counter+1) (期望 pair=m2m3, 一条 WPA*02) ----\n");
+    hs_dump(false);
+    int got4 = hs_export_22000(selftest_sink, NULL);
+    printf("---- selftest: lines=%d ----\n", got4);
+
+    hs_clear();
+    return (got == 1 && got2 == 1 && got3 == 0 && got4 == 1) ? 0 : 1;
 }
 
 

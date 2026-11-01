@@ -186,8 +186,9 @@ int mk_beacon_frame(uint8_t *out, int max_len, const uint8_t src[6],
     /* beacon interval (LE) */
     out[p++] = (uint8_t)(interval & 0xff);
     out[p++] = (uint8_t)(interval >> 8);
-    /* capability: ESS (0x0001) | Short-Preamble (0x0020) -> 0x2101 */
-    out[p++] = 0x01; out[p++] = 0x21;
+    /* ESS(0x0001) | ShortSlot(0x0400) = 0x0401. 之前写 0x2101 置上了
+     * Spectrum Mgmt 与保留位, 部分客户端拿它做漫游判定. */
+    out[p++] = 0x01; out[p++] = 0x04;
 
     /* IE: SSID (id=0) */
     int ssid_len = ssid ? (int)strlen(ssid) : 0;
