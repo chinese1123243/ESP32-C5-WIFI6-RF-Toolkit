@@ -11,7 +11,7 @@
     "build:android:release": "npm run www:sync && cap sync android && cd android && gradlew.bat assembleRelease"
   },
   "devDependencies": {
-    "@capacitor/cli": "^6.0.0",
+    "@capacitor/cli": "^8.5.3",
     "typescript": "^7.0.2"
   },
   "dependencies": {
