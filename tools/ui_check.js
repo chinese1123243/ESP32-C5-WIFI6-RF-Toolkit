@@ -38,6 +38,9 @@ try {
 console.log('[2] element ids');
 const htmlIds = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]));
 const refs = new Set([...js.matchAll(/\$\('([^']+)'\)/g)].map(m => m[1]));
+/* 还有一类引用是"id 当参数传"的: setStat('x') / set('x') / put('x').
+ * 这类静态查不到 $('x'), 拼错 id 也不会报, 现场表现是某个格子永远是 '--'. */
+for (const m of js.matchAll(/\b(?:setStat|set|put)\('([A-Za-z_][\w-]*)'/g)) refs.add(m[1]);
 const missing = [...refs].filter(r => !htmlIds.has(r));
 if (missing.length) bad('$() ids not in index.html: ' + missing.join(', '));
 else ok(refs.size + ' refs, all present in ' + htmlIds.size + ' html ids');

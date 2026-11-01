@@ -1,6 +1,6 @@
 /* RFTOOL PWA service worker — 离线缓存 */
-const CACHE = 'rftool-v2.4.11-r1';
-const ASSETS = ['./', './index.html', './app.js?v=2.4.11', './app.js', './manifest.json', './icon.png'];
+const CACHE = 'rftool-v2.4.12-r1';
+const ASSETS = ['./', './index.html', './app.js?v=2.4.12', './app.js', './manifest.json', './icon.png'];
 
 self.addEventListener('install', e => {
     e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)));

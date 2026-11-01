@@ -4,7 +4,7 @@
  */
 
 /* 版本 */
-const APP_VERSION  = '2.4.11';
+const APP_VERSION  = '2.4.12';
 const APP_BUILD    = '2026.09';
 const APP_AUTHOR      = 'CN112';
 const APP_AUTHOR_FULL = 'CN1123243';
@@ -339,7 +339,19 @@ let connected = false, connecting = false, negotiatedMtu = 0;
 let bleScanHandle = null;
 const bleDevices = new Map();
 const apList = [];
-let lastHealth = null;   /* 最近一次 health --json, 供仪表盘系统观测行 */
+let lastHealth = null;   /* 最近一次 health --json, 供仪表盘指标网格 */
+
+/* 记住用户的选择: 调度策略、驻留、列表排序与筛选.
+ * 每次打开都回默认值的话, 常用配置得重新点一遍. */
+const PREF_KEY = 'rfkit.prefs';
+const prefs = (() => {
+    try { return JSON.parse(localStorage.getItem(PREF_KEY) || '{}') || {}; }
+    catch(_) { return {}; }
+})();
+function savePref(k, v){
+    prefs[k] = v;
+    try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch(_) {}
+}
 const clientList = [];
 let selectedAp = null, selectedClient = null;
 
@@ -524,8 +536,238 @@ function updateConnInfo(){
 }
 
 /*
-   开屏动画
+   开屏: 频谱自检
+   扫描线从左走到右, 走过的位置留下谱线, 峰值处落标记, 品牌随后浮现.
+   谱线由固定峰值表生成, 每次启动长得一样 (随机噪点会让开屏每次都不同, 显得脏).
+   动画只在开屏期间跑, 收尾即停 rAF.
  */
+let splashStartAt = 0;     /* 开屏真正可见的时刻, Boot 的计时锚点 */
+
+const Splash = (() => {
+    const cv = document.getElementById('spSweep');
+    const reduces = window.matchMedia &&
+                    window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    /* [中心, 宽度, 高度] 归一化到 0..1 */
+    const PEAKS = [
+        [0.07, 0.022, 0.34], [0.16, 0.014, 0.63], [0.25, 0.020, 0.20],
+        [0.35, 0.013, 0.88], [0.44, 0.019, 0.41], [0.55, 0.024, 0.26],
+        [0.66, 0.015, 0.75], [0.77, 0.021, 0.38], [0.87, 0.016, 0.57],
+        [0.95, 0.023, 0.19],
+    ];
+
+    const T_SWEEP0 = 150, T_SWEEP1 = 880;    /* 扫描线起止 */
+    const T_SETTLE = 1180;                   /* 谱线落到暗态的时刻 */
+
+    let ctx = null, cw = 0, ch = 0, n = 0, step = 2, vals = [];
+    let t0 = 0, raf = 0, running = false;
+
+    function spec(u){
+        let v = 0.055;
+        for (let k = 0; k < PEAKS.length; k++){
+            const d = (u - PEAKS[k][0]) / PEAKS[k][1];
+            v += PEAKS[k][2] * Math.exp(-d * d);
+        }
+        /* 固定相位的细纹, 让谱线不带塑料感 */
+        v += 0.011 * Math.sin(u * 149.0) + 0.008 * Math.sin(u * 373.0 + 1.1);
+        return Math.max(0.02, Math.min(1, v));
+    }
+
+    function fit(){
+        cw = cv.clientWidth || 320;
+        ch = cv.clientHeight || 88;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        if (cv.width !== Math.round(cw * dpr) || cv.height !== Math.round(ch * dpr)){
+            cv.width = Math.round(cw * dpr);
+            cv.height = Math.round(ch * dpr);
+        }
+        ctx = cv.getContext('2d');
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        n = Math.max(32, Math.round(cw / 2));
+        step = cw / (n - 1);
+        vals = new Array(n);
+        for (let i = 0; i < n; i++) vals[i] = spec(i / (n - 1));
+    }
+
+    /* 网格: 竖 12 格, 横 3 格, 只用极低对比 */
+    function grid(){
+        ctx.strokeStyle = 'rgba(232,241,255,.045)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let i = 0; i <= 12; i++){
+            const x = Math.round(cw * i / 12) + .5;
+            ctx.moveTo(x, 0); ctx.lineTo(x, ch);
+        }
+        for (let j = 0; j <= 3; j++){
+            const y = Math.round(ch * j / 3) + .5;
+            ctx.moveTo(0, y); ctx.lineTo(cw, y);
+        }
+        ctx.stroke();
+    }
+
+    function pathTo(xLimit){
+        ctx.beginPath();
+        let lastX = 0;
+        for (let i = 0; i < n; i++){
+            const x = i * step;
+            if (x > xLimit) break;
+            const y = ch - 4 - vals[i] * (ch - 12);
+            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            lastX = x;
+        }
+        return lastX;
+    }
+
+    function draw(sx, alpha){
+        ctx.clearRect(0, 0, cw, ch);
+        grid();
+
+        /* 面积: 极低对比, 只给谱线一个落脚点 */
+        pathTo(sx);
+        ctx.lineTo(sx, ch); ctx.lineTo(0, ch); ctx.closePath();
+        ctx.fillStyle = 'rgba(232,241,255,.035)';
+        ctx.fill();
+
+        /* 磷光拖尾: 分三段描, 比逐段改 alpha 便宜 */
+        const segs = [[0, .16], [96, .52], [26, .95]];
+        for (let k = 0; k < segs.length; k++){
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(Math.max(0, sx - segs[k][0] - (k === 0 ? sx : 0)), 0,
+                     k === 0 ? sx : Math.min(segs[k][0] + 2, sx), ch);
+            ctx.clip();
+            pathTo(sx);
+            ctx.strokeStyle = 'rgba(234,242,255,' + (segs[k][1] * alpha).toFixed(3) + ')';
+            ctx.lineWidth = k === 2 ? 1.35 : 1;
+            ctx.lineJoin = 'round';
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        /* 峰标记: 扫描线过了才落, 像分析仪的保持点 */
+        ctx.strokeStyle = 'rgba(234,242,255,' + (.55 * alpha).toFixed(3) + ')';
+        ctx.lineWidth = 1;
+        for (let k = 0; k < PEAKS.length; k++){
+            const px = PEAKS[k][0] * cw;
+            if (px > sx - 4) continue;
+            const py = ch - 4 - spec(PEAKS[k][0]) * (ch - 12);
+            ctx.beginPath();
+            ctx.moveTo(Math.round(px) + .5, py - 7);
+            ctx.lineTo(Math.round(px) + .5, py - 2);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(Math.round(px) - 2.5 + .5, py - 7.5);
+            ctx.lineTo(Math.round(px) + 2.5 + .5, py - 7.5);
+            ctx.stroke();
+        }
+
+        /* 扫描线: 只有 1px 主线 + 极窄的一层辉光.
+           之前给 12px 渐变填充, 读起来像一条发亮的竖条, 不像扫描线. */
+        if (sx <= cw){
+            const g = ctx.createLinearGradient(sx - 7, 0, sx, 0);
+            g.addColorStop(0, 'rgba(234,242,255,0)');
+            g.addColorStop(1, 'rgba(234,242,255,.07)');
+            ctx.fillStyle = g;
+            ctx.fillRect(Math.max(0, sx - 7), 0, Math.min(7, sx), ch);
+
+            ctx.strokeStyle = 'rgba(234,242,255,' + (.78 * alpha).toFixed(3) + ')';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(Math.round(sx) + .5, 0);
+            ctx.lineTo(Math.round(sx) + .5, ch);
+            ctx.stroke();
+        }
+    }
+
+    function frame(now){
+        if (!t0) t0 = now;
+        const t = now - t0;
+        const p = Math.max(0, Math.min(1, (t - T_SWEEP0) / (T_SWEEP1 - T_SWEEP0)));
+        /* 收尾: 1200ms 内谱线压到 0.35, 之后停 */
+        const fade = t <= T_SETTLE ? 1
+                   : Math.max(0.35, 1 - (t - T_SETTLE) / 320);
+        draw(p * cw, fade);
+        if (t < T_SETTLE + 340){ raf = requestAnimationFrame(frame); }
+        else { running = false; draw(cw + 40, 0.35); draw(cw, 0.35); }
+    }
+
+    function start(){
+        if (!cv) return;
+        if (!splashStartAt) splashStartAt = performance.now();
+        fit();
+        if (reduces){ draw(cw + 40, 0.35); return; }
+        if (running) return;
+        running = true;
+        raf = requestAnimationFrame(frame);
+    }
+
+    window.addEventListener('resize', () => {
+        if (!cv || !ctx) return;
+        const was = running;
+        fit();
+        if (!was) draw(cw + 40, 0.35);
+    }, { passive: true });
+
+    if (document.readyState === 'loading'){
+        document.addEventListener('DOMContentLoaded', start, { once: true });
+    } else {
+        start();
+    }
+
+    return {
+        stop(){ if (raf) cancelAnimationFrame(raf); running = false; },
+        /* 重画收尾态. 开屏被隐藏时 clientWidth 变 0, 画布会被 resize 清掉;
+         * 重新显示 (切后台回来、旋转屏幕) 时得再画一次才不会是一片空白. */
+        redraw(){
+            if (!cv || running) return;
+            fit();
+            draw(cw + 40, 0.35);
+        },
+    };
+})();
+
+/*
+   启动时序: 动画至少走完一遍, 就绪后立刻收尾.
+   原来是固定 2400ms: 动画没看完就跳走, 或者能用了还在干等.
+ */
+const Boot = (() => {
+    /* 锚点用开屏出现的时刻, 不能用脚本解析时刻: 慢设备上 load 可能晚一两秒,
+     * 从解析算起会一加载完就立刻关掉, 动画一帧都看不到. */
+    const MIN_MS = 1250;      /* 让扫描线走完 (扫描 880 + 收尾 340) */
+    const MAX_MS = 2600;      /* 卡住也不能一直挂着 */
+    let ready = false, closed = false;
+
+    function close(){
+        if (closed) return;
+        closed = true;
+        Splash.stop();
+        const sp = document.getElementById('splash');
+        const pr = document.getElementById('spProg');
+        if (pr){ pr.classList.add('now'); pr.style.width = '100%'; }
+        if (!sp) return;
+        setTimeout(() => {
+            sp.classList.add('hidden');
+            setTimeout(() => { sp.style.display = 'none'; }, 700);
+        }, 140);
+    }
+
+    function tick(){
+        if (closed) return;
+        const dt = performance.now() - (splashStartAt || performance.now());
+        if ((ready && dt >= MIN_MS) || dt >= MAX_MS) return close();
+        setTimeout(tick, 60);
+    }
+
+    return {
+        start(){
+            const pr = document.getElementById('spProg');
+            if (pr) requestAnimationFrame(() => { pr.style.width = '86%'; });
+            setTimeout(tick, 60);
+        },
+        ready(){ ready = true; },
+    };
+})();
+
 window.addEventListener('load', () => {
     applyVersionUI();
     updateConnInfo();
@@ -536,10 +778,8 @@ window.addEventListener('load', () => {
     renderCreds();
     renderPhishSta();
     setTimeout(moveTabInd, 60);
-    setTimeout(() => {
-        $('splash').classList.add('hidden');
-        setTimeout(() => { $('splash').style.display = 'none'; }, 900);
-    }, 2400);
+    Boot.start();
+    Boot.ready();
 });
 
 /*
@@ -1488,8 +1728,28 @@ function parseOutputLine(line){
                                         ' (' + (h.jobs_rej_name || '') + ')';
             log(msg, 'meta');
             lastHealth = h;
-            const sys = document.getElementById('dashSys');
-            if (sys){ sys.hidden = false; sys.textContent = '系统观测 · ' + msg.slice(5); }
+            const grid = document.getElementById('dashGrid');
+            if (grid){
+                grid.hidden = false;
+                /* kb: 堆的数字都在 20KB~40KB, 写成 32.4K 比 33203 好读 */
+                const kb = n => (n == null) ? '--' : (n / 1024).toFixed(1) + 'K';
+                const put = (id, v, warn) => {
+                    const el = document.getElementById(id);
+                    if (!el) return;
+                    el.textContent = v;
+                    el.parentNode.classList.toggle('warn', !!warn);
+                };
+                put('mgHeap', kb(h.internal_free));
+                /* 16KB 是门户与 BLE 同时要用的连续块门槛, 低于它标红 */
+                put('mgLargest', kb(h.internal_largest),
+                    h.internal_largest != null && h.internal_largest < 16384);
+                put('mgTasks', h.tasks != null ? h.tasks : '--');
+                put('mgJobs', (h.jobs_active || 0) + '/' + (h.jobs_cap || 0));
+                put('mgRate', ((h.out_rate_x10 || 0) / 10).toFixed(1));
+                put('mgRho', h.ev_rho_pct != null ? h.ev_rho_pct + '%' : '--');
+                put('mgDrop', h.ev_dropped != null ? h.ev_dropped : '--', h.ev_dropped > 0);
+                put('mgRej', h.jobs_rejected || 0, h.jobs_rejected > 0);
+            }
         } catch(_) { log(line); }
         return;
     }
@@ -2308,6 +2568,7 @@ function parseOutputLine(line){
             setStat('stInject', kv.inject_total || '0'); setStat('stInject2', kv.inject_total || '0');
             setStat('stAps', kv.aps || '0');   setStat('stAps2', kv.aps || '0');
             setStat('stCli', kv.clients || '0'); setStat('stCli2', kv.clients || '0');
+            setStat('hsFollow', kv.hs_follow || '0');
             updateBand(kv.auto_ch === '1' ? 'AUTO' : bandOf(ch));
             setJobActive((kv.state || 'IDLE') !== 'IDLE');
             /* 固件回报的 MTU 是实际协商结果, 比 requestMtu 的返回值可靠 */
@@ -2732,6 +2993,18 @@ function apCapsHtml(ap){
     return out.map(s => `<span>${s}</span>`).join('');
 }
 
+/* AP 列表的排序与频段筛选. 41 条信道扫一遍通常二三十台, 全按信号排会
+ * 把同一信道打散, 也没法只看 5G. 这两个开关放在列表顶上, 一点就生效. */
+let apSortKey = 'rssi';
+let apBand = 'all';
+
+function apVisible(a){
+    if (apBand === 'all') return true;
+    if (apBand === 'open') return /OPEN/i.test(a.enc || '');
+    if (apBand === '5') return a.channel >= 36;
+    return a.channel < 36;
+}
+
 function renderApList(){
     const list = $('apList');
     const keyword = ($('apSearch')?.value || '').toLowerCase();
@@ -2740,24 +3013,28 @@ function renderApList(){
         $('apCount').textContent = '0 个 AP';
         return;
     }
-    const filtered = keyword
+    let filtered = keyword
         ? apList.filter(a => a.ssid.toLowerCase().includes(keyword) || a.bssid.toLowerCase().includes(keyword) || String(a.channel).includes(keyword))
         : apList;
+    filtered = filtered.filter(apVisible);
     if (filtered.length === 0){
-        list.innerHTML = '<div class="list-empty">未发现匹配的 AP</div>';
+        list.innerHTML = '<div class="list-empty">当前筛选下没有 AP</div>';
         $('apCount').textContent = apList.length + ' 个 AP';
         return;
     }
     list.innerHTML = '';
-    const sorted = [...filtered].sort((a,b) => b.rssi - a.rssi);
+    const sorted = [...filtered].sort((a, b) =>
+        apSortKey === 'ch'   ? (a.channel - b.channel || b.rssi - a.rssi)
+      : apSortKey === 'ssid' ? String(a.ssid).localeCompare(String(b.ssid))
+      : (b.rssi - a.rssi));
     for (let i=0; i<sorted.length; i++){
         const ap = sorted[i];
         const item = document.createElement('div');
         item.className = 'list-item' + (selectedAp && selectedAp.bssid === ap.bssid ? ' selected' : '');
         item.style.animationDelay = (i * 20) + 'ms';
-        const rssiIcon = ap.rssi > -50 ? '▰' : ap.rssi > -70 ? '▱' : '▯';
+        /* 行首不再放图标: ▰▱▯ 这组字形不在系统字体里会掉成方块, 换成实心点
+         * 又和右侧信号条重复. 强弱交给信号条, 选中交给左侧高亮条. */
         item.innerHTML = `
-            <div class="ic">${rssiIcon}</div>
             <div class="nm">
                 <div class="ssid">${ap.ssid}${ap.hidden ? ' <span style="color:var(--faint);font-size:9px;">[HIDDEN]</span>' : ''}</div>
                 <div class="meta">
@@ -2768,7 +3045,10 @@ function renderApList(){
                 </div>
                 <div class="meta" style="margin-top:2px">${apCapsHtml(ap)}</div>
             </div>
-            <div class="rssi">${ap.rssi} dBm</div>
+            <div class="rssi">
+                <span class="rbar"><i style="width:${Math.max(4, Math.min(100, (ap.rssi + 95) / 65 * 100)).toFixed(0)}%"></i></span>
+                ${ap.rssi}
+            </div>
         `;
         item.addEventListener('click', () => selectAp(ap));
         item.addEventListener('long-press', () => copyText(ap.bssid));
@@ -2776,22 +3056,62 @@ function renderApList(){
         item.addEventListener('touchend', e => { if (Date.now()-item._pressT > 500) copyText(ap.bssid); });
         list.appendChild(item);
     }
-    $('apCount').textContent = filtered.length + ' 个 AP' + (keyword ? ` (共 ${apList.length})` : '');
+    $('apCount').textContent = filtered.length + ' 个 AP' +
+        ((keyword || apBand !== 'all') ? ` (共 ${apList.length})` : '');
     window.RFRefreshPicks?.();
+}
+
+/* 筛选条: 排序与频段各只允许一个选中 */
+{
+    const box = $('apSort');
+    if (box){
+        box.addEventListener('click', e => {
+            const btn = e.target.closest('button');
+            if (!btn) return;
+            if (btn.dataset.sort){
+                apSortKey = btn.dataset.sort;
+                savePref('apSort', apSortKey);
+                box.querySelectorAll('[data-sort]').forEach(x => x.classList.toggle('on', x === btn));
+            } else if (btn.dataset.band){
+                apBand = btn.dataset.band;
+                savePref('apBand', apBand);
+                box.querySelectorAll('[data-band]').forEach(x => x.classList.toggle('on', x === btn));
+            } else return;
+            renderApList();
+        });
+
+        /* 恢复上次的排序与筛选. 找不到对应按钮就保持默认, 不硬套 */
+        if (prefs.apSort){
+            const b = box.querySelector(`[data-sort="${prefs.apSort}"]`);
+            if (b){ apSortKey = prefs.apSort;
+                    box.querySelectorAll('[data-sort]').forEach(x => x.classList.toggle('on', x === b)); }
+        }
+        if (prefs.apBand){
+            const b = box.querySelector(`[data-band="${prefs.apBand}"]`);
+            if (b){ apBand = prefs.apBand;
+                    box.querySelectorAll('[data-band]').forEach(x => x.classList.toggle('on', x === b)); }
+        }
+    }
 }
 
 /* 策略说明: 一句话讲清代价, 不写"更快更稳"这种没信息量的话 */
 {
     const polSel = $('sniffPolicy'), note = $('sniffPolicyNote');
     const TEXT = {
-        psd:  'PSD：按发现数排序，一轮 78 条约 20 秒',
+        psd:  'PSD：按发现数排序，一轮 41 条约 13 秒',
         sacs: 'SACS：长时间扫描更少漏，短扫与 PSD 打平',
         adt:  'ADT：前 2 秒最快，空信道回探稀疏',
         wrl:  'WRL：按帧率加权，热信道可能只是有人在刷视频',
     };
     polSel?.addEventListener('change', () => {
         if (note) note.textContent = TEXT[polSel.value] || '';
+        savePref('policy', polSel.value);
     });
+    /* 恢复上次选的策略: 直接赋 value 不会触发 change, 说明文字要手动刷一次 */
+    if (polSel && prefs.policy && [...polSel.options].some(o => o.value === prefs.policy)){
+        polSel.value = prefs.policy;
+        if (note) note.textContent = TEXT[polSel.value] || '';
+    }
 }
 
 $('apSearch')?.addEventListener('input', renderApList);
