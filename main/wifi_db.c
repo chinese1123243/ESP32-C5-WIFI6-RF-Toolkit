@@ -18,66 +18,18 @@
 #include "esp_timer.h"
 #include "esp_log.h"
 
-/* OUI table (top vendors, compressed) */
-/* Format: {oui[3], name}. Sorted for binary search. */
-typedef struct { uint8_t oui[3]; const char *name; } oui_entry_t;
-
-static const char *DB_TAG = "WDB";
-
-static const oui_entry_t s_oui_table[] = {
-    {{0x00,0x0C,0xE7}, "Espressif"},
-    {{0x00,0x11,0x22}, "Custom"},
-    {{0x00,0x1A,0x11}, "Google"},
-    {{0x00,0x50,0x56}, "VMware"},
-    {{0x00,0x50,0xF2}, "Microsoft"},
-    {{0x00,0x60,0x2F}, "Cisco"},
-    {{0x00,0xA0,0xF8}, "Symbol"},
-    {{0x04,0x0E,0x0E}, "Tp-link"},
-    {{0x04,0xC0,0x07}, "Tp-link"},
-    {{0x0C,0x82,0x8C}, "Tp-link"},
-    {{0x10,0x27,0xBE}, "Apple"},
-    {{0x14,0x8F,0xB6}, "Tp-link"},
-    {{0x18,0xA6,0xF0}, "Tp-link"},
-    {{0x1C,0xBF,0xCE}, "Tp-link"},
-    {{0x24,0x0A,0x64}, "Tp-link"},
-    {{0x28,0x15,0xA4}, "Unknown"},
-    {{0x30,0xB5,0xC2}, "Espressif"},
-    {{0x3C,0xDC,0x75}, "Espressif"},
-    {{0x40,0x83,0x3F}, "Tp-link"},
-    {{0x48,0x57,0x02}, "Unknown"},
-    {{0x50,0xC7,0xBF}, "Tp-link"},
-    {{0x54,0xA6,0x51}, "Unknown"},
-    {{0x58,0xD5,0x6E}, "Tp-link"},
-    {{0x60,0x32,0xB1}, "Tp-link"},
-    {{0x64,0x16,0x66}, "Tp-link"},
-    {{0x68,0x77,0x24}, "Waveshare"},
-    {{0x7C,0xDD,0x90}, "Unknown"},
-    {{0x7E,0x77,0x24}, "Waveshare"},
-    {{0x80,0xEA,0x96}, "Tp-link"},
-    {{0x8C,0xE1,0x17}, "Tp-link"},
-    {{0x90,0x4C,0xE0}, "Unknown"},
-    {{0x9C,0xF6,0xDD}, "Tp-link"},
-    {{0xA0,0xF3,0xC1}, "Tp-link"},
-    {{0xAC,0x84,0xC6}, "Tp-link"},
-    {{0xB0,0x4E,0x60}, "Unknown"},
-    {{0xC0,0x4A,0x00}, "Tp-link"},
-    {{0xD4,0x6A,0x8A}, "Unknown"},
-    {{0xE0,0x4D,0x84}, "Unknown"},
-    {{0xE4,0xFE,0x43}, "Unknown"},
-    {{0xEC,0x08,0x6B}, "Tp-link"},
-    {{0xF0,0x99,0xB6}, "Tp-link"},
-    {{0xF4,0xEC,0x38}, "Unknown"},
-};
-#define OUI_COUNT (sizeof(s_oui_table)/sizeof(s_oui_table[0]))
+/* 厂商表由 tools/gen_oui.py 从 IEEE 注册表生成, 按 OUI 升序可直接二分.
+ * 811 条覆盖主流消费设备; 全量 34114 条塞不进 flash, 也没必要. */
+#include "oui_table.h"
 
 const char *oui_lookup(const uint8_t mac[3])
 {
-    /* Linear search (table is small, ~40 entries) */
-    for (int i = 0; i < (int)OUI_COUNT; i++) {
-        if (s_oui_table[i].oui[0] == mac[0] &&
-            s_oui_table[i].oui[1] == mac[1] &&
-            s_oui_table[i].oui[2] == mac[2])
-            return s_oui_table[i].name;
+    uint32_t key = ((uint32_t)mac[0] << 16) | ((uint32_t)mac[1] << 8) | mac[2];
+    int lo = 0, hi = (int)OUI_COUNT - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+        if (s_oui_table[mid].key == key) return s_oui_table[mid].name;
+        if (s_oui_table[mid].key < key) lo = mid + 1; else hi = mid - 1;
     }
     return "Unknown";
 }

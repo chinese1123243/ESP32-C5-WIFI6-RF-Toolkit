@@ -673,6 +673,15 @@ button.mi{ width:100%; background:none; border:0; text-align:left; font:inherit;
   font-size:11px; line-height:1.62; color:var(--faint); letter-spacing:.01em;
 }
 
+/* 图表页: 画布统一按容器宽度铺满, 高度按图表类型分档 */
+.cv{ display:block; width:100%; background:transparent; }
+.cv-mid{ height:112px; }
+.cv-sq{ height:150px; }
+.stat-row{ display:grid; grid-template-columns:repeat(4,1fr); gap:7px; margin-top:2px; }
+.stat-cell{ border:1px solid var(--line2); border-radius:8px; padding:9px 4px 8px; text-align:center; }
+.stat-cell b{ display:block; font-size:18px; font-weight:600; letter-spacing:-.02em; line-height:1.1; }
+.stat-cell span{ display:block; margin-top:3px; font-size:9px; letter-spacing:.1em; color:var(--dim); text-transform:uppercase; }
+
 </style>
 </head>
 <body>
@@ -797,6 +806,47 @@ button.mi{ width:100%; background:none; border:0; text-align:left; font:inherit;
             <button class="btn" id="dashBtnScanAp">扫描 AP</button>
             <button class="btn" id="dashBtnRefresh">刷新状态</button>
           </div>
+        </div>
+      </section>
+
+      <!-- ===== 01 图表 ===== -->
+      <section class="panel" id="pan-chart">
+        <div class="blk">
+          <span class="idx">01 — Analytics</span>
+          <h3>数据视图<span class="h3-sub">Charts</span></h3>
+          <div class="stat-row">
+            <div class="stat-cell"><b id="chApN">0</b><span>AP</span></div>
+            <div class="stat-cell"><b id="chOpenN">0</b><span>开放</span></div>
+            <div class="stat-cell"><b id="chWpa3N">0</b><span>WPA3</span></div>
+            <div class="stat-cell"><b id="chBusy">--</b><span>最忙信道</span></div>
+          </div>
+          <div class="note" id="chHint">图表跟随当前 AP 列表实时刷新。先扫一次。</div>
+        </div>
+
+        <div class="blk">
+          <h3>信道占用<span class="h3-sub">Channel Load</span></h3>
+          <canvas class="cv cv-mid" id="chChan"></canvas>
+        </div>
+
+        <div class="blk">
+          <h3>信号强度<span class="h3-sub">RSSI</span></h3>
+          <canvas class="cv cv-mid" id="chRssi"></canvas>
+        </div>
+
+        <div class="blk">
+          <h3>加密构成<span class="h3-sub">Security</span></h3>
+          <canvas class="cv cv-sq" id="chEnc"></canvas>
+        </div>
+
+        <div class="blk">
+          <h3>厂商分布<span class="h3-sub">Vendors</span></h3>
+          <canvas class="cv cv-mid" id="chVend"></canvas>
+        </div>
+
+        <div class="blk">
+          <h3>发现节奏<span class="h3-sub">Discovery</span></h3>
+          <canvas class="cv cv-mid" id="chTime"></canvas>
+          <div class="note" id="chTimeNote">每次重新扫描会从头计时。</div>
         </div>
       </section>
 
@@ -1527,6 +1577,7 @@ button.mi{ width:100%; background:none; border:0; text-align:left; font:inherit;
     <div class="tabs" id="tabs">
       <div class="tab-ind" id="tabInd"></div>
       <div class="tab active" data-tab="dash">仪表盘</div>
+      <div class="tab" data-tab="chart">图表</div>
       <div class="tab" data-tab="scan">扫描</div>
       <div class="tab" data-tab="sniff">嗅探</div>
       <div class="tab" data-tab="deauth">Deauth</div>
