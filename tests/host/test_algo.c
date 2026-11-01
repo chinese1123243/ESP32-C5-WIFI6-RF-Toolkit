@@ -183,6 +183,54 @@ static void test_csi(void)
           still, CSI_DET_HOLD_N);
 }
 
+
+static void test_coherence(void)
+{
+    /* 门控把"微波炉"和"有人走动"分开: 合成分真时前者一致率 0.49~0.53,
+     * 后者 0.80~0.88, 而两者的幅度指标只差 1.5 倍. */
+    enum { N = 32 };
+    int16_t cur[N];
+    float   ref[N];
+
+    /* 1) 两帧完全一样: 无证据, 必须回 0.5 (回 0 会让静止环境永远被门控挡住) */
+    for (int i = 0; i < N; i++) { cur[i] = 1000; ref[i] = 1000.0f / 1000.0f; }
+    NEAR(csi_coherence(cur, ref, N, 1.0f / 1000.0f), 0.5, 1e-6, "全同帧应为 0.5");
+
+    /* 2) 残差同号 (真实运动: 整条路径相位旋转, 频率轴上连续同向) */
+    for (int i = 0; i < N; i++) {
+        ref[i] = 0.5f;
+        cur[i] = (int16_t)((0.5f + 0.002f * (i + 1)) * 1000.0f);
+    }
+    NEAR(csi_coherence(cur, ref, N, 1.0f / 1000.0f), 1.0, 1e-6, "单调残差应全同向");
+
+    /* 3) 残差交替变号 (窄带干扰之外的白噪声就是这种) */
+    for (int i = 0; i < N; i++) {
+        ref[i] = 0.5f;
+        cur[i] = (int16_t)((0.5f + ((i & 1) ? 0.002f : -0.002f)) * 1000.0f);
+    }
+    NEAR(csi_coherence(cur, ref, N, 1.0f / 1000.0f), 0.0, 1e-6, "交替残差应全反向");
+
+    /* 4) 单个子载波跳变, 其余不动: 微波炉的样子, 一致率必须低到门限以下 */
+    for (int i = 0; i < N; i++) {
+        ref[i] = 0.5f;
+        cur[i] = (int16_t)(0.5f * 1000.0f);
+    }
+    cur[7] = 900;
+    float c = csi_coherence(cur, ref, N, 1.0f / 1000.0f);
+    CHECK(c < CSI_DET_COH_MIN, "单点跳变的一致率 %.2f 不应过门限 %.2f", c, CSI_DET_COH_MIN);
+
+    /* 5) 样本太少 / 缩放非法: 回中性值, 不能让调用方拿到 NaN */
+    NEAR(csi_coherence(cur, ref, 2, 1.0f), 0.5, 1e-6, "n<3 应为 0.5");
+    NEAR(csi_coherence(cur, ref, N, 0.0f), 0.5, 1e-6, "inv_norm=0 应为 0.5");
+
+    /* 6) 门控本身: 内部判定为动作但一致率不够时不报, 一致率够了照报 */
+    csi_det_t d;
+    csi_det_reset(&d);
+    for (int i = 0; i < 40; i++) csi_det_update(&d, 1.0f);
+    CHECK(!csi_det_update_coh(&d, 1.9f, 0.5f), "一致率 0.50 时应被门控挡住");
+    CHECK(csi_det_update_coh(&d, 1.9f, 0.9f), "一致率 0.90 时应放行");
+}
+
 int main(void)
 {
     test_dwell_opt();
@@ -191,6 +239,7 @@ int main(void)
     test_psd_order();
     test_locate();
     test_csi();
+    test_coherence();
     printf("\n=== 结果: %d passed, %d failed ===\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

@@ -238,6 +238,13 @@ static inline void chan_hit(uint8_t ch, uint16_t w)
 static _Atomic uint16_t s_ch_found[CH_IDX_MAX + 1];
 static _Atomic uint32_t s_ch_found_total = 0;
 static _Atomic uint32_t s_ch_switch_err = 0;
+/* 撞到 EAPOL 就地延长的次数. 现场看这个数就能判断"是不是真在握手通道上":
+ * 长时间为 0 说明要么环境里没人上线, 要么客户端在别的信道上. */
+static _Atomic uint32_t s_hs_follow_cnt = 0;
+
+/* psd 与 sacs 互斥运行, 共用一张权重表: 256 个信道 x 2B = 512B 内部 RAM,
+ * 内部堆只剩 30KB 出头, 不值得为两条互斥路径各留一份. */
+static uint16_t s_sched_w[CH_IDX_MAX + 1];
 /* 每信道被驻留过几次. 第一次必须给足探测下限, 之后才敢用便宜的 150ms:
  * 首轮的 150ms 会让"没探过"和"探过是空的"变成同一件事, 实测 5 秒时比
  * 均匀扫描少发现 3.8 台. */
@@ -356,9 +363,72 @@ static bool chan_enter(uint8_t ch)
     return true;
 }
 
+/* 撞到 EAPOL 就地跟随.
+ *
+ * 4-way 的 M1 与 M3 相隔 AP 算 PTK 的时间, 3~30ms; 整个握手跨度约 30ms.
+ * 驻留 300ms 时它大概率整段落在窗内, 但驻留 100ms 且握手恰好在窗尾开始时,
+ * 后面几帧就落到切走之后了.
+ *
+ * 仿真 (scripts/hs_capture_sim.py, 30 次/时到达, 41 条信道):
+ *   全扫 300ms 不跟随   捕获率 2.4%, 首捕期望 5 分
+ *   全扫 60ms + 跟随    捕获率 2.3%, 首捕期望 5 分, 但轮一遍快 4 倍
+ *   有货信道 300ms      捕获率 7.7%, 首捕期望 2 分
+ *   有货信道 60ms + 跟随 捕获率 9.3%, 首捕期望 74 秒
+ * 也就是说跟随让"短驻留"追平"长驻留", 代价只落在真有握手的信道上.
+ *
+ * 判据用序号而不是时间戳: 只关心"这段驻留里有没有新的 EAPOL", 不需要精度,
+ * 也不需要记住上次是哪个信道.
+ */
+static void hs_follow(uint8_t ch, uint32_t seq0, uint32_t max_ms)
+{
+    if (hs_eapol_seq() == seq0) return;     /* 没撞到: 一分钟都不多给 */
+
+    atomic_fetch_add(&s_hs_follow_cnt, 1);
+    uint32_t spent = 0;
+    /* 100ms 一段: M2→M3 最长约 30ms, 留三倍余量. 还在来就继续跟, 直到
+     * 安静一段或者到上限. 上限 400ms 是为了不让一个持续有 EAPOL 的信道
+     * (比如强制门户每几秒重试一次) 把轮转卡死. */
+    while (spent < max_ms && atomic_load(&s_channel_rotate)) {
+        uint32_t d = 100;
+        if (d > max_ms - spent) d = max_ms - spent;
+        uint32_t before = hs_eapol_seq();
+        vTaskDelay(pdMS_TO_TICKS(d));
+        chan_close(ch, d);
+        spent += d;
+        if (hs_eapol_seq() == before) break;
+        WDT_RESET();
+    }
+}
+
+/* 客户端按信道计权.
+ *
+ * 握手只发生在有客户端的信道上. 41 条信道里通常只有 6~10 条有客户端, 把
+ * 权重抬上去就能让这几条排到轮次前面 (chan_psd_order 按权重降序), 冷信道
+ * 仍然会被走到, 只是排在后面.
+ *
+ * 权重取 +3/客户端: 一台客户端带来的握手机会远多于一台 AP 的 beacon, 但
+ * 不能把"只有 AP 没有客户端"的信道饿死 (新设备就是在那些信道上接入的).
+ * 每次重排都从 wifi_db 现算, 不占常驻内存.
+ *
+ * 边界: 这只改变"相遇的先后", 不改变稳态捕获率. 每条信道每轮仍只有一次
+ * 驻留, 排第几与握手什么时候来无关. 它换来的是单次短扫描更容易先碰上
+ * 活跃信道; 想真正提高捕获率得靠 hs_follow 就地延长.
+ */
+static void ch_add_client_w(void)
+{
+    int n = 0;
+    const client_entry_t *cl = wifi_db_get_clients(&n);
+    if (!cl || n <= 0) return;
+    for (int i = 0; i < n; i++) {
+        const ap_entry_t *ap = wifi_db_find_ap(cl[i].bssid);
+        if (ap && ap->channel <= CH_IDX_MAX) s_sched_w[ap->channel] += 3;
+    }
+}
+
 static void auto_visit(uint8_t ch, uint32_t base)
 {
     if (!chan_enter(ch)) return;
+    uint32_t seq0 = hs_eapol_seq();
 
     uint8_t pol = atomic_load(&s_auto_policy);
     uint32_t dwell = (pol == AUTO_POLICY_PSD) ? auto_dwell_psd(ch, base)
@@ -368,7 +438,7 @@ static void auto_visit(uint8_t ch, uint32_t base)
     vTaskDelay(pdMS_TO_TICKS(dwell));
     chan_close(ch, dwell);
 
-    /* ADT 的关键不是驻留公式, 是"见到货就地续期": 一轮要扫 78 条信道 (25 秒),
+    /* ADT 的关键不是驻留公式, 是"见到货就地续期": 一轮要扫 41 条信道 (13 秒),
      * 只按公式给时长的话, 热信道在首轮只能拿到一次机会, 与 psd 没有区别.
      * 这里在发现 >=2 台时就地续到饱和, 最多 2*base, 不改变轮次顺序. */
     if (pol == AUTO_POLICY_ADT && ch <= CH_IDX_MAX) {
@@ -386,6 +456,7 @@ static void auto_visit(uint8_t ch, uint32_t base)
             k = atomic_load(&s_ch_found[ch]);
         }
     }
+    hs_follow(ch, seq0, 400);
     if (ch <= CH_IDX_MAX) atomic_fetch_add(&s_ch_visits[ch], 1);
 }
 
@@ -393,16 +464,13 @@ static void auto_visit(uint8_t ch, uint32_t base)
  * 41 个元素, 插入排序足够, 且天然稳定 (相同权重保持原顺序, 不会来回抖). */
 static uint8_t s_psd_order[N_CH_2G + N_CH_5G];
 
-/* psd 与 sacs 互斥运行, 共用一张权重表: 256 个信道 x 2B = 512B 内部 RAM,
- * 内部堆只剩 30KB 出头, 不值得为两条互斥路径各留一份. */
-static uint16_t s_sched_w[CH_IDX_MAX + 1];
-
 static int psd_build_order(void)
 {
     int n = 0;
     for (size_t i = 0; i < N_CH_2G; i++) s_psd_order[n++] = s_channels_2g[i];
     for (size_t i = 0; i < N_CH_5G; i++) s_psd_order[n++] = s_channels_5g[i];
     for (int c = 0; c <= CH_IDX_MAX; c++) s_sched_w[c] = atomic_load(&s_ch_found[c]);
+    ch_add_client_w();
     return chan_psd_order(s_psd_order, s_sched_w, n, s_psd_order);
 }
 
@@ -456,6 +524,7 @@ static void sacs_visit(uint8_t ch, uint32_t base)
 {
     if (ch == 0 || ch > CH_IDX_MAX) return;
     if (!chan_enter(ch)) return;
+    uint32_t seq0 = hs_eapol_seq();
 
     uint32_t probe = base / 3;          /* base=300 时 100ms, 与仿真一致 */
     if (probe < 80) probe = 80;
@@ -480,6 +549,7 @@ static void sacs_visit(uint8_t ch, uint32_t base)
         else if (++empty_run >= 2) break;   /* 连续两个空窗就撤 */
         WDT_RESET();
     }
+    hs_follow(ch, seq0, 400);
     atomic_fetch_add(&s_ch_visits[ch], 1);
 }
 
@@ -506,6 +576,7 @@ static int sacs_build_order(uint32_t rnd)
         }
     }
     if (n == 0) return 0;
+    ch_add_client_w();
     return chan_psd_order(s_sacs_order, s_sched_w, n, s_sacs_order);
 }
 
@@ -1631,7 +1702,11 @@ static void sniff_stop_common(void)
     /* DONE 从命令上下文发出: 走 raw_out 而不是 printf, 这样从编排任务等
      * 非命令上下文调用时也能送到手机 (raw_out 自带 BLE 事件投递). */
     radio_release(RES_RX_PROMISC);
-    raw_out("META,WIFI,SNIFF,DONE,total,%u\n", (unsigned)atomic_load(&s_sniff_total));
+    /* hs_follow: 这一轮因为撞到 EAPOL 而就地延长的次数. 它是"有没有真的
+     * 在握手通道上"的唯一直接证据, 比抓到的条数更能说明环境. */
+    raw_out("META,WIFI,SNIFF,DONE,total,%u,hs_follow,%u\n",
+            (unsigned)atomic_load(&s_sniff_total),
+            (unsigned)atomic_load(&s_hs_follow_cnt));
 }
 
 esp_err_t wifi_attack_sniff_stop(void)
@@ -1671,8 +1746,8 @@ void wifi_attack_status(void)
      * 进度任务 / 信道轮询任务一旦在" 停→立刻再开" 时重复起来, 任务数会
      * 逐轮累加, 别的读数(META 行、堆)全都看不出来. */
     printf("META,WIFI,STATUS,state,%s,channel,%u,auto_ch,%u,sniff_total,%u,"
-           "inject_total,%u,aps,%u,clients,%u,eapols,%u,mtu,%u,ble,%u,phy,%u,tasks,%u,"
-           "sta_mac,%s\n",
+           "inject_total,%u,aps,%u,clients,%u,eapols,%u,hs_follow,%u,"
+           "mtu,%u,ble,%u,phy,%u,tasks,%u,sta_mac,%s\n",
            stname,
            (unsigned)atomic_load(&s_sniff_channel),
            auto_ch ? 1u : 0u,
@@ -1681,6 +1756,7 @@ void wifi_attack_status(void)
            (unsigned)wifi_db_ap_count(),
            (unsigned)wifi_db_client_count(),
            (unsigned)wifi_db_eapol_count(),
+           (unsigned)atomic_load(&s_hs_follow_cnt),
            (unsigned)lk.mtu, lk.connected ? 1u : 0u,
            (unsigned)lk.phy,
            (unsigned)uxTaskGetNumberOfTasks(), macs);

@@ -10,4 +10,4 @@
  */
 #pragma once
 
-#define RFTOOL_VERSION "2.4.10"
+#define RFTOOL_VERSION "2.4.11"

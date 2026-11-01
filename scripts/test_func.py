@@ -92,6 +92,19 @@ def main():
     n_ap = len(re.findall(r"^AP,", t, re.M))
     check("自动轮询发现 AP", n_ap >= 0, f"aps={n_ap}" + ("" if n_ap else " (环境无 AP 时可为 0)"))
 
+    # 4a 握手跟随: 嗅探中撞到 EAPOL 必须就地延长驻留
+    #     合成帧走的是同一条 hs_feed, 所以这条验的是"检测到延长"的接线,
+    #     不验真握手能不能抓到 (那要靠现场有客户端上线).
+    d.cmd("stop", 0.8)
+    d.cmd("sniff auto --dwell 300", 2.0)
+    t = d.cmd("status", 1.5)
+    before = one(r"hs_follow,(\d+)", t, 0, int)
+    d.cmd("hs selftest", 3.0)
+    t = d.cmd("status", 1.5)
+    after = one(r"hs_follow,(\d+)", t, 0, int)
+    d.cmd("stop", 1.0)
+    check("EAPOL 触发驻留延长", after > before, f"hs_follow {before} -> {after}")
+
     # 4b SACS 策略同样能发现 AP
     d.cmd("stop", 0.8)
     t = d.cmd("sniff auto --dwell 300 --policy sacs", 0.8)

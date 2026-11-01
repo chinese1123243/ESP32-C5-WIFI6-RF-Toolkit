@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /* CSI 动作检测器.
  *
@@ -40,3 +41,31 @@ void csi_det_reset(csi_det_t *d);
 
 /* 喂一个 metric, 返回是否处于动作状态. */
 bool csi_det_update(csi_det_t *d, float metric);
+
+/* 频率轴同向一致率: 相邻子载波残差同号的根数占比, 0.5 等于随机.
+
+   为什么要这个量
+   --------------
+   窄带干扰 (微波炉、蓝牙、单音) 只砸一两个子载波, 其余子载波的残差就是噪声,
+   符号随机; 真实运动是同一条路径的相位旋转, 在频率轴上连续同向.
+
+   合成数据实测 (scripts/csi_sim.py, 6 径 400ns 时延扩展):
+     场景     一致率中位   p10    p90
+     静止       0.490     0.412  0.588
+     窄带干扰    0.529     0.412  0.627
+     走动       0.882     0.765  0.941     (25dB)
+     走动       0.804     0.569  0.902     (15dB)
+
+   也就是说单看这一个量就能把"微波炉"和"有人走动"分开, 而两者在幅度指标上
+   只差 1.5 倍 (0.0079 vs 0.0371), 阈值稍微飘一点就分错. */
+/* cur 是未归一化的 int16 幅度, inv_norm = 1/||cur||, ref 是已归一化的参考帧.
+   这样调用方不必为了比较再造一份归一化拷贝 (CSI 任务栈只有 4096 字节).
+   符号比较与尺度无关, 把 cur 乘上 inv_norm 就够了. */
+float csi_coherence(const int16_t *cur, const float *ref, int n, float inv_norm);
+
+#define CSI_DET_COH_MIN 0.65f
+
+/* 带同向门控的判定: 内部状态照常推进, 只在一致率够高时才报动作.
+   门控放在输出侧而不是缩放到 metric 上, 是为了不动已有的阈值标定:
+   乘以系数会把静止时的 metric 压到 mad 地板以下, z 分数随之失效. */
+bool csi_det_update_coh(csi_det_t *d, float metric, float coh);

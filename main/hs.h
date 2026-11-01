@@ -42,3 +42,8 @@ int  hs_export_22000(void (*sink)(const char *line, void *ctx), void *ctx);
 /* 自检: 用构造的 M1/M2/PMKID 走完整链路, 校验分类/配对/22000 格式.
  * 会清空现有记录. 返回 0 表示全部通过. */
 int  hs_selftest(void);
+
+/* 每收下一条 EAPOL-Key (M1..M4) 就 +1. 信道调度拿它判"这次驻留有没有撞到
+ * 握手": 撞到就地多留一会儿, 没撞到一分钟都不多给. 只读一个 uint32, 在驱动
+ * 回调里递增, 不占锁. */
+uint32_t hs_eapol_seq(void);

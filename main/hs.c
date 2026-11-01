@@ -21,6 +21,7 @@
 #include "wifi_db.h"
 #include "out_stream.h"
 
+#include <stdatomic.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -136,6 +137,12 @@ static void essid_of(const hs_t *h, char *out, size_t out_sz, int *len_out)
     }
 }
 
+/* EAPOL 到达序号. 只增不减, 自然溢出; 调用方比的是"变了没有".
+ * 放在 notify 之前是因为 hs_feed 里要用, 而这个文件没有前向声明. */
+static _Atomic uint32_t s_eapol_seq = 0;
+
+uint32_t hs_eapol_seq(void) { return atomic_load(&s_eapol_seq); }
+
 static void notify(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void notify(const char *fmt, ...)
 {
@@ -169,6 +176,10 @@ void hs_feed(const uint8_t *f, uint16_t len, int8_t rssi, uint8_t chan)
     uint16_t ki = (uint16_t)((f[eo + 5] << 8) | f[eo + 6]);
     int msg = eapol_msg_no(ki);
     if (msg < 1 || msg > 4) return;
+
+    /* 只在这里计数: 前面已经排除了非 EAPOL、非 Key、非法消息号, 所以这个
+     * 序号真正对应"一次握手的某一帧", 不会被 ARP/组播之类的数据帧冲高. */
+    atomic_fetch_add(&s_eapol_seq, 1);
 
     int eo_len = len - eo;
     if (eo_len > HS_EAPOL_MAX) eo_len = HS_EAPOL_MAX;

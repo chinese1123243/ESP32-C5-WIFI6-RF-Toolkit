@@ -81,3 +81,25 @@ bool csi_det_update(csi_det_t *d, float metric)
 
     return d->motion;
 }
+
+float csi_coherence(const int16_t *cur, const float *ref, int n, float inv_norm)
+{
+    if (!cur || !ref || n < 3 || inv_norm <= 0.0f) return 0.5f;
+    int same = 0, opp = 0;
+    float prev = (float)cur[0] * inv_norm - ref[0];
+    for (int i = 1; i < n; i++) {
+        float d = (float)cur[i] * inv_norm - ref[i];
+        float p = d * prev;
+        /* 全零残差 (两帧完全一样) 不投任何一票, 因此无证据时返回 0.5 而不是 0 */
+        if (p > 0.0f) same++;
+        else if (p < 0.0f) opp++;
+        prev = d;
+    }
+    return (same + opp) ? (float)same / (float)(same + opp) : 0.5f;
+}
+
+bool csi_det_update_coh(csi_det_t *d, float metric, float coh)
+{
+    bool m = csi_det_update(d, metric);
+    return m && coh >= CSI_DET_COH_MIN;
+}

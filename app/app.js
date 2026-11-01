@@ -4,7 +4,7 @@
  */
 
 /* 版本 */
-const APP_VERSION  = '2.4.10';
+const APP_VERSION  = '2.4.11';
 const APP_BUILD    = '2026.09';
 const APP_AUTHOR      = 'CN112';
 const APP_AUTHOR_FULL = 'CN1123243';
@@ -1506,7 +1506,13 @@ function parseOutputLine(line){
     }
     if (line.startsWith('META,CSI,')){
         /* SAMPLE 每秒好几条, 只把动作事件报出来, 其余吞掉 */
-        if (line.indexOf(',motion,1') > 0) log('[CSI] 检测到动作', 'warn');
+        if (line.indexOf(',motion,1') > 0){
+            /* 带上证据: 指标多大、一致率多少. 只报"检测到动作"的话, 现场
+             * 分不清是真有人走, 还是阈值飘了. */
+            const kv = kvOf(line.split(','), 3);
+            log('[CSI] 检测到动作 · metric ' + (kv.metric || '?') +
+                ' · coh ' + (kv.coh || '?'), 'warn');
+        }
         else if (line.startsWith('META,CSI,SELFTEST,')){
             const kv = kvOf(line.split(','), 3);
             log('[CSI] 自检 ' + kv.result + ' · peak ' + kv.peak, kv.result === 'pass' ? 'ok' : 'err');

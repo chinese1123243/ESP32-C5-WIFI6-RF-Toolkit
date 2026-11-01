@@ -188,9 +188,12 @@ static void csi_task(void *arg)
         float norm = sqrtf(sumsq);
 
         float metric = 0.0f;
+        float coh = 0.5f;      /* 频率轴同向一致率, 0.5 = 随机 */
         if (ms) {
             ms->frames++;
             if (ms->n == n && norm > 1e-3f) {
+                /* 一致率必须先算: 下面的循环会把 prev 就地覆盖成当前帧. */
+                coh = csi_coherence(&amp[skip], &ms->prev[skip], n - skip, 1.0f / norm);
                 float sum = 0.0f;
                 for (int i = skip; i < n; i++) {
                     float a = (float)amp[i] / norm;
@@ -228,13 +231,15 @@ static void csi_task(void *arg)
         /* 采样输出按帧数计而不是按时间: 时间门在多源交替时会被判空的帧占满 */
         if (++s_sample_cnt % CSI_SAMPLE_EVERY == 0) {
             /* 判定交给 csi_det: 固定 2 倍门限在持续动作时会被自己的基线学走
-             * (离线合成序列 1600 样本只有 1% 仍报动作), 且不看噪声水平. */
-            bool motion = ms && csi_det_update(&ms->det, metric);
+             * (离线合成序列 1600 样本只有 1% 仍报动作), 且不看噪声水平.
+             * coh 门控挡的是窄带干扰: 微波炉只砸一两个子载波, 一致率 0.49~0.53,
+             * 而真运动 0.80~0.88, 两者在幅度指标上只差 1.5 倍, 靠幅度分不开. */
+            bool motion = ms && csi_det_update_coh(&ms->det, metric, coh);
             float score = ms ? ms->det.score : 0.0f;
             printf("META,CSI,SAMPLE,mac,%02x%02x%02x%02x%02x%02x,metric,%.2f,base,%.2f,"
-                   "z,%.1f,motion,%d,rssi,%d,len,%u\n",
+                   "z,%.1f,coh,%.2f,motion,%d,rssi,%d,len,%u\n",
                    e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5],
-                   metric, ms ? ms->base : 0.0f, score, motion ? 1 : 0,
+                   metric, ms ? ms->base : 0.0f, score, coh, motion ? 1 : 0,
                    (int)e->rssi, (unsigned)e->len);
             if (motion) s_motion_cnt++;
             fflush(stdout);
