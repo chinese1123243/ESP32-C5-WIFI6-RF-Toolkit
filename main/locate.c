@@ -38,6 +38,8 @@ static uint32_t     s_secs = 30;
 static int          s_miss = 0;
 static int16_t      s_trend = 0;     /* 最近一次趋势, 每 10 个样本的 dB */
 static int16_t      s_trend_ci = 0;  /* 该趋势的 95% 半宽 */
+static loc_turn_t   s_turn;          /* 拐点检测状态机 */
+static int          s_turns = 0;     /* 本次采样报过的拐点数 */
 
 static int rssi_now(void)
 {
@@ -113,6 +115,21 @@ static void locate_task(void *arg)
             s_smp[s_n].ch = (uint8_t)ch;
             s_smp[s_n].t_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
             s_n++;
+
+            /* 拐点检测: rssi 散在结构体数组里, 拷成连续 int16 再喂.
+             * 检测器只用最近 ~40 个样本, 64 个够它取满窗口. */
+            int hlen = s_n < 64 ? s_n : 64;
+            for (int i = 0; i < hlen; i++)
+                s_vals[i] = s_smp[s_n - hlen + i].rssi;
+            if (loc_turn_update(&s_turn, s_vals, hlen, s_scr)) {
+                s_turns++;
+                char macs[18];
+                mac_to_str(s_mac, macs);
+                printf("META,LOCATE,TURN,mac,%s,event,passed,peak,%d,ago,%d\n",
+                       macs, s_turn.p_lock, s_n - 1 - s_turn.lock_at);
+                fflush(stdout);
+                event_publish("LOCATE", "turn passed peak=%d", s_turn.p_lock);
+            }
         }
 
         if (++tick % 4 == 0) {                 /* 每 2s 报一次, 不刷屏 */
@@ -136,8 +153,8 @@ static void locate_task(void *arg)
 
     int avg, mn, mx; const char *trend;
     statistics(&avg, &mn, &mx, &trend);
-    printf("META,LOCATE,DONE,samples,%d,avg,%d,min,%d,max,%d,miss,%d,us,%u,us_max,%u\n",
-           s_n, avg, mn, mx, s_miss, (unsigned)s_stat_us, (unsigned)s_stat_us_max);
+    printf("META,LOCATE,DONE,samples,%d,avg,%d,min,%d,max,%d,miss,%d,turns,%d,us,%u,us_max,%u\n",
+           s_n, avg, mn, mx, s_miss, s_turns, (unsigned)s_stat_us, (unsigned)s_stat_us_max);
     fflush(stdout);
     event_publish("LOCATE", "done samples=%d avg=%d", s_n, avg);
 
@@ -176,6 +193,8 @@ esp_err_t locate_start(const uint8_t mac[6], bool is_client, uint32_t secs)
     s_secs = secs;
     s_n = 0;
     s_miss = 0;
+    s_turns = 0;
+    loc_turn_reset(&s_turn);
     s_stat_us = s_stat_us_max = 0;
     s_run = true;
 

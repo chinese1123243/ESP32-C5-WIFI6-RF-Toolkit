@@ -146,6 +146,123 @@ static void test_locate(void)
     CHECK(abs(tr) > ci_small || ci_small == 0, "趋势 %d 应超过半宽 %d", tr, ci_small);
 }
 
+/* ---------- locate_est: 拐点检测 ---------- */
+
+static unsigned rnd_state = 12345;
+static int rnd(void)
+{
+    /* xorshift32: 简单 lcg 的低位质量太差, Box-Muller 会有可见的周期纹 */
+    unsigned x = rnd_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    rnd_state = x;
+    return (int)(x & 0x7fffffff);
+}
+
+/* 高斯白噪声 (Box-Muller, 统计品质够用) */
+static float gauss(float sigma)
+{
+    float u1 = (rnd() + 1) / 2147483648.0f, u2 = (rnd() + 1) / 2147483648.0f;
+    return sigma * sqrtf(-2.0f * logf(u1)) * cosf(6.2832f * u2);
+}
+
+/* 合成循迹序列: d = |d0 - v*t|, RSSI = A - 25*log10(d) + 噪声, 可选衰落.
+ * 返回真峰的样本序号. 2Hz 采样, 与 scripts/loc_turn_sim.py 同一模型. */
+static int make_walk(int16_t *x, int n, float d0, float v, float sigma, float fade_p)
+{
+    int peak = -1;
+    float fade_db = 0.0f;
+    int fade_left = 0;
+    for (int t = 0; t < n; t++) {
+        float d = d0 - v * t * 0.5f;
+        if (d < 0) d = -d;
+        if (d < 0.3f) d = 0.3f;
+        if (fade_left > 0) {
+            fade_left--;
+        } else {
+            fade_db = 0.0f;
+            if ((rnd() / 2147483648.0f) < fade_p) {
+                fade_left = (rnd() & 1);
+                fade_db = -(6.0f + 8.0f * (rnd() / 2147483648.0f));
+            }
+        }
+        if (peak < 0 && d0 - v * t * 0.5f <= 0) peak = t;
+        x[t] = (int16_t)(45.0f - 25.0f * log10f(d) + gauss(sigma) + fade_db);
+    }
+    return peak;
+}
+
+/* 喂完整条序列, 返回是否开火 (开火即停止喂) */
+static int feed_turn(const int16_t *v, int n, loc_turn_t *st, int16_t *scratch, int *fire_t)
+{
+    loc_turn_reset(st);
+    *fire_t = -1;
+    for (int t = 1; t < n; t++) {
+        if (loc_turn_update(st, v, t + 1, scratch)) {
+            *fire_t = t;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void test_turn(void)
+{
+    int16_t v[130];
+    int16_t scratch[LOC_TURN_SCR];
+    loc_turn_t st;
+    int ft;
+
+    /* 场景 1: 快步接近后越过 (10m, 1m/s, 峰在样本 20) */
+    int fires = 0, delay_ok = 0, peak_ok = 0;
+    for (int r = 0; r < 50; r++) {
+        int peak = make_walk(v, 120, 10.0f, 1.0f, 3.0f, 0.10f);
+        if (feed_turn(v, 120, &st, scratch, &ft)) {
+            fires++;
+            if (ft - peak <= 30) delay_ok++;
+            if (st.p_lock > -60 && st.p_lock < 60) peak_ok++;   /* 电平要合理 */
+        }
+    }
+    CHECK(fires >= 35, "快步通过 50 局只检出 %d, 应 >=35", fires);
+    CHECK(delay_ok == fires, "检出里 %d/%d 延迟超过 15s", fires - delay_ok, fires);
+    CHECK(peak_ok == fires, "锁定峰值电平 %d/%d 合理", fires - peak_ok, fires);
+
+    /* 场景 2: 缓步接近后越过 (6m, 0.5m/s, 峰在样本 24) */
+    fires = 0;
+    for (int r = 0; r < 50; r++) {
+        int peak = make_walk(v, 120, 6.0f, 0.5f, 3.0f, 0.10f);
+        if (feed_turn(v, 120, &st, scratch, &ft)) {
+            fires++;
+            if (ft - peak > 30) { g_fail++; printf("FAIL 缓步延迟 %d (峰 %d)\n", ft - peak, peak); }
+        }
+    }
+    CHECK(fires >= 45, "缓步通过 50 局只检出 %d, 应 >=45", fires);
+
+    /* 场景 3: 静止 (5m 不动): 误报要稀少, 50 局 <= 3 */
+    fires = 0;
+    for (int r = 0; r < 50; r++) {
+        (void)make_walk(v, 120, 5.0f, 0.0f, 3.0f, 0.10f);
+        if (feed_turn(v, 120, &st, scratch, &ft)) fires++;
+    }
+    CHECK(fires <= 3, "静止 50 局误报 %d, 应 <=3", fires);
+
+    /* 场景 4: 一直远离 (从 1m 走远): 报"已越过"没有意义, 50 局 <= 3 */
+    fires = 0;
+    for (int r = 0; r < 50; r++) {
+        (void)make_walk(v, 120, 1.0f, 0.5f, 3.0f, 0.10f);
+        if (feed_turn(v, 120, &st, scratch, &ft)) fires++;
+    }
+    CHECK(fires <= 3, "远离 50 局误报 %d, 应 <=3", fires);
+
+    /* 历史不足时不能开火, 也不能把状态搞挂 */
+    loc_turn_reset(&st);
+    for (int t = 1; t <= LOC_TURN_MIN_N - 1; t++) {
+        v[t] = -60;
+        CHECK(loc_turn_update(&st, v, t + 1, scratch) == 0, "n=%d 不应开火", t + 1);
+    }
+}
+
 /* ---------- csi_det ---------- */
 
 static void test_csi(void)
@@ -238,6 +355,7 @@ int main(void)
     test_dwell_sat();
     test_psd_order();
     test_locate();
+    test_turn();
     test_csi();
     test_coherence();
     printf("\n=== 结果: %d passed, %d failed ===\n", g_pass, g_fail);

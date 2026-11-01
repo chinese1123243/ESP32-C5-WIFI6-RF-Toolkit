@@ -27,8 +27,17 @@ extern "C" {
 #define RFTOOL_RGB_GPIO          27
 #define RFTOOL_RGB_NUM          1     /* 板载仅 1 颗 WS2812 */
 
-/* 802.11 帧最大长度 (含地址/帧体, 不含 FCS) */
+/* 自己构造帧时的缓冲上限 (含地址/帧体, 不含 FCS).
+ * 注入路径上到处是 uint8_t buf[RFTOOL_MAX_FRAME_LEN] 这种栈数组, 调大会直接
+ * 吃栈, 所以这个值只管"我造得出来的最大帧". */
 #define RFTOOL_MAX_FRAME_LEN    512
+
+/* 接收路径的帧长上限. 跟上面那个是两个概念, 之前共用一个值是个缺陷:
+ * 802.11 单帧最大 2346 字节, 一个 1500 字节 MSDU 加上 802.11/QoS/LLC 头就
+ * 一千五百多. 拿 512 去过滤接收路径, 结果是所有大帧在回调第一行就被丢掉,
+ * AP 库、客户端库、EAPOL 检测、pcap 全看不到它们, 而且不计入任何丢帧数.
+ * 取 1600: 覆盖满 MTU 的数据帧, 又不至于让 cap 的分段缓冲一次占太大. */
+#define RFTOOL_MAX_RX_FRAME     1600
 
 /* pcap DLT: 802.11 (不含 FCS, 与嗅探回调里 sig_len-4 一致) */
 #define RFTOOL_PCAP_LINKTYPE    105   /* DLT_IEEE802_11 */

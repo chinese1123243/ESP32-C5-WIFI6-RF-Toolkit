@@ -4,7 +4,7 @@
  */
 
 /* 版本 */
-const APP_VERSION  = '2.4.12';
+const APP_VERSION  = '2.4.13';
 const APP_BUILD    = '2026.09';
 const APP_AUTHOR      = 'CN112';
 const APP_AUTHOR_FULL = 'CN1123243';
@@ -30,7 +30,7 @@ const OUI_INDEX = (() => {
 const macHex = mac => (mac || '').replace(/[^0-9a-fA-F]/g, '').toLowerCase();
 
 /* 本地管理位(第一字节 bit1): 手机默认开 MAC 随机化, 这时的 OUI 是随机前缀,
- * 查出来写个厂名等于编. 单列成"随机 MAC"更有用 —— 说明这台设备在躲. */
+ * 查出来写个厂名等于编. 单列成"随机 MAC"更有用, 说明这台设备在躲. */
 const isRandMac = mac => {
     const h = macHex(mac);
     return h.length >= 2 && (parseInt(h.slice(0, 2), 16) & 0x02) !== 0;
@@ -1663,11 +1663,21 @@ function locateText(p){
                ' · 区间 ' + (kv.min || '?') + '~' + (kv.max || '?') +
                ' · 离散 ' + (kv.mad || '0') + ' dB' +
                ' · n ' + (kv.n || 0) + ' · ' + (TREND[kv.trend] || kv.trend || '');
+    if (k === 'TURN'){
+        const ago = parseInt(kv.ago || '0');
+        return '已越过目标 · 峰值 ' + (kv.peak || '?') +
+               (ago > 0 ? ' · 峰约 ' + (ago * 0.5).toFixed(0) + ' 秒前' : '') +
+               ' · 循迹时请折返确认';
+    }
     if (k === 'START') return '采样开始 · ' + (kv.kind === 'client' ? '客户端' : 'AP') +
                               ' · ' + (kv.secs || '?') + 's';
-    if (k === 'DONE')  return '采样完成 · ' + (kv.samples || 0) + ' 个 · 均值 ' +
-                              (kv.avg || '?') + ' · 丢失 ' + (kv.miss || 0) +
-                              ' · 统计 ' + (kv.us_max || '?') + ' µs';
+    if (k === 'DONE'){
+        const turns = parseInt(kv.turns || '0');
+        return '采样完成 · ' + (kv.samples || 0) + ' 个 · 均值 ' +
+               (kv.avg || '?') + ' · 丢失 ' + (kv.miss || 0) +
+               (turns ? ' · 检到越峰 ' + turns + ' 次' : '') +
+               ' · 统计 ' + (kv.us_max || '?') + ' µs';
+    }
     if (k === 'STOP')  return '采样已停止';
     if (k === 'ERR')   return '失败: ' + (kv.msg || '?');
     return p.slice(2).join(' · ');
@@ -5566,7 +5576,7 @@ window.gotoTab = function(name){ rfOpen(name); };
     const dispChan = new Map(), dispVend = new Map();
     const dispRssi = new Array(14).fill(0), dispEnc = new Map();
 
-    /* ---- 信道占用 ---- */
+    /* 信道占用 */
     function drawChan(){
         const { ctx, w, h } = fit(cv.chan);
         const target = new Map();
@@ -5616,7 +5626,7 @@ window.gotoTab = function(name){ rfOpen(name); };
         ctx.fillText('最忙 ch' + chs[busyI] + ' ×' + Math.round(vals[busyI]), 2, 7);
     }
 
-    /* ---- 信号强度 ---- */
+    /* 信号强度 */
     function drawRssi(){
         const { ctx, w, h } = fit(cv.rssi);
         if (!apList.length) return empty(ctx, h, '暂无 AP');
@@ -5645,7 +5655,7 @@ window.gotoTab = function(name){ rfOpen(name); };
         ctx.textAlign = 'left';
     }
 
-    /* ---- 加密构成 ---- */
+    /* 加密构成 */
     const ENC_CATS = ['开放', 'WEP', 'WPA 混合', 'WPA2', 'WPA3', '未知'];
     const ENC_COLS = [ERR, 'rgba(255,107,74,.48)', INK + '.24)', INK + '.44)', ACC, INK + '.12)'];
 
@@ -5715,7 +5725,7 @@ window.gotoTab = function(name){ rfOpen(name); };
         });
     }
 
-    /* ---- 厂商分布 ---- */
+    /* 厂商分布 */
     function drawVend(){
         const { ctx, w, h } = fit(cv.vend);
         if (!apList.length) return empty(ctx, h, '暂无 AP');
@@ -5756,7 +5766,7 @@ window.gotoTab = function(name){ rfOpen(name); };
         });
     }
 
-    /* ---- 发现节奏 ---- */
+    /* 发现节奏 */
     const series = [];
     let tStart = 0;
 

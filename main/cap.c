@@ -274,7 +274,8 @@ void cap_feed(const uint8_t *frame, uint16_t len, int8_t rssi, uint8_t chan,
               int8_t noise, uint8_t rate)
 {
     if (!s_on || !s_stage || s_full) return;
-    if (!frame || len == 0 || len > CAP_MAX_FRAME) return;
+    if (!frame || len == 0) return;
+    if (len > CAP_MAX_FRAME) { s_drops++; return; }   /* 超限也算丢, 别让它无声消失 */
     /* FULL 帧 (FCS 失败) 已在调用侧过滤 */
 
     uint8_t flags = classify(frame, len);

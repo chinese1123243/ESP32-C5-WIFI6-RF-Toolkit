@@ -108,7 +108,7 @@ def csi_frame(paths, t, rng, snr_db, interf_sub=None, interf_amp=0.0):
     return [v * g for v in out]
 
 
-# ---------------- 特征 ----------------
+# 特征
 
 def norm(a):
     s = math.sqrt(sum(v * v for v in a))
@@ -173,7 +173,7 @@ def feat_lag_coh(d):
 
 
 
-# ---------------- 检测器 (与 csi_det.c 同参数) ----------------
+# 检测器 (与 csi_det.c 同参数)
 
 ENTER_Z, EXIT_Z, HOLD_N, CUSUM_K, CUSUM_H = 4.0, 1.5, 5, 0.5, 6.0
 BASE_DOWN, BASE_UP, MAD_RATE, MAD_FLOOR = 0.02, 0.002, 0.05, 0.02

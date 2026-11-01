@@ -38,8 +38,9 @@
 #define CAP_HTML_RESERVE    (1024 * 1024)
 /* pcap 全局头长度 */
 #define CAP_PCAP_HDR        24
-/* 单帧上限 (与 RFTOOL_MAX_FRAME_LEN 一致) */
-#define CAP_MAX_FRAME       512
+/* 单帧上限. 必须与 radio_common.h 的 RFTOOL_MAX_RX_FRAME 一致:
+ * 接收回调已经按那个值过滤过了, 这里再小的话就是二次静默丢弃. */
+#define CAP_MAX_FRAME       1600
 /* 关键帧索引容量 */
 #define CAP_KEY_MAX         512
 

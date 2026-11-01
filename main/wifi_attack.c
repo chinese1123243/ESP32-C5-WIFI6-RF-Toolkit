@@ -238,6 +238,8 @@ static inline void chan_hit(uint8_t ch, uint16_t w)
 static _Atomic uint16_t s_ch_found[CH_IDX_MAX + 1];
 static _Atomic uint32_t s_ch_found_total = 0;
 static _Atomic uint32_t s_ch_switch_err = 0;
+/* 超过 RFTOOL_MAX_RX_FRAME 而被丢弃的帧数. 不报出来就没人知道 pcap 缺了什么. */
+static _Atomic uint32_t s_rx_oversize = 0;
 /* 撞到 EAPOL 就地延长的次数. 现场看这个数就能判断"是不是真在握手通道上":
  * 长时间为 0 说明要么环境里没人上线, 要么客户端在别的信道上. */
 static _Atomic uint32_t s_hs_follow_cnt = 0;
@@ -852,7 +854,13 @@ static void wifi_sniff_cb(void *buf, wifi_promiscuous_pkt_type_t type)
     int sig_len = p->rx_ctrl.sig_len;
     if (sig_len < 24) return;
     int frame_len = sig_len - 4;            /* sig_len 含 FCS, pcap 用无 FCS */
-    if (frame_len <= 0 || frame_len > RFTOOL_MAX_FRAME_LEN) return;
+    if (frame_len <= 0) return;
+    if (frame_len > RFTOOL_MAX_RX_FRAME) {
+        /* 超过上限的帧以前是静默丢弃的, 连计数都没有, 表现为"抓到的总比
+         * 实际少". 至少让这个数可见. */
+        atomic_fetch_add(&s_rx_oversize, 1);
+        return;
+    }
 
     const uint8_t *f = p->payload;
     uint8_t ftype = frame_type(f);
@@ -1746,7 +1754,7 @@ void wifi_attack_status(void)
      * 进度任务 / 信道轮询任务一旦在" 停→立刻再开" 时重复起来, 任务数会
      * 逐轮累加, 别的读数(META 行、堆)全都看不出来. */
     printf("META,WIFI,STATUS,state,%s,channel,%u,auto_ch,%u,sniff_total,%u,"
-           "inject_total,%u,aps,%u,clients,%u,eapols,%u,hs_follow,%u,"
+           "inject_total,%u,aps,%u,clients,%u,eapols,%u,hs_follow,%u,oversize,%u,"
            "mtu,%u,ble,%u,phy,%u,tasks,%u,sta_mac,%s\n",
            stname,
            (unsigned)atomic_load(&s_sniff_channel),
@@ -1757,6 +1765,7 @@ void wifi_attack_status(void)
            (unsigned)wifi_db_client_count(),
            (unsigned)wifi_db_eapol_count(),
            (unsigned)atomic_load(&s_hs_follow_cnt),
+           (unsigned)atomic_load(&s_rx_oversize),
            (unsigned)lk.mtu, lk.connected ? 1u : 0u,
            (unsigned)lk.phy,
            (unsigned)uxTaskGetNumberOfTasks(), macs);
