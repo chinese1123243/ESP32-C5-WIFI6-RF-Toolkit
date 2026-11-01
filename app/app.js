@@ -2778,10 +2778,10 @@ function renderApList(){
 {
     const polSel = $('sniffPolicy'), note = $('sniffPolicyNote');
     const TEXT = {
-        sacs: '长时间扫描更少漏，短扫与 PSD 打平',
-        psd:  '稳，但一轮 78 条要 20 秒',
-        adt:  '前 2 秒最快，空信道回探稀疏',
-        wrl:  '按帧率加权，热信道可能只是有人在刷视频',
+        psd:  'PSD：按发现数排序，一轮 78 条约 20 秒',
+        sacs: 'SACS：长时间扫描更少漏，短扫与 PSD 打平',
+        adt:  'ADT：前 2 秒最快，空信道回探稀疏',
+        wrl:  'WRL：按帧率加权，热信道可能只是有人在刷视频',
     };
     polSel?.addEventListener('change', () => {
         if (note) note.textContent = TEXT[polSel.value] || '';
